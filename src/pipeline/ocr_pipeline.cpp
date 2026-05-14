@@ -3,10 +3,14 @@
 #include "turbo_ocr/common/timing.h"
 #include "turbo_ocr/decode/gpu_image.h"
 #include "turbo_ocr/common/serialization.h"
+#include "turbo_ocr/formula/formulanet.h"
 #include "turbo_ocr/layout/reading_order.h"
+#include "turbo_ocr/router/cua_router.h"
+#include "turbo_ocr/table/table_stage.h"
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <format>
 
 #include <opencv2/imgproc.hpp>
@@ -34,12 +38,20 @@ OcrPipeline::~OcrPipeline() noexcept {
     cudaStreamDestroy(rec_stream_);
   if (layout_stream_)
     cudaStreamDestroy(layout_stream_);
+  if (table_stream_)
+    cudaStreamDestroy(table_stream_);
+  if (formula_stream_)
+    cudaStreamDestroy(formula_stream_);
   if (rec_event_)
     cudaEventDestroy(rec_event_);
   if (det_event_)
     cudaEventDestroy(det_event_);
   if (det_only_event_)
     cudaEventDestroy(det_only_event_);
+  if (table_done_event_)
+    cudaEventDestroy(table_done_event_);
+  if (formula_done_event_)
+    cudaEventDestroy(formula_done_event_);
   for (auto &buf : img_bufs_) {
     if (buf.d_buf)
       cudaFree(buf.d_buf);
@@ -95,6 +107,67 @@ bool OcrPipeline::init(const std::string &det_model,
   CUDA_CHECK(cudaStreamCreateWithFlags(&rec_stream_, cudaStreamNonBlocking));
   CUDA_CHECK(cudaEventCreateWithFlags(&rec_event_, cudaEventDisableTiming));
   CUDA_CHECK(cudaEventCreateWithFlags(&det_event_, cudaEventDisableTiming));
+
+  return true;
+}
+
+bool OcrPipeline::load_router_models(
+    const std::string &table_cls_trt,
+    const std::string &cell_wired_trt,
+    const std::string &cell_wireless_trt,
+    const std::string &slanext_wired_trt,
+    const std::string &slanext_wireless_trt,
+    const std::string &formula_onnx,
+    const std::string &formula_tokenizer_json) {
+  // Router itself is CPU-only and cheap; build it unconditionally so the
+  // classify path is available even when no downstream engines load.
+  router_ = std::make_unique<router::CuaRouter>();
+
+  // Table half — required if any table TRT path is provided. Skip
+  // entirely when all table paths are empty.
+  const bool want_table =
+      !table_cls_trt.empty() && !cell_wired_trt.empty() &&
+      !slanext_wired_trt.empty();
+  if (want_table) {
+    auto stage = std::make_unique<table::TableStage>();
+    if (!stage->init(table_cls_trt, cell_wired_trt, cell_wireless_trt,
+                     slanext_wired_trt, slanext_wireless_trt)) {
+      std::cerr << "[Pipeline] Failed to init TableStage\n";
+      return false;
+    }
+    table_stage_ = std::move(stage);
+    if (!table_stream_) {
+      CUDA_CHECK(cudaStreamCreateWithFlags(&table_stream_, cudaStreamNonBlocking));
+      CUDA_CHECK(cudaEventCreateWithFlags(&table_done_event_, cudaEventDisableTiming));
+    }
+    std::cout << "[Pipeline] Table stage enabled" << '\n';
+  }
+
+  // Formula half — entirely optional. Guarded against missing files so
+  // the server starts cleanly while upstream re-exports the split-ONNX
+  // bundle (see .claude/plans/10_trt_gate_results.md).
+  const bool want_formula = !formula_onnx.empty() &&
+                            !formula_tokenizer_json.empty() &&
+                            std::filesystem::exists(formula_onnx) &&
+                            std::filesystem::exists(formula_tokenizer_json);
+  if (want_formula) {
+    auto eng = std::make_unique<formula::FormulaNet>();
+    if (!eng->load_model(formula_onnx)) {
+      std::cerr << "[Pipeline] Formula engine load_model failed — formulas disabled\n";
+    } else if (!eng->load_tokenizer(formula_tokenizer_json)) {
+      std::cerr << "[Pipeline] Formula tokenizer load failed — formulas disabled\n";
+    } else {
+      formula_ = std::move(eng);
+      if (!formula_stream_) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&formula_stream_, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&formula_done_event_, cudaEventDisableTiming));
+      }
+      std::cout << "[Pipeline] Formula stage enabled" << '\n';
+    }
+  } else if (!formula_onnx.empty()) {
+    std::cout << "[Pipeline] Formula engine skipped (path missing): "
+              << formula_onnx << '\n';
+  }
 
   return true;
 }
@@ -210,6 +283,65 @@ GpuImage OcrPipeline::upload_image(const cv::Mat &img, cudaStream_t stream,
   timer.gpu_stop();
 
   return GpuImage{buf.d_buf, buf.pitch, img.rows, img.cols};
+}
+
+void OcrPipeline::dispatch_router_(OcrPipelineResult &out,
+                                   const GpuImage &gpu_img,
+                                   const std::vector<Box> &boxes,
+                                   PipelineTimer &timer) {
+  // text-only short-circuits — every one of these MUST bail BEFORE any
+  // new CUDA API call (plan 04 §7 invariants).
+  if (!router_) return;
+  if (out.layout.empty()) return;
+
+  timer.cpu_start("router_classify");
+  plan_.clear();
+  router_->classify(boxes, out.layout, plan_);
+  timer.cpu_stop();
+
+  const bool has_table   = !plan_.table_layout_ids.empty() && table_stage_;
+  const bool has_formula = !plan_.formula_layout_ids.empty() && formula_;
+  if (!has_table && !has_formula) return;          // routed-all-text bail
+
+  // Tables: TableStage owns its own waitEvent(det_only_event_) and final
+  // sync inside collect(), so by the time run() returns the work is done
+  // and `gpu_img` is no longer being read by table_stream_.
+  if (has_table) {
+    timer.gpu_start("table_dispatch");
+    out.tables = table_stage_->run(gpu_img, out.layout, out.results,
+                                   table_stream_, det_only_event_);
+    timer.gpu_stop();
+    CUDA_CHECK(cudaEventRecord(table_done_event_, table_stream_));
+  }
+
+  // Formulas: FormulaNet::run takes a Box list (sub-rects) and self-
+  // syncs on `formula_stream_` per sub-batch. Wait on det_only_event_
+  // before dispatch so gpu_img is safe to read.
+  if (has_formula) {
+    CUDA_CHECK(cudaStreamWaitEvent(formula_stream_, det_only_event_, 0));
+
+    std::vector<Box> fboxes;
+    fboxes.reserve(plan_.formula_layout_ids.size());
+    for (int lid : plan_.formula_layout_ids) {
+      if (lid >= 0 && static_cast<std::size_t>(lid) < out.layout.size())
+        fboxes.push_back(out.layout[lid].box);
+    }
+    timer.gpu_start("formula_dispatch");
+    auto eng_res = formula_->run(gpu_img, fboxes, formula_stream_);
+    timer.gpu_stop();
+    CUDA_CHECK(cudaEventRecord(formula_done_event_, formula_stream_));
+
+    out.formulas.reserve(eng_res.size());
+    for (std::size_t i = 0; i < eng_res.size(); ++i) {
+      const int lid = plan_.formula_layout_ids[i];
+      router::FormulaResult fr;
+      fr.layout_id = lid;
+      fr.latex     = std::move(eng_res[i].latex);
+      fr.score     = out.layout[lid].score;        // proxy until engine surfaces one
+      fr.box       = out.layout[lid].box;
+      out.formulas.push_back(std::move(fr));
+    }
+  }
 }
 
 std::vector<OCRResultItem> OcrPipeline::run(const cv::Mat &img,
@@ -335,6 +467,10 @@ OcrPipelineResult OcrPipeline::run_with_layout(const cv::Mat &img,
   if (layout_active) {
     out.layout = layout_->collect();
   }
+
+  // CUA router + table/formula dispatch. No-op on text-only pages (see
+  // dispatch_router_'s short-circuits — plan 04 §7).
+  dispatch_router_(out, gpu_img, boxes, timer);
 
   // Reading-order over layout regions, with synthetic XY-cut entries
   // for orphan results so unmatched detections (page numbers, headers
@@ -493,6 +629,9 @@ OcrPipelineResult OcrPipeline::run_with_layout(GpuImage gpu_img,
   if (layout_active) {
     out.layout = layout_->collect();
   }
+
+  // CUA router + table/formula dispatch (text-only path bails inside).
+  dispatch_router_(out, gpu_img, boxes, timer);
 
   // Reading-order — see run(...) above for the contract; helper handles
   // orphan results (missing layout match) via synthetic XY-cut entries.

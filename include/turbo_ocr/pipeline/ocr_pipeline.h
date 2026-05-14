@@ -13,6 +13,11 @@
 #include "turbo_ocr/pipeline/i_ocr_pipeline.h"
 #include "turbo_ocr/pipeline/pipeline_result.h"
 #include "turbo_ocr/recognition/paddle_rec.h"
+#include "turbo_ocr/router/routing_plan.h"
+
+namespace turbo_ocr::router  { class CuaRouter; }
+namespace turbo_ocr::table   { class TableStage; }
+namespace turbo_ocr::formula { class FormulaNet; }
 
 namespace turbo_ocr::pipeline {
 
@@ -31,6 +36,22 @@ public:
   // Plain run(...) continues to return text only (layout is computed and
   // discarded to keep a stable API for non-layout callers).
   [[nodiscard]] bool load_layout_model(const std::string &layout_trt_path);
+
+  // Load the CUA router + table-stage + formula engines in one call.
+  // Pass an empty path for any optional component (e.g. wireless table
+  // engines, or the formula engine entirely) to skip it — the loader
+  // returns true as long as the *required* parts (router + wired table)
+  // initialised. Streams and events for the new modalities are created
+  // lazily inside this call; pipelines that never invoke it allocate
+  // zero new CUDA resources (required by plan 04 §7).
+  [[nodiscard]] bool
+  load_router_models(const std::string &table_cls_trt,
+                     const std::string &cell_wired_trt,
+                     const std::string &cell_wireless_trt,
+                     const std::string &slanext_wired_trt,
+                     const std::string &slanext_wireless_trt,
+                     const std::string &formula_onnx,
+                     const std::string &formula_tokenizer_json);
 
   // IOcrPipeline interface — delegates to stream-aware overloads with stream=0
   void warmup() override { warmup_gpu(0); }
@@ -161,6 +182,28 @@ private:
     int cap_rows = 0, cap_cols = 0;
   };
   BatchImgBuf batch_img_bufs_[kMaxBatchImages];
+
+  // ---- CUA router + table/formula stages (lazy-allocated) ----------------
+  std::unique_ptr<router::CuaRouter>   router_;
+  std::unique_ptr<table::TableStage>   table_stage_;
+  std::unique_ptr<formula::FormulaNet> formula_;
+
+  cudaStream_t table_stream_       = nullptr;
+  cudaStream_t formula_stream_     = nullptr;
+  cudaEvent_t  table_done_event_   = nullptr;
+  cudaEvent_t  formula_done_event_ = nullptr;
+
+  // Reusable per-call routing plan — member, not local, to avoid the
+  // per-page heap churn of the inner vectors.
+  router::RoutingPlan plan_;
+
+  // Apply the router + dispatch table/formula stages on a single page.
+  // No-op (returns immediately) unless `router_` is loaded AND `out.layout`
+  // is non-empty — text-only callers see zero new CUDA API calls.
+  void dispatch_router_(OcrPipelineResult &out,
+                        const GpuImage &gpu_img,
+                        const std::vector<Box> &boxes,
+                        PipelineTimer &timer);
 };
 
 } // namespace turbo_ocr::pipeline

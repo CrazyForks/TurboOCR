@@ -176,8 +176,11 @@ static bool build_engine(const std::string &onnx_path,
     size_t scaled = static_cast<size_t>((1ULL << 30) * scale);
     workspace_bytes = std::min(scaled, size_t(4ULL << 30));
     if (workspace_bytes < (1ULL << 30)) workspace_bytes = 1ULL << 30;
+  } else if (type == "slanext_wired" || type == "slanext_wireless" ||
+             type == "formula") {
+    workspace_bytes = 2ULL << 30;          // 2 GiB (plan 07 §5)
   } else {
-    workspace_bytes = 1ULL << 30;          // rec, cls
+    workspace_bytes = 1ULL << 30;          // rec, cls, table_cls, table_cell_*
   }
   config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, workspace_bytes);
   config->setFlag(nvinfer1::BuilderFlag::kFP16);
@@ -235,6 +238,66 @@ static bool build_engine(const std::string &onnx_path,
         return false;
       }
     }
+  } else if (type == "table_cls") {
+    // PP-LCNet_x1_0_table_cls (224×224, 2 classes wired/wireless). Shape
+    // profile from turbostruct-rs/crates/turbostruct-engine/src/builder/
+    // profiles.rs::populate_table_cls (lines 166-183).
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{1, 3, 224, 224});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{1, 3, 224, 224});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{8, 3, 224, 224});
+  } else if (type == "table_cell_wired" || type == "table_cell_wireless") {
+    // RT-DETR-L_{wired,wireless}_table_cell_det — same triple-input contract
+    // as PP-DocLayoutV3 but at 640×640. Profile from profiles.rs::
+    // populate_table_cell (lines 185-222).
+    for (int i = 0; i < network->getNbInputs(); ++i) {
+      auto *in = network->getInput(i);
+      std::string name = in->getName();
+      if (name == "image") {
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kMIN,
+            nvinfer1::Dims4{1, 3, 640, 640});
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kOPT,
+            nvinfer1::Dims4{1, 3, 640, 640});
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kMAX,
+            nvinfer1::Dims4{4, 3, 640, 640});
+      } else if (name == "im_shape" || name == "scale_factor") {
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kMIN,
+            nvinfer1::Dims2{1, 2});
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kOPT,
+            nvinfer1::Dims2{1, 2});
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kMAX,
+            nvinfer1::Dims2{4, 2});
+      } else {
+        std::cerr << "[TRT] Unexpected input for " << type << ": " << name
+                  << '\n';
+        return false;
+      }
+    }
+  } else if (type == "slanext_wired" || type == "slanext_wireless") {
+    // SLANeXt {wired,wireless} encoder, 488×488. Decoder Loop body is part
+    // of the same engine — internal dynamic dim handled by TRT. Profile from
+    // profiles.rs::populate_slanext (lines 224-243).
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{1, 3, 488, 488});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{1, 3, 488, 488});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{4, 3, 488, 488});
+  } else if (type == "formula") {
+    // PP-FormulaNet-S — single grayscale 384×384 input, MTP-K=3 decoder
+    // Loop op. Profile from profiles.rs::populate_formula (lines 245-276).
+    // HGNetV2-B4 encoder carries Q/DQ ops baked into the ONNX; TRT honors
+    // those under FP16 weakly-typed networks. Do NOT setFlag(kINT8) with a
+    // fresh calibrator here — the decoder Loop body must stay FP16 (plan
+    // 07 §5).
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{1, 1, 384, 384});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{1, 1, 384, 384});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{8, 1, 384, 384});
   } else {
     // cls: PP-OCRv5 textline orientation classifier (PP-LCNet_x0_25), input
     // 80x160. Must match kClsImageH/kClsImageW in classification/paddle_cls.h.

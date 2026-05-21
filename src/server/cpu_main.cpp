@@ -263,6 +263,7 @@ int main(int argc, char **argv) {
   const turbo_ocr::pdf::PdfMode default_pdf_mode = cfg.default_pdf_mode;
 
   turbo_ocr::routes::register_pdf_route(work_pool, infer, pdf_renderer, default_pdf_mode, layout_available);
+  turbo_ocr::routes::register_pdf_image_route(work_pool, pdf_renderer);
 
   // --- /ocr/batch endpoint (CPU version) ---
   drogon::app().registerHandler(

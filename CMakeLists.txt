@@ -176,6 +176,10 @@ if(USE_CPU_ONLY)
         COMMENT "Generating protobuf/gRPC sources (CPU)"
     )
 
+    # libjpeg-turbo for CPU build too.
+    find_library(TURBOJPEG_LIB turbojpeg REQUIRED)
+    find_package(OpenSSL REQUIRED)
+
     # --- CPU library ---
     add_library(turbo_ocr_cpu STATIC
         src/engine/cpu_engine.cpp
@@ -186,13 +190,16 @@ if(USE_CPU_ONLY)
         src/layout/cpu_paddle_layout.cpp
         src/render/pdf_renderer.cpp
         src/pdf/pdf_text_layer.cpp
+        src/pdf/page_image_encoder.cpp
+        src/pdf/page_image_cache.cpp
     )
     target_include_directories(turbo_ocr_cpu PUBLIC
         ${CMAKE_SOURCE_DIR}/third_party/pdfium/include
         ${ONNXRUNTIME_INCLUDE_DIR}
     )
     target_link_libraries(turbo_ocr_cpu PUBLIC turbo_ocr_common ${ONNXRUNTIME_LIB}
-        ${CMAKE_SOURCE_DIR}/third_party/pdfium/lib/libpdfium.so pthread)
+        ${CMAKE_SOURCE_DIR}/third_party/pdfium/lib/libpdfium.so pthread
+        ${TURBOJPEG_LIB} OpenSSL::Crypto)
     target_compile_options(turbo_ocr_cpu PRIVATE ${TURBO_OCR_CXX_FLAGS})
     target_compile_definitions(turbo_ocr_cpu PUBLIC USE_CPU_ONLY)
     add_library(turbo_ocr::cpu ALIAS turbo_ocr_cpu)
@@ -292,6 +299,8 @@ else()
         src/kernels/jfa.cu
         src/render/pdf_renderer.cpp
         src/pdf/pdf_text_layer.cpp
+        src/pdf/page_image_encoder.cpp
+        src/pdf/page_image_cache.cpp
     )
     target_include_directories(turbo_ocr_gpu PUBLIC
         ${CUDAToolkit_INCLUDE_DIRS}
@@ -305,6 +314,14 @@ else()
     # in bin/ by scripts/install_fastpdf2png.sh (so native dev + Docker
     # builds both resolve it at runtime). Docker additionally copies it to
     # /usr/lib via ldconfig in Dockerfile.gpu:49.
+    # libjpeg-turbo: fast JPEG encode for page image export.
+    find_library(TURBOJPEG_LIB turbojpeg REQUIRED)
+    message(STATUS "libjpeg-turbo: ${TURBOJPEG_LIB}")
+
+    # OpenSSL (libcrypto) for SHA-256 in page image cache keys.
+    # Drogon already links it transitively; we make it explicit for the GPU lib.
+    find_package(OpenSSL REQUIRED)
+
     target_link_libraries(turbo_ocr_gpu PUBLIC
         turbo_ocr_common
         nvinfer
@@ -313,6 +330,8 @@ else()
         nvjpeg
         cudart
         ${CMAKE_SOURCE_DIR}/third_party/pdfium/lib/libpdfium.so
+        ${TURBOJPEG_LIB}
+        OpenSSL::Crypto
     )
     target_compile_options(turbo_ocr_gpu PRIVATE ${TURBO_OCR_CXX_FLAGS})
     add_library(turbo_ocr::gpu ALIAS turbo_ocr_gpu)

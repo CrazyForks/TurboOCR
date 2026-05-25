@@ -11,7 +11,7 @@
 namespace turbo_ocr::pdf {
 
 PageImageFormat parse_page_image_format(const char *s) noexcept {
-  if (!s) return PageImageFormat::Jpeg;
+  if (!s) return PageImageFormat::Png;
   // Case-insensitive prefix comparison
   auto eq = [](const char *a, const char *b) noexcept {
     while (*a && *b) {
@@ -25,7 +25,7 @@ PageImageFormat parse_page_image_format(const char *s) noexcept {
   if (eq(s, "jpeg") || eq(s, "jpg")) return PageImageFormat::Jpeg;
   if (eq(s, "png"))                   return PageImageFormat::Png;
   if (eq(s, "webp"))                  return PageImageFormat::WebP;
-  return PageImageFormat::Jpeg;
+  return PageImageFormat::Png;
 }
 
 const char *page_image_format_name(PageImageFormat fmt) noexcept {
@@ -85,7 +85,7 @@ std::vector<uint8_t> encode_page_image(const cv::Mat &bgr,
         &out_buf, &out_size,
         TJSAMP_420,
         opts.quality,
-        TJFLAG_FASTDCT | TJFLAG_NOREALLOC * 0);
+        TJFLAG_FASTDCT);
 
     tjDestroy(tj);
     if (rc != 0 || out_buf == nullptr) {
@@ -98,16 +98,28 @@ std::vector<uint8_t> encode_page_image(const cv::Mat &bgr,
     return result;
   }
 
-  // PNG and WebP via OpenCV (acceptable — only used on explicit request).
+  // PNG and WebP via OpenCV. (A SIMD PNG encoder like fpnge was evaluated and
+  // rejected: it encodes faster but produces ~2× larger files, and since the
+  // image is base64-embedded in the JSON response, payload size — not encode
+  // CPU — dominates end-to-end. For small lossless output prefer WebP, which
+  // is ~3× smaller than PNG here.)
   std::vector<int> params;
   std::string ext;
   if (opts.format == PageImageFormat::Png) {
     ext = ".png";
-    // PNG compression 6 is OpenCV default — good balance of speed/size.
-    params = {cv::IMWRITE_PNG_COMPRESSION, 6};
+    // PNG compression level: 0=fastest/biggest, 9=slowest/smallest.
+    // Default 3 = good speed-size sweet spot.
+    int comp = std::clamp(opts.png_compression, 0, 9);
+    params = {cv::IMWRITE_PNG_COMPRESSION, comp};
   } else {
     ext = ".webp";
-    params = {cv::IMWRITE_WEBP_QUALITY, opts.quality};
+    if (opts.lossless) {
+      // OpenCV convention: WEBP_QUALITY=101 triggers libwebp lossless mode.
+      // Bit-exact reconstruction; slower than lossy but pixel-perfect.
+      params = {cv::IMWRITE_WEBP_QUALITY, 101};
+    } else {
+      params = {cv::IMWRITE_WEBP_QUALITY, opts.quality};
+    }
   }
 
   std::vector<uint8_t> buf;

@@ -276,7 +276,6 @@ int main(int argc, char **argv) {
   turbo_ocr::routes::register_ocr_base64_route(work_pool, infer, decode, layout_available);
   turbo_ocr::routes::register_image_routes(work_pool, *dispatcher, decode, nvjpeg_available, layout_available);
   turbo_ocr::routes::register_pdf_route(work_pool, *dispatcher, pdf_renderer, default_pdf_mode, layout_available);
-  turbo_ocr::routes::register_pdf_image_route(work_pool, pdf_renderer);
 
   // gRPC
   auto grpc_handle = turbo_ocr::server::start_grpc_server(

@@ -15,7 +15,7 @@ enum class PageImageFormat {
   WebP,
 };
 
-/// Parse format string (case-insensitive). Returns Jpeg on unknown.
+/// Parse format string (case-insensitive). Returns Png on unknown.
 PageImageFormat parse_page_image_format(const char *s) noexcept;
 
 /// Human-readable format name used in Content-Type and URL paths.
@@ -23,9 +23,14 @@ const char *page_image_format_name(PageImageFormat fmt) noexcept;
 const char *page_image_content_type(PageImageFormat fmt) noexcept;
 
 struct EncodeOptions {
-  PageImageFormat format  = PageImageFormat::Jpeg;
-  int             quality = 85;   // JPEG/WebP quality (1–100)
-  int             max_side = 0;   // 0 = no resize; >0 = fit within max_side px
+  PageImageFormat format   = PageImageFormat::Png;
+  // PNG is always lossless. `lossless` only affects WebP (default true there too).
+  bool            lossless = true;
+  int             quality  = 85;   // Used for JPEG and lossy WebP. Ignored for PNG.
+  // PNG compression level: 0 = no compression (largest, fastest),
+  // 9 = max compression (smallest, slowest). 3 = good speed-size sweet spot.
+  int             png_compression = 3;
+  int             max_side = 0;    // 0 = no resize; >0 = fit within max_side px
 };
 
 /// Encode a BGR cv::Mat to compressed bytes.

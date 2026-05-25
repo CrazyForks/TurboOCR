@@ -22,9 +22,4 @@ void register_pdf_route(server::WorkPool &pool,
                         pdf::PdfMode default_pdf_mode,
                         bool layout_available);
 
-/// Register GET /pdf/images/{sha}/{page_idx}.{format} — cached page image retrieval.
-/// Must be called after any register_pdf_route() call so the cache is warm.
-void register_pdf_image_route(server::WorkPool &pool,
-                               render::PdfRenderer &pdf_renderer);
-
 } // namespace turbo_ocr::routes

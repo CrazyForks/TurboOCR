@@ -17,8 +17,6 @@
 #include <json/json.h>
 
 #include "turbo_ocr/common/serialization.h"
-#include "turbo_ocr/common/sha256.h"
-#include "turbo_ocr/pdf/page_image_cache.h"
 #include "turbo_ocr/pdf/page_image_encoder.h"
 #include "turbo_ocr/pdf/pdf_text_layer.h"
 #include "turbo_ocr/server/server_types.h"
@@ -56,13 +54,14 @@ int max_pdf_pages() {
 // page result at point coordinates (DPI=72); the caller scales to pixel
 // coordinates only when the resolved mode is geometric (so layout output,
 // which is in pixel space, doesn't get rescaled twice).
-// Image mode for /ocr/pdf?images=... query param.
-enum class ImageMode { None, Refs, Inline };
+// Image mode for /ocr/pdf?images=... query param. Only "inline" is supported;
+// the page image is embedded as base64 in the JSON response. There is no
+// server-side cache and no GET retrieval endpoint.
+enum class ImageMode { None, Inline };
 
 ImageMode parse_image_mode(const std::string &s) noexcept {
-  if (s == "1" || s == "true" || s == "on" || s == "yes" || s == "refs")
-    return ImageMode::Refs;
-  if (s == "inline") return ImageMode::Inline;
+  if (s == "1" || s == "true" || s == "on" || s == "yes" || s == "inline")
+    return ImageMode::Inline;
   return ImageMode::None;
 }
 
@@ -252,6 +251,7 @@ void open_pdf_for_text_layer(const uint8_t *pdf_data, size_t pdf_len_local,
 template <typename PageResult>
 void prepopulate_pages(pdf::PdfMode mode,
                        bool layout_or_want_layout,
+                       bool want_page_image,
                        const std::vector<pdf::PdfPageText> &page_text_cache,
                        std::vector<PageResult> &page_results,
                        std::vector<uint8_t> &need_render,
@@ -302,6 +302,16 @@ void prepopulate_pages(pdf::PdfMode mode,
         break;
       default: break;
     }
+
+    // A page image was requested. Text-layer pages (geometric / auto with a
+    // trusted layer) skip rasterization for OCR, so force a render here —
+    // otherwise the encoder has no pixels and the page comes back with no
+    // image. The OCR text still comes from the resolved mode; only the
+    // rendered image is added.
+    if (want_page_image && !need_render[static_cast<size_t>(p)]) {
+      need_render[static_cast<size_t>(p)] = 1;
+      if (any_need_render) *any_need_render = true;
+    }
   }
 }
 
@@ -316,7 +326,6 @@ std::string emit_pdf_response(std::vector<PageResult> &page_results,
                                int request_dpi,
                                bool want_blocks = false,
                                ImageMode image_mode = ImageMode::None,
-                               const std::string &pdf_sha = {},
                                const pdf::EncodeOptions &encode_opts = {}) {
   size_t n_pages = page_results.size();
   size_t total_results = 0;
@@ -351,17 +360,8 @@ std::string emit_pdf_response(std::vector<PageResult> &page_results,
     json_str += pg.text_layer_quality;
     json_str += '"';
 
-    // Append image data/ref when requested.
-    if (image_mode == ImageMode::Refs && !pdf_sha.empty()) {
-      const char *fmt = pdf::page_image_format_name(encode_opts.format);
-      json_str += ",\"image_ref\":\"/pdf/images/";
-      json_str += pdf_sha;
-      json_str += '/';
-      json_str += std::to_string(i);
-      json_str += '.';
-      json_str += fmt;
-      json_str += '"';
-    } else if (image_mode == ImageMode::Inline && !pg.encoded_image.empty()) {
+    // Append image data when requested (inline base64 in the JSON response).
+    if (image_mode == ImageMode::Inline && !pg.encoded_image.empty()) {
       // Base64-encode the raw image bytes.
       // simdutf base64_from_binary writes directly to a pre-allocated buffer.
       const auto &raw = pg.encoded_image;
@@ -400,12 +400,33 @@ std::string parse_image_query_params(const drogon::HttpRequestPtr &req,
   if (!fmt_str.empty())
     encode_opts.format = pdf::parse_page_image_format(fmt_str.c_str());
 
+  // lossless: defaults to true (set in EncodeOptions). Accept 0/1/true/false/yes/no.
+  auto lossless_str = req->getParameter("lossless");
+  if (!lossless_str.empty()) {
+    if (lossless_str == "0" || lossless_str == "false" || lossless_str == "no" || lossless_str == "off")
+      encode_opts.lossless = false;
+    else if (lossless_str == "1" || lossless_str == "true" || lossless_str == "yes" || lossless_str == "on")
+      encode_opts.lossless = true;
+    else
+      return "lossless must be 0/1/true/false";
+  }
+
+  // PNG compression level 0-9 (default 3). Lower = faster, larger; higher = slower, smaller.
+  auto png_comp_str = req->getParameter("png_compression");
+  if (!png_comp_str.empty()) {
+    int c = std::atoi(png_comp_str.c_str());
+    if (c < 0 || c > 9) return "png_compression must be 0-9";
+    encode_opts.png_compression = c;
+  }
+
   auto quality_str = req->getParameter("quality");
   if (!quality_str.empty()) {
     int q = std::atoi(quality_str.c_str());
     if (q < 1 || q > 100)
       return "quality must be 1-100";
     encode_opts.quality = q;
+    // If the client explicitly set quality, they want lossy. Honor it.
+    if (lossless_str.empty()) encode_opts.lossless = false;
   }
 
   auto max_side_str = req->getParameter("max_side");
@@ -417,20 +438,6 @@ std::string parse_image_query_params(const drogon::HttpRequestPtr &req,
   }
 
   return {};
-}
-
-// Encode rendered image and store in LRU cache.
-std::string encode_and_cache_page(const cv::Mat &img,
-                                   const std::string &pdf_sha,
-                                   int page_idx,
-                                   int dpi,
-                                   const pdf::EncodeOptions &opts) {
-  auto encoded = pdf::encode_page_image(img, opts);
-  if (encoded.empty()) return {};
-  const char *fmt = pdf::page_image_format_name(opts.format);
-  auto key = pdf::PageImageCache::make_key(pdf_sha, page_idx, fmt, dpi);
-  pdf::PageImageCache::instance().put(key, std::move(encoded));
-  return key;
 }
 
 #ifndef USE_CPU_ONLY
@@ -466,7 +473,6 @@ struct GpuPdfPageResult : public PdfPageResultBase {};
     std::vector<std::future<void>> &page_futures,
     std::mutex &futures_mutex,
     ImageMode image_mode = ImageMode::None,
-    const std::string &pdf_sha = {},
     const pdf::EncodeOptions &encode_opts = {}) {
   return pdf_renderer.render_streamed(pdf_data, pdf_len_local, dpi,
       [&](int page_idx, std::string ppm_path) {
@@ -500,9 +506,7 @@ struct GpuPdfPageResult : public PdfPageResultBase {};
             // (~5-15ms libjpeg-turbo) overlaps with the GPU waiting for the
             // next batch and adds <5% to total pipeline latency.
             std::vector<uint8_t> encoded_img;
-            if (image_mode == ImageMode::Refs) {
-              encode_and_cache_page(img, pdf_sha, page_idx, dpi, encode_opts);
-            } else if (image_mode == ImageMode::Inline) {
+            if (image_mode == ImageMode::Inline) {
               encoded_img = pdf::encode_page_image(img, encode_opts);
             }
 
@@ -518,8 +522,13 @@ struct GpuPdfPageResult : public PdfPageResultBase {};
             std::vector<layout::LayoutBox> layout_snapshot;
 
             if (page_mode == pdf::PdfMode::Geometric) {
-              auto lo = e.pipeline->run_layout_only(img, e.stream);
-              layout_snapshot = std::move(lo.layout);
+              // Geometric pages keep their text-layer results; only run the
+              // layout pass when the client asked for it. A page rendered
+              // solely to produce its image (no layout requested) skips this.
+              if (layout_enabled) {
+                auto lo = e.pipeline->run_layout_only(img, e.stream);
+                layout_snapshot = std::move(lo.layout);
+              }
             } else {
               auto pipeline_out = e.pipeline->run_with_layout(
                   img, e.stream, layout_enabled, want_reading_order);
@@ -586,76 +595,6 @@ struct GpuPdfPageResult : public PdfPageResultBase {};
 }
 #endif // !USE_CPU_ONLY
 
-// CPU streamed render callback. Sequential: decode PPM, run the InferFunc
-// inline. mode==Ocr means we never visited prepopulate_pages, so resolved
-// mode is pinned here. Geometric pages keep their layer-derived text and
-// just rescale point→pixel coords.
-int run_streamed_render_cpu(
-    const server::InferFunc &infer,
-    render::PdfRenderer &pdf_renderer,
-    const uint8_t *pdf_data, size_t pdf_len_local,
-    int dpi, bool want_layout, bool want_reading_order, pdf::PdfMode mode,
-    std::vector<PdfPageResultBase> &page_results,
-    const std::vector<uint8_t> &need_render) {
-  auto stream_handle = pdf_renderer.render_streamed(pdf_data, pdf_len_local, dpi,
-      [&](int page_idx, std::string ppm_path) {
-        if (mode != pdf::PdfMode::Ocr &&
-            page_idx < static_cast<int>(need_render.size()) &&
-            !need_render[static_cast<size_t>(page_idx)])
-          return;
-
-        cv::Mat img = render::PdfRenderer::decode_ppm(ppm_path);
-        if (img.empty()) return;
-
-        if (page_idx >= static_cast<int>(page_results.size()))
-          page_results.resize(page_idx + 1);
-        auto &pg = page_results[static_cast<size_t>(page_idx)];
-
-        turbo_ocr::server::InferOptions inf_opts;
-        inf_opts.want_layout = want_layout;
-        inf_opts.want_reading_order = want_reading_order;
-        // mode==Ocr means the per-page resolved_mode wasn't set up
-        // front (we skipped the text-layer pre-pass entirely), so
-        // pin it to Ocr here. For non-ocr modes pg.resolved_mode is
-        // already set per page.
-        if (mode == pdf::PdfMode::Ocr)
-          pg.resolved_mode = pdf::PdfMode::Ocr;
-
-        if (pg.resolved_mode == pdf::PdfMode::Geometric) {
-          // Text already filled from layer in pt-space; only run
-          // layout (when requested) and rescale text boxes from
-          // points to pixel space matching the rendered image.
-          if (want_layout) {
-            auto inf = infer(img, inf_opts);
-            pg.layout = std::move(inf.layout);
-          }
-          pg.width = img.cols;
-          pg.height = img.rows;
-          pg.effective_dpi = dpi;
-          const float pt_to_px = static_cast<float>(dpi) / 72.0f;
-          for (auto &item : pg.results) {
-            for (int k = 0; k < 4; ++k) {
-              item.box[k][0] = static_cast<int>(
-                  std::round(item.box[k][0] * pt_to_px));
-              item.box[k][1] = static_cast<int>(
-                  std::round(item.box[k][1] * pt_to_px));
-            }
-          }
-        } else {
-          // Ocr branch: full pipeline, results from rec.
-          auto inf = infer(img, inf_opts);
-          pg.results = std::move(inf.results);
-          pg.layout = std::move(inf.layout);
-          pg.reading_order = std::move(inf.reading_order);
-          pg.width = img.cols;
-          pg.height = img.rows;
-          pg.effective_dpi = dpi;
-          for (auto &item : pg.results) item.source = "ocr";
-        }
-      });
-  return stream_handle.num_pages;
-}
-
 } // namespace
 
 #ifndef USE_CPU_ONLY
@@ -716,17 +655,10 @@ void register_pdf_route(server::WorkPool &pool,
     if (pdf_buf->empty())
       pdf_buf->assign(pdf_ptr, pdf_len);
 
-    // Compute PDF SHA once on the event loop — cheap (64 bytes of output).
-    std::string pdf_sha;
-    if (image_mode != ImageMode::None) {
-      pdf_sha = turbo_ocr::sha256_hex(pdf_buf->data(), pdf_buf->size());
-    }
-
     server::submit_work(pool, std::move(callback),
         [pdf_buf, req, &dispatcher, &pdf_renderer,
          layout_enabled, want_reading_order, want_blocks,
-         dpi, req_mode, image_mode, encode_opts,
-         pdf_sha = std::move(pdf_sha)](server::DrogonCallback &cb) {
+         dpi, req_mode, image_mode, encode_opts](server::DrogonCallback &cb) {
       const auto *pdf_data = reinterpret_cast<const uint8_t *>(pdf_buf->data());
       size_t pdf_len_local = pdf_buf->size();
 
@@ -749,7 +681,8 @@ void register_pdf_route(server::WorkPool &pool,
       bool any_need_render = (mode == pdf::PdfMode::Ocr);
 
       if (mode != pdf::PdfMode::Ocr) {
-        prepopulate_pages(mode, layout_enabled, page_text_cache,
+        prepopulate_pages(mode, layout_enabled,
+                          image_mode != ImageMode::None, page_text_cache,
                           page_results, need_render, &any_need_render);
       }
 
@@ -777,7 +710,7 @@ void register_pdf_route(server::WorkPool &pool,
                                    pdf_doc.get(), page_text_cache,
                                    results_mutex, page_results, need_render,
                                    page_futures, futures_mutex,
-                                   image_mode, pdf_sha, encode_opts);
+                                   image_mode, encode_opts);
           num_pages = stream_handle.num_pages;
         } catch (const std::exception &e) {
           for (auto &f : page_futures) { try { f.get(); } catch (...) {} }
@@ -816,7 +749,7 @@ void register_pdf_route(server::WorkPool &pool,
           trimmed.push_back(std::move(page_results[i]));
       }
       cb(server::json_response(emit_pdf_response(trimmed, dpi, want_blocks,
-                                                  image_mode, pdf_sha, encode_opts)));
+                                                  image_mode, encode_opts)));
     });
   }, {drogon::Post});
 }
@@ -877,16 +810,10 @@ void register_pdf_route(server::WorkPool &pool,
 
     auto pdf_buf = std::make_shared<std::string>(pdf_ptr, pdf_len);
 
-    std::string pdf_sha;
-    if (image_mode != ImageMode::None) {
-      pdf_sha = turbo_ocr::sha256_hex(pdf_buf->data(), pdf_buf->size());
-    }
-
     server::submit_work(pool, std::move(callback),
         [pdf_buf, &infer, &pdf_renderer, want_layout,
          want_reading_order, want_blocks, dpi,
-         req_mode, image_mode, encode_opts,
-         pdf_sha = std::move(pdf_sha)](server::DrogonCallback &cb) {
+         req_mode, image_mode, encode_opts](server::DrogonCallback &cb) {
       const auto *pdf_data = reinterpret_cast<const uint8_t *>(pdf_buf->data());
       size_t pdf_len_local = pdf_buf->size();
 
@@ -917,7 +844,8 @@ void register_pdf_route(server::WorkPool &pool,
       // mode=geometric / mode=auto consult the text layer first and only
       // render when necessary.
       if (mode != pdf::PdfMode::Ocr) {
-        prepopulate_pages(mode, want_layout, page_text_cache,
+        prepopulate_pages(mode, want_layout,
+                          image_mode != ImageMode::None, page_text_cache,
                           page_results, need_render, /*any_need_render=*/nullptr);
       }
 
@@ -945,10 +873,8 @@ void register_pdf_route(server::WorkPool &pool,
                   page_results.resize(page_idx + 1);
                 auto &pg = page_results[static_cast<size_t>(page_idx)];
 
-                // Encode + cache/store image before running OCR.
-                if (image_mode == ImageMode::Refs) {
-                  encode_and_cache_page(img, pdf_sha, page_idx, dpi, encode_opts);
-                } else if (image_mode == ImageMode::Inline) {
+                // Encode the page image inline (only mode supported now).
+                if (image_mode == ImageMode::Inline) {
                   pg.encoded_image = pdf::encode_page_image(img, encode_opts);
                 }
 
@@ -1003,79 +929,9 @@ void register_pdf_route(server::WorkPool &pool,
       }
 
       cb(server::json_response(emit_pdf_response(page_results, dpi, want_blocks,
-                                                  image_mode, pdf_sha, encode_opts)));
+                                                  image_mode, encode_opts)));
     });
   }, {drogon::Post});
-}
-
-// ---------------------------------------------------------------------------
-// GET /pdf/images/{sha}/{page_idx}.{format}
-// ---------------------------------------------------------------------------
-// Cache-hit path: LRU lookup → raw bytes + Content-Type header → <5 ms.
-// Cache-miss path: no on-demand re-render yet (future work). Returns 404.
-// Clients that use images=refs pattern should request the image promptly
-// after the /ocr/pdf response — the cache is warm for the duration of
-// IMG_CACHE_MB worth of recent renders.
-void register_pdf_image_route(server::WorkPool &pool,
-                               render::PdfRenderer & /*pdf_renderer*/) {
-  (void)pool;
-  drogon::app().registerHandler(
-      "/pdf/images/{sha}/{page_file}",
-      [](const drogon::HttpRequestPtr &req,
-         std::function<void(const drogon::HttpResponsePtr &)> &&callback,
-         const std::string &sha,
-         const std::string &page_file) {
-        (void)req;
-        // Parse page_file: "N.jpeg" / "N.png" / "N.webp"
-        auto dot = page_file.rfind('.');
-        if (dot == std::string::npos || dot == 0) {
-          callback(server::error_response(drogon::k400BadRequest, "BAD_PATH",
-                                          "Expected {page_idx}.{format}"));
-          return;
-        }
-        int page_idx = std::atoi(page_file.substr(0, dot).c_str());
-        std::string fmt = page_file.substr(dot + 1);
-
-        // Try all common DPI values; the cache key includes dpi so we
-        // scan the known range to find any matching entry. In practice the
-        // caller knows the DPI from the /ocr/pdf response and should use
-        // the right URL — but for convenience we also support DPI as a
-        // query param.
-        int dpi = 100;
-        auto dpi_str = req->getParameter("dpi");
-        if (!dpi_str.empty()) dpi = std::atoi(dpi_str.c_str());
-
-        auto key = pdf::PageImageCache::make_key(sha, page_idx, fmt.c_str(), dpi);
-        auto cached = pdf::PageImageCache::instance().get(key);
-
-        if (!cached || cached->empty()) {
-          // Try to find in cache with any DPI by iterating common values.
-          // This is a convenience fallback for clients that don't supply dpi=.
-          for (int d : {72, 100, 150, 200, 300}) {
-            if (d == dpi) continue;
-            auto k2 = pdf::PageImageCache::make_key(sha, page_idx, fmt.c_str(), d);
-            cached = pdf::PageImageCache::instance().get(k2);
-            if (cached && !cached->empty()) break;
-          }
-        }
-
-        if (!cached || cached->empty()) {
-          callback(server::error_response(drogon::k404NotFound, "NOT_CACHED",
-              "Page image not in cache. Re-POST the PDF with images=refs to populate the cache."));
-          return;
-        }
-
-        auto resp = drogon::HttpResponse::newHttpResponse();
-        resp->setStatusCode(drogon::k200OK);
-        resp->setBody(std::string(
-            reinterpret_cast<const char *>(cached->data()), cached->size()));
-        auto ct = pdf::page_image_content_type(
-            pdf::parse_page_image_format(fmt.c_str()));
-        resp->setContentTypeString(ct);
-        resp->addHeader("Cache-Control", "max-age=3600");
-        callback(resp);
-      },
-      {drogon::Get});
 }
 
 } // namespace turbo_ocr::routes

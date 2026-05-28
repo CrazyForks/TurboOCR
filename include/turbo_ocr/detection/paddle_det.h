@@ -24,6 +24,14 @@ public:
   /// Load a TensorRT detection engine and allocate GPU buffers.
   [[nodiscard]] bool load_model(const std::string &model_path);
 
+  /// PDF-only static-engine warmup: issue one inference at exactly
+  /// {B, 3, H, W} (the only shape the static det_pdf_static engine
+  /// accepts) on dummy device data. Caller-owned stream; the call
+  /// syncs the stream once before returning. Returns false on a TRT
+  /// infer error, true otherwise.
+  [[nodiscard]] bool warmup_pdf_static(int B, int H, int W,
+                                        cudaStream_t stream = 0);
+
   // Takes GpuImage directly - no double upload
   [[nodiscard]] std::vector<Box> run(const GpuImage &gpu_img, int orig_h, int orig_w,
                                      cudaStream_t stream = 0);

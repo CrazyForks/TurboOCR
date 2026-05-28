@@ -29,6 +29,11 @@ public:
   // Eagerly allocate all GPU/pinned buffers (called during warmup)
   void allocate_buffers();
 
+  /// PDF-only static-engine warmup: submit one TRT inference at exactly
+  /// {B, 3, 80, 160} on dummy data. Required because the cached
+  /// cls_pdf_static engine rejects any other shape. Syncs `stream`.
+  [[nodiscard]] bool warmup_pdf_static(int B, cudaStream_t stream = 0);
+
 private:
   static constexpr int kClsBatchNum = 128;
   // PP-OCRv5 textline orientation classifier (PP-LCNet_x0_25) expects

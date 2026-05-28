@@ -1,5 +1,6 @@
 #include "turbo_ocr/pipeline/ocr_pipeline.h"
 #include "turbo_ocr/common/cuda_check.h"
+#include "turbo_ocr/common/errors.h"
 #include "turbo_ocr/common/timing.h"
 #include "turbo_ocr/decode/gpu_image.h"
 #include "turbo_ocr/common/serialization.h"
@@ -193,6 +194,37 @@ bool OcrPipeline::load_layout_model(const std::string &layout_trt_path) {
 }
 
 void OcrPipeline::warmup_gpu(cudaStream_t stream) {
+  // PDF-only static-engine warmup. The static engines accept only the
+  // single profile shape they were built with, so the normal dynamic-shape
+  // warmup below (run() on a 100×100 dummy, then 5 rec width buckets)
+  // would abort with InferenceError. Issue exactly one batched dummy
+  // inference at the static shape on each engine instead. Env vars match
+  // ServerConfig: TURBO_OCR_PDF_BATCH/_PAGE_H/_PAGE_W and _REC_BATCH/_REC_W.
+  auto env_int = [](const char *name, int def) {
+    if (const char *v = std::getenv(name)) {
+      try { return std::stoi(v); } catch (...) {}
+    }
+    return def;
+  };
+  const char *pdf_only_env = std::getenv("TURBO_OCR_PDF_ONLY");
+  if (pdf_only_env && std::string(pdf_only_env) == "1") {
+    const int B  = env_int("TURBO_OCR_PDF_BATCH",      8);
+    const int H  = env_int("TURBO_OCR_PDF_PAGE_H",  1280);
+    const int W  = env_int("TURBO_OCR_PDF_PAGE_W",   960);
+    const int Br = env_int("TURBO_OCR_PDF_REC_BATCH", 32);
+    const int Wr = env_int("TURBO_OCR_PDF_REC_W",    320);
+    if (!det_->warmup_pdf_static(B, H, W, stream))
+      throw turbo_ocr::InferenceError("[pdf_only] det static warmup failed");
+    if (use_cls_ && !cls_->warmup_pdf_static(B, stream))
+      throw turbo_ocr::InferenceError("[pdf_only] cls static warmup failed");
+    if (!rec_->warmup_pdf_static(Br, Wr, stream))
+      throw turbo_ocr::InferenceError("[pdf_only] rec static warmup failed");
+    std::cout << "[Pipeline] PDF-only warmup complete (static engines)"
+              << " B=" << B << " H=" << H << " W=" << W
+              << " RecB=" << Br << " RecW=" << Wr << '\n';
+    return;
+  }
+
   // Run full pipeline with a dummy image to trigger TRT JIT and lazy GPU allocations.
   // If layout is enabled, the first run(...) call below will already hit the
   // layout TRT engine via the run() body — no separate layout warmup needed.

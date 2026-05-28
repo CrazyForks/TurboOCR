@@ -362,6 +362,27 @@ PaddleDet::run(const GpuImage &gpu_img, int orig_h, int orig_w,
 }
 
 // ============================================================================
+// PDF-only static-engine warmup
+// ============================================================================
+bool PaddleDet::warmup_pdf_static(int B, int H, int W, cudaStream_t stream) {
+  // Bind the batched I/O slot — the cached static engine expects exactly
+  // {B, 3, H, W}, which is what its profile was built with.
+  engine_->bind_io(d_batch_input_.get(), d_batch_output_.get());
+  const size_t in_floats = static_cast<size_t>(B) * 3 * H * W;
+  // Zero-fill input on device; the actual values don't matter for warmup,
+  // we just need TRT to JIT and lazy-alloc with this exact shape.
+  CUDA_CHECK(cudaMemsetAsync(d_batch_input_.get(), 0,
+                              in_floats * sizeof(float), stream));
+  nvinfer1::Dims4 dims{B, 3, H, W};
+  bool ok = engine_->infer_dynamic(dims, stream);
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  // Restore single-image binding so any future dynamic-shape callers find
+  // the right slot. In pdf_only mode no one should call run() anyway.
+  engine_->bind_io(d_input_.get(), d_output_.get());
+  return ok;
+}
+
+// ============================================================================
 // Batched detection: process N images in a single TRT inference call.
 // All images are resized to the same target dimensions (max of the batch).
 // ============================================================================

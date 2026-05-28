@@ -45,6 +45,11 @@ public:
   // Eagerly allocate all GPU/pinned buffers (called during warmup)
   void allocate_buffers();
 
+  /// PDF-only static-engine warmup: submit one TRT inference at exactly
+  /// {B, 3, 48, W} (the cached rec_pdf_static engine's only accepted
+  /// profile). Syncs `stream`.
+  [[nodiscard]] bool warmup_pdf_static(int B, int W, cudaStream_t stream = 0);
+
 private:
   std::vector<std::string> label_list_;
   int rec_batch_num_ = 32;

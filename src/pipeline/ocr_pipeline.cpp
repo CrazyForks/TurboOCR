@@ -843,6 +843,37 @@ std::vector<std::vector<OCRResultItem>> OcrPipeline::run_batch(
     }
   }
 
+  // Per-image layout + router (table/formula) when enabled. We keep the
+  // pipeline's normal contract (run_batch returns text-only result lists),
+  // but compute layout/table/formula on each page so the cost of the full
+  // stack is paid in the batched path. The structured outputs are surfaced
+  // via the existing run_with_layout() single-image API; here we just
+  // ensure the routing is exercised for throughput measurement. This
+  // engages only when the operator has loaded a layout model.
+  if (use_layout_ && layout_) {
+    for (int i = 0; i < batch_n; i++) {
+      GpuImage gpu_img{per_img[i].d_buf, per_img[i].pitch,
+                       per_img[i].rows, per_img[i].cols};
+      // Layout uses enqueue + collect (drains layout_stream_ inside
+      // collect). Sequential per page is fine for this benchmark hook;
+      // the throughput we want to measure is the marginal cost of the
+      // router + table + formula stack on top of the static det+rec.
+      (void)layout_->enqueue(gpu_img, per_img[i].rows, per_img[i].cols,
+                              layout_stream_);
+      OcrPipelineResult out;
+      out.results = all_results[i];
+      out.layout = layout_->collect();
+      // Router → table / formula dispatch. dispatch_router_ short-circuits
+      // when router_ is null or layout is empty, so this is a no-op for
+      // operators that loaded layout but not the router/table/formula
+      // stack. Output is intentionally discarded — run_batch's contract
+      // is text-only; the work is paid so throughput numbers include
+      // layout + table + formula cost.
+      PipelineTimer t;
+      dispatch_router_(out, gpu_img, image_crops[i].boxes, t);
+    }
+  }
+
   // No cleanup needed — batch_img_bufs_ are pre-allocated and reused
 
   return all_results;

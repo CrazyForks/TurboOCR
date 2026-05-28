@@ -52,6 +52,15 @@ void PaddleRec::allocate_buffers() {
     return;
 
   int bs = rec_batch_num_;
+  // pdf_only batched dispatch can push wider than rec_batch_num_ (default
+  // 32). Pull the env'd TURBO_OCR_PDF_REC_BATCH up so transform / output
+  // pinned + GPU buffers are sized for the static engine's profile.
+  if (const char *po = std::getenv("TURBO_OCR_PDF_ONLY");
+      po && std::string(po) == "1") {
+    if (const char *rb = std::getenv("TURBO_OCR_PDF_REC_BATCH")) {
+      try { bs = std::max(bs, std::stoi(rb)); } catch (...) {}
+    }
+  }
 
   size_t input_elems = static_cast<size_t>(bs) * 3 * rec_image_h_ * kMaxRecWidth;
   d_batch_input_ = CudaPtr<float>(input_elems);

@@ -851,26 +851,47 @@ std::vector<std::vector<OCRResultItem>> OcrPipeline::run_batch(
   // ensure the routing is exercised for throughput measurement. This
   // engages only when the operator has loaded a layout model.
   if (use_layout_ && layout_) {
-    for (int i = 0; i < batch_n; i++) {
-      GpuImage gpu_img{per_img[i].d_buf, per_img[i].pitch,
-                       per_img[i].rows, per_img[i].cols};
-      // Layout uses enqueue + collect (drains layout_stream_ inside
-      // collect). Sequential per page is fine for this benchmark hook;
-      // the throughput we want to measure is the marginal cost of the
-      // router + table + formula stack on top of the static det+rec.
-      (void)layout_->enqueue(gpu_img, per_img[i].rows, per_img[i].cols,
-                              layout_stream_);
-      OcrPipelineResult out;
-      out.results = all_results[i];
-      out.layout = layout_->collect();
-      // Router → table / formula dispatch. dispatch_router_ short-circuits
-      // when router_ is null or layout is empty, so this is a no-op for
-      // operators that loaded layout but not the router/table/formula
-      // stack. Output is intentionally discarded — run_batch's contract
-      // is text-only; the work is paid so throughput numbers include
-      // layout + table + formula cost.
-      PipelineTimer t;
-      dispatch_router_(out, gpu_img, image_crops[i].boxes, t);
+    // pdf_only mode → every page is the same rendered size, so layout can
+    // batch all of them in one TRT execute (engine profile {1..8, 3, 800,
+    // 800}, FP16). The non-batched fallback below keeps the legacy
+    // per-image path for variable-size workloads.
+    const bool pdf_only_pipe2 = std::getenv("TURBO_OCR_PDF_ONLY") &&
+                  std::string(std::getenv("TURBO_OCR_PDF_ONLY")) == "1";
+    if (pdf_only_pipe2) {
+      std::vector<GpuImage> gpu_imgs;
+      std::vector<std::pair<int,int>> dims;
+      gpu_imgs.reserve(batch_n); dims.reserve(batch_n);
+      for (int i = 0; i < batch_n; ++i) {
+        gpu_imgs.push_back({per_img[i].d_buf, per_img[i].pitch,
+                            per_img[i].rows, per_img[i].cols});
+        dims.emplace_back(per_img[i].rows, per_img[i].cols);
+      }
+      if (layout_->enqueue_batch(gpu_imgs, dims, layout_stream_)) {
+        auto all_layout = layout_->collect_batch();
+        // dispatch_router_ per image (router internals are per-page —
+        // table/formula stages crop per region). Layout is now amortized
+        // across the whole batch.
+        PipelineTimer t;
+        for (int i = 0; i < batch_n; ++i) {
+          OcrPipelineResult out;
+          out.results = all_results[i];
+          out.layout = i < (int)all_layout.size() ? std::move(all_layout[i])
+                                                  : std::vector<turbo_ocr::layout::LayoutBox>{};
+          dispatch_router_(out, gpu_imgs[i], image_crops[i].boxes, t);
+        }
+      }
+    } else {
+      for (int i = 0; i < batch_n; i++) {
+        GpuImage gpu_img{per_img[i].d_buf, per_img[i].pitch,
+                         per_img[i].rows, per_img[i].cols};
+        (void)layout_->enqueue(gpu_img, per_img[i].rows, per_img[i].cols,
+                                layout_stream_);
+        OcrPipelineResult out;
+        out.results = all_results[i];
+        out.layout = layout_->collect();
+        PipelineTimer t;
+        dispatch_router_(out, gpu_img, image_crops[i].boxes, t);
+      }
     }
   }
 

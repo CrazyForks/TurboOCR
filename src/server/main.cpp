@@ -109,9 +109,29 @@ int main(int argc, char **argv) {
   // because in-progress builds by sibling replicas are protected by the
   // 60-second min-age window inside the sweeper.
   turbo_ocr::engine::sweep_orphan_engine_temps();
-  auto det_model = turbo_ocr::engine::ensure_trt_engine(cfg.det_onnx, "det");
-  auto rec_model = turbo_ocr::engine::ensure_trt_engine(rec_paths.rec, "rec");
-  auto cls_model = turbo_ocr::engine::ensure_trt_engine(cfg.cls_onnx, "cls");
+  // PDF-only highly-batched mode: build det/cls/rec with STATIC shapes at
+  // the fixed PDF page resolution + batch dim so TRT specializes tactics
+  // for one exact shape. The static engines are still ONNX-driven; we just
+  // pass a different `type` to ensure_trt_engine() so the profile builder
+  // emits min==opt==max and the cache key bakes in the fixed dims. The
+  // env contract (TURBO_OCR_PDF_PAGE_H/_W/_BATCH/_REC_BATCH/_REC_W) is
+  // read directly inside onnx_to_trt's profile branch — see
+  // src/engine/onnx_to_trt.cpp:read_pdf_*.
+  const char *det_type = cfg.pdf_only ? "det_pdf_static" : "det";
+  const char *cls_type = cfg.pdf_only ? "cls_pdf_static" : "cls";
+  const char *rec_type = cfg.pdf_only ? "rec_pdf_static" : "rec";
+  auto det_model = turbo_ocr::engine::ensure_trt_engine(cfg.det_onnx, det_type);
+  auto rec_model = turbo_ocr::engine::ensure_trt_engine(rec_paths.rec, rec_type);
+  auto cls_model = turbo_ocr::engine::ensure_trt_engine(cfg.cls_onnx, cls_type);
+  if (cfg.pdf_only) {
+    TOCR_LOG_INFO("PDF-only mode: built static-shape engines",
+                  "dpi",       cfg.pdf_dpi,
+                  "page_h",    cfg.pdf_page_h,
+                  "page_w",    cfg.pdf_page_w,
+                  "batch",     cfg.pdf_batch,
+                  "rec_batch", cfg.pdf_rec_batch,
+                  "rec_w",     cfg.pdf_rec_w);
+  }
   if (cfg.disable_angle_cls) {
     cls_model.clear();
     TOCR_LOG_INFO("Angle classification disabled via DISABLE_ANGLE_CLS=1");

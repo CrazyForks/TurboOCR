@@ -67,6 +67,21 @@ if(NOT c-ares_FOUND AND NOT TARGET c-ares::cares)
     endif()
 endif()
 
+# Trantor's installed cmake targets on some distros reference a bare
+# `c-ares_lib` instead of the modern `c-ares::cares` namespace. Provide a
+# shim target so the linker resolves it. Harmless when Trantor is upgraded.
+if(NOT TARGET c-ares_lib)
+    add_library(c-ares_lib INTERFACE IMPORTED)
+    find_library(_SHIM_CARES_LIB cares)
+    if(_SHIM_CARES_LIB)
+        set_target_properties(c-ares_lib PROPERTIES
+            INTERFACE_LINK_LIBRARIES "${_SHIM_CARES_LIB}")
+    elseif(TARGET c-ares::cares)
+        set_target_properties(c-ares_lib PROPERTIES
+            INTERFACE_LINK_LIBRARIES "c-ares::cares")
+    endif()
+endif()
+
 # --- Shared library: turbo_ocr_common ---
 add_library(turbo_ocr_common STATIC
     src/detection/det_postprocess.cpp
@@ -286,12 +301,32 @@ else()
         src/detection/paddle_det.cpp
         src/recognition/paddle_rec.cpp
         src/classification/paddle_cls.cpp
+        src/lang_cls/script_id.cpp
         src/layout/paddle_layout.cpp
         src/pipeline/ocr_pipeline.cpp
         src/kernels/kernels.cu
         src/kernels/jfa.cu
         src/render/pdf_renderer.cpp
         src/pdf/pdf_text_layer.cpp
+        # CUA router + table + formula stages (referenced by ocr_pipeline's
+        # dispatch_router_). Pulled in here so paddle_highspeed_cpp links;
+        # the operator's prior in-progress integration left these source
+        # files on disk but not on the build target.
+        src/router/cua_router.cpp
+        src/router/region_features.cpp
+        src/router/routing_plan.cpp
+        src/table/table_stage.cpp
+        src/table/table_cls.cpp
+        src/table/table_cell.cpp
+        src/table/slanext.cpp
+        src/table/slanext_dict.cpp
+        src/table/slanext_postprocess.cpp
+        src/table/cell_matcher.cpp
+        src/table/html_reconstruct.cpp
+        src/table/kernels/table_kernels.cu
+        src/formula/formulanet.cpp
+        src/formula/formula_tokenizer.cpp
+        src/formula/kernels/formula_kernels.cu
     )
     target_include_directories(turbo_ocr_gpu PUBLIC
         ${CUDAToolkit_INCLUDE_DIRS}
@@ -380,6 +415,18 @@ else()
         ${OpenCV_LIBS}
     )
     set_target_properties(diff_ccl PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+
+    # PDF-only static-engine throughput benchmark.
+    add_executable(pdf_static_bench tools/pdf_static_bench.cpp)
+    target_include_directories(pdf_static_bench PRIVATE include)
+    target_link_libraries(pdf_static_bench PRIVATE
+        turbo_ocr_gpu
+        ${OpenCV_LIBS}
+    )
+    set_target_properties(pdf_static_bench PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
     )

@@ -40,6 +40,30 @@ using turbo_ocr::detection::kDetMaxSideMin;
   return v;
 }
 
+// ---------- PDF-only fixed-resolution mode ----------------------------------
+// When the operator boots with TURBO_OCR_PDF_ONLY=1, all PDF pages are
+// rendered at TURBO_OCR_PDF_DPI (default 150). The page pixel dimensions are
+// therefore deterministic and identical across pages, which lets us build the
+// det/cls/rec TRT engines with STATIC (min==opt==max) input profiles at the
+// fixed shape — TRT then picks tactics optimal for that exact size and
+// elides every dynamic-shape branch at execute time.
+//
+// TURBO_OCR_PDF_PAGE_H / _PAGE_W: the rendered page pixel size, already
+// rounded to a multiple of 32 by the caller (main.cpp computes from DPI ×
+// std-page-pt / 72 and rounds). TURBO_OCR_PDF_BATCH: the static det/cls
+// batch dim (matches OcrPipeline::kMaxBatchImages on the call side).
+[[nodiscard]] static int env_int_or(const char *name, int def) {
+  if (const char *v = std::getenv(name)) {
+    try { return std::stoi(v); } catch (...) {}
+  }
+  return def;
+}
+[[nodiscard]] static int read_pdf_page_h() { return env_int_or("TURBO_OCR_PDF_PAGE_H", 1280); }
+[[nodiscard]] static int read_pdf_page_w() { return env_int_or("TURBO_OCR_PDF_PAGE_W", 960);  }
+[[nodiscard]] static int read_pdf_batch()  { return env_int_or("TURBO_OCR_PDF_BATCH",   8); }
+[[nodiscard]] static int read_pdf_rec_batch() { return env_int_or("TURBO_OCR_PDF_REC_BATCH", 32); }
+[[nodiscard]] static int read_pdf_rec_w()     { return env_int_or("TURBO_OCR_PDF_REC_W", 320); }
+
 static class BuildLogger : public nvinfer1::ILogger {
 public:
   void log(Severity severity, const char *msg) noexcept override {
@@ -119,6 +143,18 @@ std::string get_cached_engine_path(const std::string &onnx_path,
   // so each operator config gets its own engine (Triton/vLLM pattern).
   if (type == "det")
     key += ":dms" + std::to_string(read_det_max_side());
+  // PDF-only static engines: the cache must distinguish between different
+  // fixed shapes / batches. Any pdf-static type bakes the page dims + batch
+  // into the cache key so a DPI change rebuilds rather than reusing stale.
+  if (type == "det_pdf_static" || type == "cls_pdf_static" || type == "rec_pdf_static") {
+    key += ":pdfh" + std::to_string(read_pdf_page_h()) +
+           ":pdfw" + std::to_string(read_pdf_page_w()) +
+           ":pdfb" + std::to_string(read_pdf_batch());
+    if (type == "rec_pdf_static") {
+      key += ":recb" + std::to_string(read_pdf_rec_batch()) +
+             ":recw" + std::to_string(read_pdf_rec_w());
+    }
+  }
   // TRT_OPT_LEVEL changes which kernels TensorRT picks, so the produced
   // engine differs. Operators that toggle the level get separate cached
   // engines instead of silently reusing a stale one.
@@ -179,8 +215,17 @@ static bool build_engine(const std::string &onnx_path,
   } else if (type == "slanext_wired" || type == "slanext_wireless" ||
              type == "formula") {
     workspace_bytes = 2ULL << 30;          // 2 GiB (plan 07 §5)
+  } else if (type == "det_pdf_static") {
+    // Static-shape PDF det engine: same workspace policy as dynamic det,
+    // scaled by the larger of the two PDF page dims (since both are fixed).
+    double side = std::max(read_pdf_page_h(), read_pdf_page_w());
+    double scale = (side / 960.0) * (side / 960.0);
+    size_t scaled = static_cast<size_t>((1ULL << 30) * scale);
+    workspace_bytes = std::min(scaled, size_t(4ULL << 30));
+    if (workspace_bytes < (1ULL << 30)) workspace_bytes = 1ULL << 30;
   } else {
-    workspace_bytes = 1ULL << 30;          // rec, cls, table_cls, table_cell_*
+    workspace_bytes = 1ULL << 30;          // rec, cls, table_cls, table_cell_*,
+                                            // cls_pdf_static, rec_pdf_static
   }
   config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, workspace_bytes);
   config->setFlag(nvinfer1::BuilderFlag::kFP16);
@@ -204,6 +249,20 @@ static bool build_engine(const std::string &onnx_path,
         nvinfer1::Dims4{1, 3, det_opt, det_opt});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
         nvinfer1::Dims4{1, 3, det_max, det_max});
+  } else if (type == "det_pdf_static") {
+    // PDF-only mode: every page is rendered to the SAME (H, W) at a fixed
+    // DPI, so we pin the profile to a single shape (min==opt==max) at the
+    // configured batch. TRT can fully specialize: no dynamic-shape branches
+    // at execute time, tactic search runs once for this exact shape.
+    const int B = read_pdf_batch();
+    const int H = read_pdf_page_h();
+    const int W = read_pdf_page_w();
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{B, 3, H, W});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{B, 3, H, W});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{B, 3, H, W});
   } else if (type == "rec") {
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
         nvinfer1::Dims4{1, 3, 48, 48});
@@ -211,6 +270,31 @@ static bool build_engine(const std::string &onnx_path,
         nvinfer1::Dims4{32, 3, 48, 320});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
         nvinfer1::Dims4{32, 3, 48, 4000});
+  } else if (type == "rec_pdf_static") {
+    // Static rec for PDF: fixed batch (TURBO_OCR_PDF_REC_BATCH, default 32)
+    // and a single canonical width (TURBO_OCR_PDF_REC_W, default 320, the
+    // width bucket PP-OCRv5 is most efficient at). Boxes whose natural
+    // crop width exceeds W get bucketed externally by the rec wrapper —
+    // here we lock the engine to one shape for max tactic specialization.
+    const int B = read_pdf_rec_batch();
+    const int W = read_pdf_rec_w();
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{B, 3, 48, W});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{B, 3, 48, W});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{B, 3, 48, W});
+  } else if (type == "cls_pdf_static") {
+    // Static cls (PP-LCNet_x0_25, 80×160) with fixed batch. The cls input
+    // shape is constant across the original model; only the batch dim
+    // changes. We lock it to TURBO_OCR_PDF_BATCH to match det.
+    const int B = read_pdf_batch();
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{B, 3, 80, 160});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{B, 3, 80, 160});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{B, 3, 80, 160});
   } else if (type == "layout") {
     // PP-DocLayoutV3 has 3 inputs: image [B,3,800,800], im_shape [B,2],
     // scale_factor [B,2]. paddle2onnx does not guarantee input ordering, so

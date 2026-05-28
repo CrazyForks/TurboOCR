@@ -85,6 +85,26 @@ struct ServerConfig {
   pdf::PdfMode default_pdf_mode = pdf::PdfMode::Ocr;
   bool        default_pdf_mode_was_set = false;
 
+  // ---- PDF-only highly-batched mode --------------------------------------
+  // When `pdf_only` is true, every PDF page is rendered at `pdf_dpi` to the
+  // fixed pixel size (pdf_page_h, pdf_page_w) and det/cls/rec engines are
+  // built with STATIC input shapes at that size + pdf_batch batch dim. TRT
+  // then specializes tactics for a single shape and runs every page through
+  // the cross-image batch path with zero dynamic-shape overhead.
+  //   TURBO_OCR_PDF_ONLY=1                  enable
+  //   TURBO_OCR_PDF_DPI=150                 render DPI
+  //   TURBO_OCR_PDF_PAGE_H=1280  PAGE_W=960 fixed render dims (rounded to 32)
+  //   TURBO_OCR_PDF_BATCH=8                 det/cls batch dim (matches
+  //                                          OcrPipeline::kMaxBatchImages)
+  //   TURBO_OCR_PDF_REC_BATCH=32  REC_W=320 rec static shape
+  bool pdf_only       = false;
+  int  pdf_dpi        = 150;
+  int  pdf_page_h     = 1280;
+  int  pdf_page_w     = 960;
+  int  pdf_batch      = 8;
+  int  pdf_rec_batch  = 32;
+  int  pdf_rec_w      = 320;
+
   /// Effective profile this config was loaded for. Set by from_env.
   Profile profile = build_profile();
 
@@ -207,6 +227,13 @@ inline std::string ServerConfig::to_json() const {
   j += ",\"ocr_lang\":"          + esc(ocr_lang_value);
   j += ",\"disable_angle_cls\":" + std::string(disable_angle_cls ? "true" : "false");
   j += ",\"layout_disabled\":"   + std::string(layout_disabled ? "true" : "false");
+  j += ",\"pdf_only\":"          + std::string(pdf_only ? "true" : "false");
+  j += ",\"pdf_dpi\":"           + std::to_string(pdf_dpi);
+  j += ",\"pdf_page_h\":"        + std::to_string(pdf_page_h);
+  j += ",\"pdf_page_w\":"        + std::to_string(pdf_page_w);
+  j += ",\"pdf_batch\":"         + std::to_string(pdf_batch);
+  j += ",\"pdf_rec_batch\":"     + std::to_string(pdf_rec_batch);
+  j += ",\"pdf_rec_w\":"         + std::to_string(pdf_rec_w);
   j += ",\"default_pdf_mode\":"  + esc(pdf::mode_name(default_pdf_mode));
   j += ",\"det_max_side\":"      + std::to_string(det_max_side);
   j += ",\"trt_opt_level\":"     + std::to_string(trt_opt_level);
@@ -286,6 +313,23 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
 
   c.disable_angle_cls = env_bool_strict("DISABLE_ANGLE_CLS", false, c.errors);
   c.layout_disabled   = env_bool_strict("DISABLE_LAYOUT",    false, c.errors);
+
+  // PDF-only highly-batched mode (env-only by design — operators flip this
+  // at boot, not per-request). Defaults match A4 portrait at 150 DPI rounded
+  // to multiples of 32: 1280 × 960. Sizes outside [32, 4096] are rejected.
+  c.pdf_only       = env_bool_strict("TURBO_OCR_PDF_ONLY", false, c.errors);
+  c.pdf_dpi        = env_int_strict("TURBO_OCR_PDF_DPI",        150,  50,  600,  c.errors);
+  c.pdf_page_h     = env_int_strict("TURBO_OCR_PDF_PAGE_H",     1280, 32,  4096, c.errors);
+  c.pdf_page_w     = env_int_strict("TURBO_OCR_PDF_PAGE_W",     960,  32,  4096, c.errors);
+  c.pdf_batch      = env_int_strict("TURBO_OCR_PDF_BATCH",      8,    1,   64,   c.errors);
+  c.pdf_rec_batch  = env_int_strict("TURBO_OCR_PDF_REC_BATCH",  32,   1,   256,  c.errors);
+  c.pdf_rec_w      = env_int_strict("TURBO_OCR_PDF_REC_W",      320,  32,  4000, c.errors);
+  if (c.pdf_only && (c.pdf_page_h % 32 != 0 || c.pdf_page_w % 32 != 0)) {
+    c.errors.push_back("TURBO_OCR_PDF_PAGE_H/_PAGE_W must each be a multiple "
+                       "of 32 (det engine requires it); got H=" +
+                       std::to_string(c.pdf_page_h) + " W=" +
+                       std::to_string(c.pdf_page_w));
+  }
   // ENABLE_LAYOUT removed — operators must migrate.
   if (env_present("ENABLE_LAYOUT")) {
     c.errors.push_back(

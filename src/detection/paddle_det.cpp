@@ -394,51 +394,96 @@ PaddleDet::run_batch(const std::vector<GpuImage> &gpu_imgs,
   if (n == 0)
     return {};
 
-  // Fallback: single image → use optimized single path
-  if (n == 1) {
+  // PDF-only static-engine mode: the engine accepts ONLY {B, 3, H, W}.
+  // We always submit exactly that, padding shorter inputs by repeating
+  // slot 0 (the pad slots' output gets discarded after post-processing).
+  auto env_int = [](const char *name, int def) {
+    if (const char *v = std::getenv(name)) {
+      try { return std::stoi(v); } catch (...) {}
+    }
+    return def;
+  };
+  const bool pdf_only = std::getenv("TURBO_OCR_PDF_ONLY") &&
+                        std::string(std::getenv("TURBO_OCR_PDF_ONLY")) == "1";
+
+  // Fallback: single image → use optimized single path (only valid when
+  // running with the dynamic engine; pdf_only's static engine can't take
+  // a batch=1 shape since its profile is fixed at pdf_batch).
+  if (n == 1 && !pdf_only) {
     auto boxes = run(gpu_imgs[0], orig_dims[0].first, orig_dims[0].second, stream);
     return {std::move(boxes)};
   }
 
-  // Clamp to max batch size
-  const int batch_size = std::min(n, kMaxBatchSize);
-
-  // --- Compute unified resize dimensions (max across batch, rounded to 32) ---
-  int max_resize_h = 0, max_resize_w = 0;
+  int batch_size;
+  int resize_h, resize_w;
   struct PerImgInfo {
     int orig_h, orig_w;
     float ratio;
     int resize_h, resize_w;
   };
-  std::vector<PerImgInfo> infos(batch_size);
+  std::vector<PerImgInfo> infos;
 
-  for (int i = 0; i < batch_size; i++) {
-    int h = orig_dims[i].first;
-    int w = orig_dims[i].second;
-    float ratio = 1.0f;
-    if (std::max(h, w) > kMaxSideLen_) {
-      ratio = (h > w) ? static_cast<float>(kMaxSideLen_) / h
-                      : static_cast<float>(kMaxSideLen_) / w;
+  if (pdf_only) {
+    // Lock to the static engine's exact profile. The CUDA preprocessing
+    // kernel handles arbitrary input H/W → fixed output H/W, so callers
+    // can hand us pages of any size and we'll resize-fit to the static
+    // shape. ratio is unused in the pdf_only post-processing path —
+    // boxes are reported in resize_h/w pixel space and the caller maps
+    // back via orig_dims.
+    batch_size = env_int("TURBO_OCR_PDF_BATCH",     8);
+    resize_h   = env_int("TURBO_OCR_PDF_PAGE_H", 1280);
+    resize_w   = env_int("TURBO_OCR_PDF_PAGE_W",  960);
+    infos.resize(batch_size);
+    for (int i = 0; i < batch_size; ++i) {
+      // Real input dims for slots 0..min(n,batch_size)-1; pad slots
+      // beyond use slot 0's dims (the result is discarded later).
+      int src = (i < n) ? i : 0;
+      int h = orig_dims[src].first;
+      int w = orig_dims[src].second;
+      float ratio = std::min(static_cast<float>(resize_h) / h,
+                              static_cast<float>(resize_w) / w);
+      infos[i] = {h, w, ratio, resize_h, resize_w};
     }
-    int rh = std::max(static_cast<int>(round(h * ratio / 32.0) * 32), 32);
-    int rw = std::max(static_cast<int>(round(w * ratio / 32.0) * 32), 32);
-    infos[i] = {h, w, ratio, rh, rw};
-    max_resize_h = std::max(max_resize_h, rh);
-    max_resize_w = std::max(max_resize_w, rw);
-  }
+  } else {
+    // Clamp to max batch size
+    batch_size = std::min(n, kMaxBatchSize);
 
-  // Use the unified (max) dimensions for all images in the batch
-  const int resize_h = max_resize_h;
-  const int resize_w = max_resize_w;
+    // --- Compute unified resize dimensions (max across batch, rounded to 32) ---
+    int max_resize_h = 0, max_resize_w = 0;
+    infos.resize(batch_size);
+
+    for (int i = 0; i < batch_size; i++) {
+      int h = orig_dims[i].first;
+      int w = orig_dims[i].second;
+      float ratio = 1.0f;
+      if (std::max(h, w) > kMaxSideLen_) {
+        ratio = (h > w) ? static_cast<float>(kMaxSideLen_) / h
+                        : static_cast<float>(kMaxSideLen_) / w;
+      }
+      int rh = std::max(static_cast<int>(round(h * ratio / 32.0) * 32), 32);
+      int rw = std::max(static_cast<int>(round(w * ratio / 32.0) * 32), 32);
+      infos[i] = {h, w, ratio, rh, rw};
+      max_resize_h = std::max(max_resize_h, rh);
+      max_resize_w = std::max(max_resize_w, rw);
+    }
+
+    // Use the unified (max) dimensions for all images in the batch
+    resize_h = max_resize_h;
+    resize_w = max_resize_w;
+  }
   const int pixels_per_image = resize_h * resize_w;
 
   // --- 1. Upload per-image metadata to device ---
-  // Use pre-allocated pinned buffers for truly async transfers
+  // Use pre-allocated pinned buffers for truly async transfers.
+  // For pdf_only with n < batch_size, pad slots beyond n with slot 0's
+  // GpuImage so the resize kernel has a valid src — the output for
+  // padded slots is discarded in the post-processing loop below.
   for (int i = 0; i < batch_size; i++) {
-    h_batch_src_ptrs_.get()[i] = gpu_imgs[i].data;
-    h_batch_src_steps_.get()[i] = static_cast<int>(gpu_imgs[i].step);
-    h_batch_src_heights_.get()[i] = gpu_imgs[i].rows;
-    h_batch_src_widths_.get()[i] = gpu_imgs[i].cols;
+    int src = (i < n) ? i : 0;
+    h_batch_src_ptrs_.get()[i]    = gpu_imgs[src].data;
+    h_batch_src_steps_.get()[i]   = static_cast<int>(gpu_imgs[src].step);
+    h_batch_src_heights_.get()[i] = gpu_imgs[src].rows;
+    h_batch_src_widths_.get()[i]  = gpu_imgs[src].cols;
   }
 
   CUDA_CHECK(cudaMemcpyAsync(d_batch_src_ptrs_.get(), h_batch_src_ptrs_.get(),
@@ -483,9 +528,12 @@ PaddleDet::run_batch(const std::vector<GpuImage> &gpu_imgs,
   // For each image slice in the batch output, run the appropriate path.
   // We temporarily alias cur_output_ / cur_bitmap_ to point at each image's
   // slice. Scope guard ensures they are restored even if an exception is thrown.
-  std::vector<std::vector<Box>> all_boxes(batch_size);
+  // Output is sized to n (the real input count); the pdf_only pad slots
+  // past n are processed but their results are dropped.
+  const int real_n = pdf_only ? std::min(n, batch_size) : batch_size;
+  std::vector<std::vector<Box>> all_boxes(real_n);
 
-  for (int i = 0; i < batch_size; i++) {
+  for (int i = 0; i < real_n; i++) {
     const int orig_h = infos[i].orig_h;
     const int orig_w = infos[i].orig_w;
 

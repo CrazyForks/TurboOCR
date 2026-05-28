@@ -748,21 +748,40 @@ std::vector<std::vector<OCRResultItem>> OcrPipeline::run_batch(
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
-  // Per-image detection (det engine uses batch=1 for optimal single-image speed)
+  // Detection. In pdf_only mode, every page is the same rendered size so
+  // we go straight through det's batched static-shape path (one TRT call
+  // per batch chunk). In normal mode, det uses batch=1 per image for
+  // optimal single-image latency.
+  const bool pdf_only_pipe = std::getenv("TURBO_OCR_PDF_ONLY") &&
+                              std::string(std::getenv("TURBO_OCR_PDF_ONLY")) == "1";
   std::vector<std::vector<Box>> all_det_boxes(batch_n);
-  for (int i = 0; i < batch_n; i++) {
-    GpuImage gi{per_img[i].d_buf, per_img[i].pitch,
-                per_img[i].rows, per_img[i].cols};
-    all_det_boxes[i] = det_->run(gi, per_img[i].rows, per_img[i].cols, stream);
+  if (pdf_only_pipe) {
+    std::vector<GpuImage> gpu_imgs;
+    std::vector<std::pair<int,int>> dims;
+    gpu_imgs.reserve(batch_n); dims.reserve(batch_n);
+    for (int i = 0; i < batch_n; i++) {
+      gpu_imgs.push_back({per_img[i].d_buf, per_img[i].pitch,
+                          per_img[i].rows, per_img[i].cols});
+      dims.emplace_back(per_img[i].rows, per_img[i].cols);
+    }
+    all_det_boxes = det_->run_batch(gpu_imgs, dims, stream);
+  } else {
+    for (int i = 0; i < batch_n; i++) {
+      GpuImage gi{per_img[i].d_buf, per_img[i].pitch,
+                  per_img[i].rows, per_img[i].cols};
+      all_det_boxes[i] = det_->run(gi, per_img[i].rows, per_img[i].cols, stream);
+    }
   }
 
-  // Assign detection results and run angle classification per-image
+  // Assign detection results and run angle classification per-image.
+  // pdf_only skips cls — PDF pages from a renderer are upright by
+  // construction, and routing crops through the static cls engine
+  // would add a redundant pass that costs more than it saves.
   for (int i = 0; i < batch_n; i++) {
     per_img[i].boxes = std::move(all_det_boxes[i]);
     sorted_boxes(per_img[i].boxes);
 
-    // Optional angle classification -- only classify vertical-looking boxes
-    if (use_cls_) {
+    if (use_cls_ && !pdf_only_pipe) {
       vertical_box_indices_.clear();
       for (int vi = 0; vi < static_cast<int>(per_img[i].boxes.size()); ++vi) {
         if (is_vertical_box(per_img[i].boxes[vi]))

@@ -207,31 +207,56 @@ void OcrPipeline::warmup_gpu(cudaStream_t stream) {
     return def;
   };
   const char *pdf_only_env = std::getenv("TURBO_OCR_PDF_ONLY");
-  if (pdf_only_env && std::string(pdf_only_env) == "1") {
-    const int B  = env_int("TURBO_OCR_PDF_BATCH",      8);
-    const int H  = env_int("TURBO_OCR_PDF_PAGE_H",  1280);
-    const int W  = env_int("TURBO_OCR_PDF_PAGE_W",   960);
-    const int Br = env_int("TURBO_OCR_PDF_REC_BATCH", 32);
-    const int Wr = env_int("TURBO_OCR_PDF_REC_W",    320);
+  const bool pdf_only = pdf_only_env && std::string(pdf_only_env) == "1";
+
+  if (pdf_only) {
+    // HYBRID pdf_only warmup: static det (fixed page size) + batched layout
+    // (fixed 800x800) are warmed at their exact profile shapes here. The
+    // recognition engine is the DYNAMIC 5-bucket rec (see main.cpp:rec_type)
+    // because a single static rec width squishes wide text lines and tanks
+    // accuracy on multi-column/dense pages — so rec is warmed by the shared
+    // 5-bucket loop below, exactly like the non-pdf path. We deliberately
+    // skip the run(dummy) full-pipeline warmup since it issues a dynamic
+    // det shape the static det engine rejects.
+    const int B = env_int("TURBO_OCR_PDF_BATCH",     8);
+    const int H = env_int("TURBO_OCR_PDF_PAGE_H", 1280);
+    const int W = env_int("TURBO_OCR_PDF_PAGE_W",  960);
     if (!det_->warmup_pdf_static(B, H, W, stream))
       throw turbo_ocr::InferenceError("[pdf_only] det static warmup failed");
-    if (use_cls_ && !cls_->warmup_pdf_static(B, stream))
-      throw turbo_ocr::InferenceError("[pdf_only] cls static warmup failed");
-    if (!rec_->warmup_pdf_static(Br, Wr, stream))
-      throw turbo_ocr::InferenceError("[pdf_only] rec static warmup failed");
-    std::cout << "[Pipeline] PDF-only warmup complete (static engines)"
-              << " B=" << B << " H=" << H << " W=" << W
-              << " RecB=" << Br << " RecW=" << Wr << '\n';
-    return;
-  }
 
-  // Run full pipeline with a dummy image to trigger TRT JIT and lazy GPU allocations.
-  // If layout is enabled, the first run(...) call below will already hit the
-  // layout TRT engine via the run() body — no separate layout warmup needed.
-  cv::Mat dummy(100, 100, CV_8UC3, cv::Scalar(255, 255, 255));
-  cv::rectangle(dummy, cv::Point(10, 30), cv::Point(90, 70), cv::Scalar(0, 0, 0), 2);
-  (void)run(dummy, stream);
-  cudaStreamSynchronize(stream);
+    // Batched layout warmup at {B,3,800,800}: build B dummy page GpuImages
+    // pointing at one white page-sized buffer so enqueue_batch JITs the
+    // batched profile + reallocs its buffers before the first real request.
+    if (use_layout_ && layout_) {
+      auto &lbuf = img_bufs_[0];
+      if (H > lbuf.cap_rows || W > lbuf.cap_cols) {
+        cudaFree(lbuf.d_buf); lbuf.d_buf = nullptr;
+        CUDA_CHECK(cudaMallocPitch(&lbuf.d_buf, &lbuf.pitch, W * 3, H));
+        lbuf.cap_rows = H; lbuf.cap_cols = W;
+      }
+      CUDA_CHECK(cudaMemset2DAsync(lbuf.d_buf, lbuf.pitch, 255, W * 3, H, stream));
+      std::vector<GpuImage> dummy_pages;
+      std::vector<std::pair<int,int>> dims;
+      for (int i = 0; i < B; ++i) {
+        dummy_pages.push_back({lbuf.d_buf, lbuf.pitch, H, W});
+        dims.emplace_back(H, W);
+      }
+      if (layout_->enqueue_batch(dummy_pages, dims, layout_stream_))
+        (void)layout_->collect_batch();
+    }
+    std::cout << "[Pipeline] PDF-only hybrid warmup: static det B=" << B
+              << " H=" << H << " W=" << W
+              << ", batched layout=" << (use_layout_ ? "on" : "off")
+              << ", dynamic 5-bucket rec\n";
+    // Fall through to the shared 5-bucket rec warmup below.
+  } else {
+    // Run full pipeline with a dummy image to trigger TRT JIT and lazy GPU
+    // allocations. If layout is enabled, the run(...) body hits layout too.
+    cv::Mat dummy(100, 100, CV_8UC3, cv::Scalar(255, 255, 255));
+    cv::rectangle(dummy, cv::Point(10, 30), cv::Point(90, 70), cv::Scalar(0, 0, 0), 2);
+    (void)run(dummy, stream);
+    cudaStreamSynchronize(stream);
+  }
 
   // Warm all 5 rec width buckets to eliminate TRT JIT latency on first use.
   // The initial run() above only hits one bucket; each unseen bucket pays ~5-50ms

@@ -52,15 +52,6 @@ void PaddleRec::allocate_buffers() {
     return;
 
   int bs = rec_batch_num_;
-  // pdf_only batched dispatch can push wider than rec_batch_num_ (default
-  // 32). Pull the env'd TURBO_OCR_PDF_REC_BATCH up so transform / output
-  // pinned + GPU buffers are sized for the static engine's profile.
-  if (const char *po = std::getenv("TURBO_OCR_PDF_ONLY");
-      po && std::string(po) == "1") {
-    if (const char *rb = std::getenv("TURBO_OCR_PDF_REC_BATCH")) {
-      try { bs = std::max(bs, std::stoi(rb)); } catch (...) {}
-    }
-  }
 
   size_t input_elems = static_cast<size_t>(bs) * 3 * rec_image_h_ * kMaxRecWidth;
   d_batch_input_ = CudaPtr<float>(input_elems);
@@ -280,21 +271,6 @@ PaddleRec::run_multi(const std::vector<ImageCrops> &image_crops,
 
   allocate_buffers();
 
-  // PDF-only static-engine mode: force every crop into a single bucket
-  // at the configured static width, and run inference at exactly
-  // {pdf_rec_batch, 3, 48, pdf_rec_w}. Short batches get padded by
-  // repeating the last crop's transform (output discarded).
-  auto env_int = [](const char *name, int def) {
-    if (const char *v = std::getenv(name)) {
-      try { return std::stoi(v); } catch (...) {}
-    }
-    return def;
-  };
-  const bool pdf_only = std::getenv("TURBO_OCR_PDF_ONLY") &&
-                        std::string(std::getenv("TURBO_OCR_PDF_ONLY")) == "1";
-  const int pdf_rec_batch = env_int("TURBO_OCR_PDF_REC_BATCH", 32);
-  const int pdf_rec_w     = env_int("TURBO_OCR_PDF_REC_W",    320);
-
   // Flatten all crops with (img_idx, box_idx) tracking
   struct MultiCropInfo {
     int img_idx;
@@ -316,14 +292,8 @@ PaddleRec::run_multi(const std::vector<ImageCrops> &image_crops,
 
       int crop_imgW = std::min(static_cast<int>(std::ceil(rec_image_h_ * ar)), kMaxRecWidth);
       crop_imgW = std::max(crop_imgW, 32);
-      int bucket;
-      if (pdf_only) {
-        // Single fixed bucket — the static rec engine only accepts pdf_rec_w.
-        bucket = pdf_rec_w;
-      } else {
-        bucket = *std::lower_bound(kWidthBuckets.begin(),
-                                    kWidthBuckets.end(), crop_imgW);
-      }
+      int bucket = *std::lower_bound(kWidthBuckets.begin(),
+                                     kWidthBuckets.end(), crop_imgW);
       crops.push_back({i, b, bucket});
     }
   }
@@ -348,15 +318,13 @@ PaddleRec::run_multi(const std::vector<ImageCrops> &image_crops,
 
   while (beg < total_boxes) {
     int bucket_w = crops[beg].bucket_w;
-    int max_batch_chunk = pdf_only ? pdf_rec_batch : rec_batch_num_;
 
     int end = beg;
-    while (end < total_boxes && end - beg < max_batch_chunk &&
+    while (end < total_boxes && end - beg < rec_batch_num_ &&
            crops[end].bucket_w == bucket_w)
       end++;
 
-    int real_batch = end - beg;
-    int cur_batch = pdf_only ? pdf_rec_batch : real_batch;  // pad to static size
+    int cur_batch = end - beg;
     int imgW = bucket_w;
 
     // If we've exhausted output slots, sync and decode what we have so far
@@ -378,15 +346,11 @@ PaddleRec::run_multi(const std::vector<ImageCrops> &image_crops,
 
     // Build transforms using per-slot pinned buffers (avoids DMA race).
     // Cache raw pinned pointers once — see notes in run() above.
-    // For pdf_only padded slots (real_batch..cur_batch-1) we replicate
-    // the last real crop's transform so the warp kernel has a valid
-    // source; their output is discarded after CTC decode.
     auto &os = output_slots_[slot];
     float *h_M_invs_ptr = os.h_M_invs.get();
     int *h_crop_widths_ptr = os.h_crop_widths.get();
     for (int j = 0; j < cur_batch; ++j) {
-      int src = (j < real_batch) ? j : (real_batch - 1);
-      const auto &ci = crops[beg + src];
+      const auto &ci = crops[beg + j];
       const auto &box = image_crops[ci.img_idx].boxes[ci.box_idx];
       auto ct = turbo_ocr::compute_crop_transform(box, rec_image_h_, imgW);
       h_crop_widths_ptr[j] = ct.crop_width;
@@ -400,16 +364,14 @@ PaddleRec::run_multi(const std::vector<ImageCrops> &image_crops,
                                 cur_batch * sizeof(int),
                                 cudaMemcpyHostToDevice, stream));
 
-    // Warp crops per source image. We only warp the real_batch valid
-    // crops; padded slots [real_batch, cur_batch) hold stale data that
-    // TRT will run inference on but whose output we discard.
+    // Warp crops per source image.
     {
       size_t slot_stride = static_cast<size_t>(3) * rec_image_h_ * imgW;
       int j = 0;
-      while (j < real_batch) {
+      while (j < cur_batch) {
         int src_img = crops[beg + j].img_idx;
         int run_start = j;
-        while (j < real_batch && crops[beg + j].img_idx == src_img)
+        while (j < cur_batch && crops[beg + j].img_idx == src_img)
           j++;
         int run_len = j - run_start;
 

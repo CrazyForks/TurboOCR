@@ -117,20 +117,27 @@ int main(int argc, char **argv) {
   // env contract (TURBO_OCR_PDF_PAGE_H/_W/_BATCH/_REC_BATCH/_REC_W) is
   // read directly inside onnx_to_trt's profile branch — see
   // src/engine/onnx_to_trt.cpp:read_pdf_*.
+  // HYBRID pdf_only: static batched DET (every page is the same rendered
+  // size → one TRT execute per page-chunk) and a DYNAMIC 5-bucket REC.
+  // Benchmarks showed a single-width static rec squishes wide text lines
+  // and drops recall to 70-80% on multi-column/dense pages, while the
+  // dynamic 5-bucket rec holds 98% — and the static rec was only ~10-20%
+  // faster, a bad trade. CLS is skipped entirely in pdf_only (rendered PDF
+  // pages are upright by construction), saving its build + per-request pass.
   const char *det_type = cfg.pdf_only ? "det_pdf_static" : "det";
-  const char *cls_type = cfg.pdf_only ? "cls_pdf_static" : "cls";
-  const char *rec_type = cfg.pdf_only ? "rec_pdf_static" : "rec";
+  const char *rec_type = "rec";  // always dynamic 5-bucket
   auto det_model = turbo_ocr::engine::ensure_trt_engine(cfg.det_onnx, det_type);
   auto rec_model = turbo_ocr::engine::ensure_trt_engine(rec_paths.rec, rec_type);
-  auto cls_model = turbo_ocr::engine::ensure_trt_engine(cfg.cls_onnx, cls_type);
+  std::string cls_model;
+  if (!cfg.pdf_only) {
+    cls_model = turbo_ocr::engine::ensure_trt_engine(cfg.cls_onnx, "cls");
+  }
   if (cfg.pdf_only) {
-    TOCR_LOG_INFO("PDF-only mode: built static-shape engines",
+    TOCR_LOG_INFO("PDF-only hybrid: static batched det + dynamic 5-bucket rec, cls skipped",
                   "dpi",       cfg.pdf_dpi,
                   "page_h",    cfg.pdf_page_h,
                   "page_w",    cfg.pdf_page_w,
-                  "batch",     cfg.pdf_batch,
-                  "rec_batch", cfg.pdf_rec_batch,
-                  "rec_w",     cfg.pdf_rec_w);
+                  "batch",     cfg.pdf_batch);
   }
   if (cfg.disable_angle_cls) {
     cls_model.clear();

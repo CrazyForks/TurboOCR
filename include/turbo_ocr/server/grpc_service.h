@@ -1,15 +1,18 @@
 #pragma once
 
+#include <atomic>
 #include <cstring>
 #include <format>
 #include <future>
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <semaphore>
 #include <string_view>
 
 #include <grpcpp/grpcpp.h>
 #include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 
 #include "turbo_ocr/common/box.h"
@@ -29,6 +32,7 @@
 #endif
 #include "turbo_ocr/pipeline/pipeline_result.h"
 #include "turbo_ocr/layout/layout_types.h"
+#include "turbo_ocr/layout/reading_order.h"
 #include "turbo_ocr/pdf/pdf_extraction_mode.h"
 #include "turbo_ocr/pdf/pdf_text_layer.h"
 #include "turbo_ocr/render/pdf_renderer.h"
@@ -51,16 +55,19 @@ grpc_error(grpc::ServerContext *ctx, grpc::StatusCode code,
 
 // Mirror parse_query_options() in server_types.h: when the client asks for
 // layout-derived output but the server was started without the layout
-// model, HTTP rejects the request with INVALID_PARAMETER (`?layout=1`) or
-// LAYOUT_DISABLED (`?reading_order=1`). gRPC used to silently zero those
-// flags, leaving callers wondering why they got a y/x fallback they did
-// not ask for. Returns nullopt on success.
+// model, HTTP rejects the request with LAYOUT_DISABLED (the one stable
+// code for the condition, whichever flag triggered it). gRPC used to
+// silently zero those flags, leaving callers wondering why they got a
+// y/x fallback they did not ask for. Returns nullopt on success.
 [[nodiscard]] inline std::optional<grpc::Status>
 grpc_check_layout_request(grpc::ServerContext *ctx, bool req_layout,
                            bool req_reading_order, bool layout_available) {
   if (req_layout && !layout_available) {
+    // LAYOUT_DISABLED for every "layout feature unavailable" rejection —
+    // one stable code per condition, matching the HTTP routes and the
+    // reading_order case below.
     return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
-                      "INVALID_PARAMETER",
+                      "LAYOUT_DISABLED",
                       "Layout requested but the layout model is not loaded. "
                       "Either models/layout/layout.onnx is missing from the "
                       "image, or the server was started with DISABLE_LAYOUT=1.");
@@ -123,9 +130,15 @@ grpc_jpeg_decode_and_infer(pipeline::PipelineDispatcher &dispatcher,
         const auto *d =
             reinterpret_cast<const unsigned char *>(owned.data());
         size_t n = owned.size();
+        const int cap = decode::max_image_dim();
         auto &nvjpeg = e.get_nvjpeg();
         if (nvjpeg.available()) {
           auto [w, h] = nvjpeg.get_dimensions(d, n);
+          // Bomb guard for JPEGs the caller's pre-decode sniff couldn't
+          // parse: reject before allocating GPU memory for them.
+          if (w > cap || h > cap)
+            throw turbo_ocr::ImageTooLargeError(std::format(
+                "Image dimensions {}x{} exceed maximum of {}x{}", w, h, cap, cap));
           if (w > 0 && h > 0) {
             auto [d_buf, pitch] = e.pipeline->ensure_gpu_buf(h, w);
             if (nvjpeg.decode_to_gpu(d, n, d_buf, pitch, w, h, e.stream)) {
@@ -147,6 +160,12 @@ grpc_jpeg_decode_and_infer(pipeline::PipelineDispatcher &dispatcher,
         }
         if (img.empty())
           throw turbo_ocr::ImageDecodeError("Failed to decode JPEG");
+        // CPU-fallback / nvjpeg-unavailable bomb guard: re-check the decoded
+        // size, since get_dimensions={0,0} and the 64KB sniff can both miss.
+        if (img.cols > cap || img.rows > cap)
+          throw turbo_ocr::ImageTooLargeError(std::format(
+              "Image dimensions {}x{} exceed maximum of {}x{}",
+              img.cols, img.rows, cap, cap));
         return e.pipeline->run_with_layout(img, e.stream, want_layout,
                                            want_reading_order);
       });
@@ -166,7 +185,10 @@ public:
         default_pdf_mode_(cfg.default_pdf_mode),
         layout_available_(layout_available),
         grpc_batch_workers_(cfg.grpc_batch_workers),
-        max_pdf_pages_(cfg.max_pdf_pages) {}
+        max_pdf_pages_(cfg.max_pdf_pages),
+        max_batch_images_(cfg.max_batch_images),
+        default_pdf_dpi_(cfg.pdf_only ? cfg.pdf_dpi : 100),
+        pdf_chunk_batch_(cfg.pdf_only ? cfg.pdf_batch : 0) {}
 #endif
 
   /// CPU-friendly constructor: takes an InferFunc instead of a dispatcher.
@@ -180,7 +202,9 @@ public:
         default_pdf_mode_(cfg.default_pdf_mode),
         layout_available_(layout_available),
         grpc_batch_workers_(cfg.grpc_batch_workers),
-        max_pdf_pages_(cfg.max_pdf_pages) {}
+        max_pdf_pages_(cfg.max_pdf_pages),
+        max_batch_images_(cfg.max_batch_images),
+        default_pdf_dpi_(cfg.pdf_only ? cfg.pdf_dpi : 100) {}
 
   /// Set the readiness probe used by Health(). Same signature as the
   /// HTTP /health/ready check; called once per Health RPC. nullptr
@@ -257,6 +281,11 @@ public:
       cv::Mat img = cv::Mat(height, width, channels == 3 ? CV_8UC3 : CV_8UC1,
                             const_cast<char *>(request->pixels().data()))
                         .clone();
+      // The pipeline is BGR-only; a 1-channel Mat trips the degenerate-input
+      // guard and returns empty. Expand grayscale up front, matching the
+      // HTTP /ocr/pixels handler.
+      if (channels == 1)
+        cv::cvtColor(img, img, cv::COLOR_GRAY2BGR);
 
       try {
         auto out = run_infer(img, want_layout, want_reading_order);
@@ -294,6 +323,9 @@ public:
           fill_response(response, out.results, out.layout, out.reading_order,
                         want_blocks);
           return grpc::Status::OK;
+        } catch (const turbo_ocr::ImageTooLargeError &e) {
+          return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+                            "DIMENSIONS_TOO_LARGE", e.what());
         } catch (const turbo_ocr::ImageDecodeError &) {
           return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
                             "IMAGE_DECODE_FAILED", "Decode failed");
@@ -351,6 +383,11 @@ public:
     if (n == 0)
       return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
                         "EMPTY_BATCH", "Empty images array");
+    // Cap before the O(n) per-slot vectors + n response sub-messages below —
+    // an unbounded repeated images field is a memory-amplification OOM lever.
+    if (n > max_batch_images_)
+      return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT, "BATCH_TOO_LARGE",
+          std::format("images has {} entries, max is {}", n, max_batch_images_));
 
     if (auto err = grpc_check_layout_request(ctx, request->layout(),
             request->reading_order() || request->as_blocks(),
@@ -365,10 +402,19 @@ public:
     }
     if (want_reading_order) want_layout = true;
 
-    // Pre-decode dim sniff on every item — refuses bombs before any decode.
+    // Per-slot oversize handling: an oversized image is dropped to an empty
+    // slot (0 detections), NOT a whole-RPC abort — one decompression-bomb in
+    // a batch must not deny service to every co-batched valid image. Mirrors
+    // the per-slot contract of HTTP /ocr/batch and of this handler's own
+    // decode-failure path. Pre-decode header sniff refuses bombs before any
+    // decode cost.
+    const int dim_cap = decode::max_image_dim();
+    std::vector<bool> too_large(n, false);
     for (int i = 0; i < n; ++i) {
-      if (auto err = grpc_pre_decode_dim_check(ctx, request->images(i)); err)
-        return *err;
+      auto *p = reinterpret_cast<const unsigned char *>(request->images(i).data());
+      if (auto d = decode::peek_image_dimensions(p, request->images(i).size()))
+        if (d->width > dim_cap || d->height > dim_cap)
+          too_large[i] = true;
     }
 
     // JPEGs decode inside the dispatcher lambda (see grpc_jpeg_decode_and_infer);
@@ -376,6 +422,7 @@ public:
     std::vector<cv::Mat> imgs(n);
     std::vector<bool> is_jpeg(n, false);
     for (int i = 0; i < n; ++i) {
+      if (too_large[i]) continue;
       const auto &bytes = request->images(i);
       const auto *p = reinterpret_cast<const unsigned char *>(bytes.data());
 #ifndef USE_CPU_ONLY
@@ -388,28 +435,33 @@ public:
     }
 
     // Post-decode safety net for formats we didn't sniff (BMP/TIFF/WebP).
-    {
-      const int cap = decode::max_image_dim();
-      for (int i = 0; i < n; ++i) {
-        if (imgs[i].empty()) continue;
-        if (imgs[i].cols > cap || imgs[i].rows > cap)
-          return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
-              "DIMENSIONS_TOO_LARGE",
-              std::format("Image {} dimensions {}x{} exceed maximum of {}x{}",
-                          i, imgs[i].cols, imgs[i].rows, cap, cap));
+    for (int i = 0; i < n; ++i) {
+      if (imgs[i].empty()) continue;
+      if (imgs[i].cols > dim_cap || imgs[i].rows > dim_cap) {
+        too_large[i] = true;
+        imgs[i].release();  // drop to empty slot
       }
     }
 
     // Check we have at least one valid candidate. JPEGs are still encoded
     // bytes at this point — we trust the pre-decode dim sniff and decode
-    // failures will surface per-slot below.
-    bool any_valid = false;
+    // failures will surface per-slot below. A mixed batch proceeds (oversized
+    // slots emit empty results via mark_empty_slot). Only an all-invalid
+    // batch aborts — and then the code reflects WHY: if any slot was
+    // oversized, report DIMENSIONS_TOO_LARGE (matching single Recognize)
+    // rather than the misleading IMAGE_DECODE_FAILED.
+    bool any_valid = false, any_too_large = false;
     for (int i = 0; i < n; ++i) {
       if (is_jpeg[i] || !imgs[i].empty()) { any_valid = true; break; }
+      if (too_large[i]) any_too_large = true;
     }
     if (!any_valid)
-      return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
-                        "IMAGE_DECODE_FAILED", "No valid images");
+      return any_too_large
+          ? grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+                       "DIMENSIONS_TOO_LARGE",
+                       "All images exceed the maximum dimension")
+          : grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+                       "IMAGE_DECODE_FAILED", "No valid images");
 
     // RepeatedPtrField is not thread-safe for concurrent add_*, so pre-allocate.
     response->set_total_images(n);
@@ -417,7 +469,7 @@ public:
     entries.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
       auto *e = response->add_batch_results();
-      if (!is_jpeg[i] && imgs[i].empty()) e->set_num_detections(0);
+      if (!is_jpeg[i] && imgs[i].empty()) mark_empty_slot(e);
       entries.push_back(e);
     }
 
@@ -453,9 +505,9 @@ public:
         } catch (const std::exception &e) {
           std::cerr << std::format("[gRPC Batch] Image {} error: {}\n",
                                    i, e.what());
-          entries[i]->set_num_detections(0);
+          mark_empty_slot(entries[i]);
         } catch (...) {
-          entries[i]->set_num_detections(0);
+          mark_empty_slot(entries[i]);
         }
       }
       return grpc::Status::OK;
@@ -482,9 +534,9 @@ public:
             } catch (const std::exception &e) {
               std::cerr << std::format("[gRPC Batch] Image {} error: {}\n",
                                        i, e.what());
-              entries[i]->set_num_detections(0);
+              mark_empty_slot(entries[i]);
             } catch (...) {
-              entries[i]->set_num_detections(0);
+              mark_empty_slot(entries[i]);
             }
           }
         });
@@ -520,7 +572,10 @@ public:
     if (want_blocks) want_layout = true;
 
     int dpi = request->dpi();
-    if (dpi == 0) dpi = 100;
+    // In pdf_only mode the default is cfg.pdf_dpi — the DPI the static det
+    // profile (pdf_page_h/w) was sized for; 100 otherwise. Explicit request
+    // dpi always wins.
+    if (dpi == 0) dpi = default_pdf_dpi_;
     if (dpi < 50 || dpi > 600)
       return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
                         "INVALID_DPI", "DPI must be between 50 and 600");
@@ -663,16 +718,141 @@ public:
       }
     }
 
+    // Counters the async page tasks fetch_add into — DECLARED BEFORE
+    // page_futures so they outlive the futures' blocking destructors on every
+    // unwind path (a task may still be running when the stack unwinds past an
+    // exception; destroying these first would be a write-to-dead-object UB).
+    //
+    // dropped_pages: inference could not be enqueued (GPU at capacity) — any
+    // non-zero count turns the whole RPC into RESOURCE_EXHAUSTED rather than
+    // emitting blank pages in OK (parity with the HTTP /ocr/pdf dropped_pages
+    // -> 503 path; the throw happens on a std::async worker so it can't reach
+    // a synchronous catch at submit). decode_failures: a rendered PPM could
+    // not be read back — a server-side fault mapping to INTERNAL, matching
+    // the HTTP route's PAGE_DECODE_FAILED -> 500.
+    std::atomic<int> dropped_pages{0};
+    std::atomic<int> decode_failures{0};
+    // Bounds in-flight per-page std::async tasks. render_streamed fires
+    // callbacks at render speed while OCR is slower, so without this the
+    // single-page path spawns one OS thread per page (up to MAX_PDF_PAGES)
+    // — and on the CPU build each blocks indefinitely on the unbounded pool
+    // acquire(), exhausting threads/memory. The synchronous render callback
+    // acquires a permit before launching and the task releases it on exit,
+    // throttling rendering to OCR throughput. Declared before page_futures.
+    std::counting_semaphore<> page_gate{64};
+    // stream_handle owns the PPM tmpdir the async tasks read; declared before
+    // page_futures so the futures join (in page_futures' dtor) before the
+    // tmpdir is unlinked on any unwind path.
+    render::PdfRenderer::StreamHandle stream_handle;
+
     // Streamed render + OCR
     std::mutex futures_mutex;
     std::vector<std::future<void>> page_futures;
-    render::PdfRenderer::StreamHandle stream_handle;
     int num_pages = 0;
+
+#ifndef USE_CPU_ONLY
+    // pdf_only mode: OCR pages accumulate into pdf_chunk_batch_-sized
+    // chunks (render callbacks are synchronous, so no lock needed) and run
+    // through the pipeline's batched path — one static-shape det execute +
+    // batched layout per chunk, matching the HTTP /ocr/pdf route instead
+    // of paying a padded full-batch det execute per page.
+    std::vector<int> acc_idxs;
+    std::vector<std::string> acc_paths;
+    auto submit_ocr_chunk = [&](std::vector<int> idxs,
+                                std::vector<std::string> paths) {
+      const size_t chunk_n = idxs.size();  // captured before idxs is moved
+      // Same backpressure as the single-page path: cap in-flight chunk tasks
+      // so render can't outrun OCR and spawn unbounded std::async threads.
+      page_gate.acquire();
+      std::future<void> fut;
+      try {
+      fut = std::async(std::launch::async,
+          [this, &results_mutex, &page_results, &page_text_cache, &pdf_doc,
+           &dropped_pages, &decode_failures, &page_gate, want_layout,
+           want_reading_order, dpi,
+           idxs = std::move(idxs), paths = std::move(paths)]() {
+        struct GateRelease {
+          std::counting_semaphore<> &s;
+          ~GateRelease() { s.release(); }
+        } gate_release{page_gate};
+        std::vector<cv::Mat> imgs;
+        std::vector<int> live;  // page index per successfully decoded image
+        imgs.reserve(paths.size());
+        live.reserve(paths.size());
+        for (size_t j = 0; j < paths.size(); ++j) {
+          cv::Mat img = render::PdfRenderer::decode_ppm(paths[j]);
+          if (img.empty()) {
+            std::cerr << std::format("[gRPC PDF] Failed to decode PPM for page {}\n", idxs[j]);
+            decode_failures.fetch_add(1, std::memory_order_relaxed);
+            continue;
+          }
+          imgs.push_back(std::move(img));
+          live.push_back(idxs[j]);
+        }
+        if (imgs.empty()) return;
+
+        std::vector<pipeline::OcrPipelineResult> outs;
+        try {
+          outs = run_infer_batch(imgs, want_layout, want_reading_order);
+        } catch (const turbo_ocr::PoolExhaustedError &) {
+          dropped_pages.fetch_add(static_cast<int>(live.size()),
+                                  std::memory_order_relaxed);
+          return;  // leave slots empty; the RPC will RESOURCE_EXHAUSTED
+        }
+
+        for (size_t j = 0; j < outs.size(); ++j) {
+          const int page_idx = live[j];
+          auto &out = outs[j];
+          for (auto &it : out.results) it.source = "ocr";
+
+          pdf::PdfMode page_mode;
+          {
+            std::lock_guard<std::mutex> rlock(results_mutex);
+            page_mode = page_results[page_idx].resolved_mode;
+          }
+          if (page_mode == pdf::PdfMode::AutoVerified &&
+              page_idx < static_cast<int>(page_text_cache.size()) && pdf_doc)
+            pdf::verify_results_with_text_layer(out.results, *pdf_doc,
+                                                page_idx, dpi);
+
+          std::lock_guard<std::mutex> rlock(results_mutex);
+          auto &slot = page_results[page_idx];
+          slot.results       = std::move(out.results);
+          slot.layout        = std::move(out.layout);
+          slot.reading_order = std::move(out.reading_order);
+          slot.width         = imgs[j].cols;
+          slot.height        = imgs[j].rows;
+          slot.effective_dpi = dpi;
+          if (page_mode == pdf::PdfMode::Ocr)
+            slot.resolved_mode = pdf::PdfMode::Ocr;
+        }
+      });
+      } catch (...) {
+        // std::async failed to launch — the task that would release the
+        // permit never runs; release it, count the chunk as dropped (RPC
+        // -> RESOURCE_EXHAUSTED), and don't let the throw unwind past the
+        // joinable render thread.
+        page_gate.release();
+        dropped_pages.fetch_add(static_cast<int>(chunk_n),
+                                std::memory_order_relaxed);
+        return;
+      }
+      std::lock_guard lock(futures_mutex);
+      page_futures.push_back(std::move(fut));
+    };
+#endif // !USE_CPU_ONLY
 
     if (any_need_render) {
       try {
         stream_handle = pdf_renderer_->render_streamed(pdf_data, pdf_len, dpi,
-            [&](int page_idx, std::string ppm_path) {
+            [&](int page_idx, std::string ppm_path) noexcept {
+             // The whole callback is noexcept: it runs inside render_streamed's
+             // poll loop while the render thread is still joinable, so ANY
+             // escaping throw (the resizes / push_back below, or a failed
+             // task launch) would unwind past that std::thread and
+             // std::terminate. Catch everything; a failed page is left empty.
+             try {
+              bool is_geometric = false;
               {
                 std::lock_guard<std::mutex> rlock(results_mutex);
                 if (page_idx >= static_cast<int>(page_results.size())) {
@@ -685,19 +865,52 @@ public:
                     page_idx < static_cast<int>(need_render.size()) &&
                     !need_render[page_idx])
                   return;
+                // Per-page modes are final by render time (the pre-pass
+                // above ran before the render; mode==Ocr never resolves
+                // to Geometric).
+                is_geometric = req_mode != pdf::PdfMode::Ocr &&
+                    page_results[page_idx].resolved_mode ==
+                        pdf::PdfMode::Geometric;
               }
+
+#ifndef USE_CPU_ONLY
+              if (pdf_chunk_batch_ > 0 && !is_geometric) {
+                acc_idxs.push_back(page_idx);
+                acc_paths.push_back(std::move(ppm_path));
+                if (static_cast<int>(acc_idxs.size()) >= pdf_chunk_batch_) {
+                  submit_ocr_chunk(std::move(acc_idxs), std::move(acc_paths));
+                  acc_idxs.clear();
+                  acc_paths.clear();
+                }
+                return;
+              }
+#endif
+
+              // Bound in-flight tasks: block the (synchronous) render
+              // callback here until a permit frees, so rendering can't
+              // outrun OCR and pile up threads. The task releases the
+              // permit on exit via the RAII guard below.
+              page_gate.acquire();
 
               // Explicit captures so it's obvious which references the
               // async task uses; render_streamed is fully synchronous and
               // page_futures are joined before this function returns, so
               // every captured reference outlives the task.
-              auto fut = std::async(std::launch::async,
+              std::future<void> fut;
+              try {
+                fut = std::async(std::launch::async,
                   [this, &results_mutex, &page_results, &page_text_cache,
-                   &pdf_doc, want_layout, want_reading_order, dpi, page_idx,
+                   &pdf_doc, &dropped_pages, &decode_failures, &page_gate,
+                   want_layout, want_reading_order, dpi, page_idx,
                    path = std::move(ppm_path)]() {
+                struct GateRelease {
+                  std::counting_semaphore<> &s;
+                  ~GateRelease() { s.release(); }
+                } gate_release{page_gate};
                 cv::Mat img = render::PdfRenderer::decode_ppm(path);
                 if (img.empty()) {
                   std::cerr << std::format("[gRPC PDF] Failed to decode PPM for page {}\n", page_idx);
+                  decode_failures.fetch_add(1, std::memory_order_relaxed);
                   return;
                 }
                 int pw = img.cols, ph = img.rows;
@@ -716,35 +929,26 @@ public:
 
                 // Geometric mode with layout: run full inference to get layout
                 // (CPU has no run_layout_only; GPU path also benefits from unified code)
-                if (page_mode == pdf::PdfMode::Geometric && want_layout) {
-                  auto infer_out = run_infer(img, true, want_reading_order);
-                  layout_snapshot = std::move(infer_out.layout);
-                } else if (page_mode != pdf::PdfMode::Geometric) {
-                  auto infer_out = run_infer(img, want_layout, want_reading_order);
-                  rec_results = std::move(infer_out.results);
-                  layout_snapshot = std::move(infer_out.layout);
-                  reading_order_snapshot = std::move(infer_out.reading_order);
-                  for (auto &it : rec_results) it.source = "ocr";
+                try {
+                  if (page_mode == pdf::PdfMode::Geometric && want_layout) {
+                    auto infer_out = run_infer(img, true, want_reading_order);
+                    layout_snapshot = std::move(infer_out.layout);
+                  } else if (page_mode != pdf::PdfMode::Geometric) {
+                    auto infer_out = run_infer(img, want_layout, want_reading_order);
+                    rec_results = std::move(infer_out.results);
+                    layout_snapshot = std::move(infer_out.layout);
+                    reading_order_snapshot = std::move(infer_out.reading_order);
+                    for (auto &it : rec_results) it.source = "ocr";
+                  }
+                } catch (const turbo_ocr::PoolExhaustedError &) {
+                  dropped_pages.fetch_add(1, std::memory_order_relaxed);
+                  return;  // leave slot empty; RPC -> RESOURCE_EXHAUSTED
                 }
 
                 if (page_mode == pdf::PdfMode::AutoVerified &&
-                    page_idx < static_cast<int>(page_text_cache.size()) && pdf_doc) {
-                  for (auto &item : rec_results) {
-                    const float px_to_pt = 72.0f / static_cast<float>(dpi);
-                    auto [ix0, iy0, ix1, iy1] = turbo_ocr::aabb(item.box);
-                    float x0 = ix0 * px_to_pt, y0 = iy0 * px_to_pt;
-                    float x1 = ix1 * px_to_pt, y1 = iy1 * px_to_pt;
-                    std::string native =
-                        pdf_doc->text_in_rect_pt(page_idx, x0, y0, x1, y1);
-                    auto verdict = pdf::passes_sanity_check(
-                        native, x1 - x0, y1 - y0);
-                    if (verdict.accept) {
-                      item.text = std::move(native);
-                      item.source = "pdf";
-                      item.confidence = 1.0f;
-                    }
-                  }
-                }
+                    page_idx < static_cast<int>(page_text_cache.size()) && pdf_doc)
+                  pdf::verify_results_with_text_layer(rec_results, *pdf_doc,
+                                                      page_idx, dpi);
 
                 std::lock_guard<std::mutex> rlock(results_mutex);
                 auto &slot = page_results[page_idx];
@@ -758,6 +962,13 @@ public:
                           std::round(item.box[k][1] * pt_to_px));
                     }
                   }
+                  // Reading-order parity with OCR pages (see HTTP route).
+                  if (want_reading_order && !layout_snapshot.empty()) {
+                    turbo_ocr::assign_layout_ids(slot.results, layout_snapshot);
+                    reading_order_snapshot =
+                        turbo_ocr::layout::assign_reading_order_for_results(
+                            slot.results, layout_snapshot);
+                  }
                 } else {
                   slot.results = std::move(rec_results);
                 }
@@ -769,11 +980,36 @@ public:
                 if (page_mode == pdf::PdfMode::Ocr)
                   slot.resolved_mode = pdf::PdfMode::Ocr;
               });
+              } catch (...) {
+                // std::async failed to launch the task (thread/resource
+                // exhaustion) — the task that would have released the permit
+                // never runs, so release here. Skip the page (left empty)
+                // rather than letting the throw unwind render_streamed past
+                // its still-joinable render thread (std::terminate).
+                page_gate.release();
+                std::cerr << std::format("[gRPC PDF] could not launch task for page {}\n", page_idx);
+                return;
+              }
 
               std::lock_guard lock(futures_mutex);
               page_futures.push_back(std::move(fut));
+             } catch (const std::exception &e) {
+              // page_results.resize / push_back / etc. threw (e.g. bad_alloc).
+              // Never let it escape render_streamed (joinable render thread).
+              // Any permit acquired above is owned by an already-launched task.
+              std::cerr << std::format("[gRPC PDF] page {} callback error: {}\n",
+                                       page_idx, e.what());
+             } catch (...) {
+              std::cerr << std::format("[gRPC PDF] page {} callback error (unknown)\n", page_idx);
+             }
             });
         num_pages = stream_handle.num_pages;
+#ifndef USE_CPU_ONLY
+        // render_streamed is synchronous (all callbacks have fired) —
+        // flush the partial last chunk so trailing pages aren't dropped.
+        if (!acc_idxs.empty())
+          submit_ocr_chunk(std::move(acc_idxs), std::move(acc_paths));
+#endif
       } catch (const std::exception &e) {
         for (auto &f : page_futures) { try { f.get(); } catch (...) {} }
         std::cerr << std::format("[gRPC PDF] PDF render failed: {}\n", e.what());
@@ -799,6 +1035,16 @@ public:
     if (num_pages == 0)
       return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
                         "EMPTY_PDF", "PDF contains no pages");
+
+    if (const int dropped = dropped_pages.load(std::memory_order_relaxed); dropped > 0)
+      return grpc_error(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED, "SERVER_BUSY",
+          std::format("GPU queue full: {} of {} pages could not be processed. "
+                      "Retry with backoff.", dropped, num_pages));
+
+    if (const int failed = decode_failures.load(std::memory_order_relaxed); failed > 0)
+      return grpc_error(ctx, grpc::StatusCode::INTERNAL, "PAGE_DECODE_FAILED",
+          std::format("{} of {} rendered pages could not be decoded; retry",
+                      failed, num_pages));
 
     // Build response
     for (int i = 0; i < num_pages; ++i) {
@@ -827,6 +1073,19 @@ public:
   }
 
 private:
+  // Mark a batch slot as having no detections. In json_bytes mode this also
+  // sets json_response to a valid empty document ('{"results":[]}') so a
+  // client uniformly parsing json_response per slot doesn't choke on an
+  // empty bytes field for a failed/undecodable image (a successful blank
+  // page already produces valid empty JSON via fill_response).
+  void mark_empty_slot(ocr::OCRResponse *entry) {
+    entry->set_num_detections(0);
+    if (mode_ == GrpcResponseMode::json_bytes) {
+      std::vector<OCRResultItem> empty;
+      entry->set_json_response(results_to_json(empty));
+    }
+  }
+
   void fill_response(ocr::OCRResponse *response,
                      std::vector<OCRResultItem> &results,
                      std::vector<layout::LayoutBox> &layout_boxes,
@@ -913,6 +1172,22 @@ private:
   }
 
 #ifndef USE_CPU_ONLY
+  /// Batched counterpart of run_infer for the pdf_only PDF chunk path —
+  /// one static-shape det execute + batched layout per chunk. Callers gate
+  /// on pdf_chunk_batch_ > 0, which is only set by the dispatcher ctor.
+  std::vector<pipeline::OcrPipelineResult>
+  run_infer_batch(const std::vector<cv::Mat> &imgs, bool want_layout,
+                  bool want_reading_order) {
+    if (want_reading_order) want_layout = want_layout || layout_available_;
+    return dispatcher_->submit(
+        [&imgs, want_layout, want_reading_order](auto &e) {
+      return e.pipeline->run_batch_with_layout(imgs, e.stream, want_layout,
+                                               want_reading_order);
+    }).get();
+  }
+#endif
+
+#ifndef USE_CPU_ONLY
   pipeline::PipelineDispatcher *dispatcher_ = nullptr;
 #endif
   std::function<bool()> readiness_check_;
@@ -923,6 +1198,14 @@ private:
   bool layout_available_ = false;
   int grpc_batch_workers_ = 8;
   int max_pdf_pages_ = 2000;
+  int max_batch_images_ = 1024;
+  // Default render DPI when the request doesn't specify one: cfg.pdf_dpi
+  // in pdf_only mode (matching the static det profile), 100 otherwise.
+  int default_pdf_dpi_ = 100;
+  // pdf_only mode: chunk size for batched PDF page OCR (cfg.pdf_batch,
+  // the static det engine's batch dim); 0 = per-page path. Only ever
+  // non-zero on the GPU dispatcher constructor.
+  int pdf_chunk_batch_ = 0;
 };
 
 /// Start gRPC server on a background thread. Returns the server and thread.

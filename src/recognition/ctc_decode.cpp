@@ -1,11 +1,62 @@
 #include "turbo_ocr/recognition/ctc_decode.h"
 
+#include <cstdlib>
 #include <format>
 #include <fstream>
+#include <immintrin.h>
 #include <iostream>
 #include <string>
+#include <utility>
 
 namespace turbo_ocr::recognition {
+
+namespace {
+// AVX2 argmax over a contiguous row of floats. Matches the scalar reference
+// exactly, INCLUDING tie-breaking (lowest index wins on equal values): the
+// per-lane compare uses strict >, so a lane keeps its lowest index on ties,
+// and the 8-lane horizontal reduce also breaks ties toward the lower index.
+inline std::pair<float, int> argmax_avx2(const float *row, int n) {
+  int j = 0;
+  __m256 vmax = _mm256_set1_ps(-3.402823e38f);
+  __m256i vidx = _mm256_setzero_si256();
+  __m256i vj = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+  const __m256i v8 = _mm256_set1_epi32(8);
+  for (; j + 8 <= n; j += 8) {
+    __m256 v = _mm256_loadu_ps(row + j);
+    __m256 gt = _mm256_cmp_ps(v, vmax, _CMP_GT_OQ);
+    vmax = _mm256_max_ps(vmax, v);
+    vidx = _mm256_blendv_epi8(vidx, vj, _mm256_castps_si256(gt));
+    vj = _mm256_add_epi32(vj, v8);
+  }
+  alignas(32) float vals[8];
+  alignas(32) int idxs[8];
+  _mm256_store_ps(vals, vmax);
+  _mm256_store_si256(reinterpret_cast<__m256i *>(idxs), vidx);
+  float best = vals[0];
+  int bi = idxs[0];
+  for (int k = 1; k < 8; k++) {
+    if (vals[k] > best || (vals[k] == best && idxs[k] < bi)) {
+      best = vals[k];
+      bi = idxs[k];
+    }
+  }
+  for (; j < n; j++) {
+    if (row[j] > best) {
+      best = row[j];
+      bi = j;
+    }
+  }
+  return {best, bi};
+}
+
+inline bool simd_ctc_enabled() {
+  static const bool e = [] {
+    const char *v = std::getenv("SIMD_CTC");
+    return v && v[0] == '1';
+  }();
+  return e;
+}
+} // namespace
 
 std::pair<std::string, float>
 ctc_greedy_decode(const int *indices, const float *scores, int seq_len,
@@ -41,14 +92,23 @@ ctc_greedy_decode_raw(const float *logits, int seq_len, int num_classes,
   int count = 0;
   int last_index = -1;
 
+  const bool use_simd = simd_ctc_enabled();
   for (int i = 0; i < seq_len; i++) {
     const float *row = logits + i * num_classes;
-    int index = 0;
-    float max_val = row[0];
-    for (int j = 1; j < num_classes; j++) {
-      if (row[j] > max_val) {
-        max_val = row[j];
-        index = j;
+    int index;
+    float max_val;
+    if (use_simd) {
+      auto [mv, mi] = argmax_avx2(row, num_classes);
+      max_val = mv;
+      index = mi;
+    } else {
+      index = 0;
+      max_val = row[0];
+      for (int j = 1; j < num_classes; j++) {
+        if (row[j] > max_val) {
+          max_val = row[j];
+          index = j;
+        }
       }
     }
 

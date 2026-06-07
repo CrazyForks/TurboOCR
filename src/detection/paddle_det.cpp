@@ -323,6 +323,14 @@ PaddleDet::run_cpu_contours(int resize_h, int resize_w,
 std::vector<Box>
 PaddleDet::run(const GpuImage &gpu_img, int orig_h, int orig_w,
                cudaStream_t stream) {
+  // PDF-only static mode: the engine accepts only {B, 3, H, W}, so a
+  // dynamic single-image execute would be rejected by TRT. Route through
+  // the padded batched path instead — correct for every single-image
+  // caller (health probe, /ocr, per-page fallbacks); throughput-critical
+  // callers batch pages and call run_batch directly.
+  if (pdf_static_batch_ > 0)
+    return std::move(run_batch({gpu_img}, {{orig_h, orig_w}}, stream)[0]);
+
   int h = orig_h;
   int w = orig_w;
   float ratio = 1.0f;
@@ -362,18 +370,54 @@ PaddleDet::run(const GpuImage &gpu_img, int orig_h, int orig_w,
 }
 
 // ============================================================================
-// PDF-only static-engine warmup
+// PDF-only static-engine mode
 // ============================================================================
-bool PaddleDet::warmup_pdf_static(int B, int H, int W, cudaStream_t stream) {
+void PaddleDet::set_pdf_static_profile(int batch, int page_h, int page_w) {
+  pdf_static_batch_ = batch;
+  pdf_static_h_ = page_h;
+  pdf_static_w_ = page_w;
+
+  // init_buffers() sized the batch + CCL scratch for kMaxBatchSize ×
+  // DET_MAX_SIDE² pixels, but the fixed PDF page can exceed that (default
+  // 1280×960 > 960²) — grow everything indexed by per-image pixels so the
+  // static-shape execute can't write past its buffers. Per-slot metadata
+  // arrays stay at kMaxBatchSize: ServerConfig clamps pdf_batch to it.
+  const size_t page_pixels = static_cast<size_t>(page_h) * page_w;
+  const size_t max_pixels  = static_cast<size_t>(kMaxSideLen_) * kMaxSideLen_;
+  if (page_pixels <= max_pixels)
+    return;
+
+  const size_t batch_px = static_cast<size_t>(kMaxBatchSize) * page_pixels;
+  batch_input_size_  = batch_px * 3 * sizeof(float);
+  batch_output_size_ = batch_px * sizeof(float);
+  d_batch_input_  = CudaPtr<float>(batch_px * 3);
+  d_batch_output_ = CudaPtr<float>(batch_px);
+  d_batch_bitmap_ = CudaPtr<uint8_t>(batch_px);
+
+  if (gpu_ccl_mode_ > 0) {
+    // Per-image CCL/JFA scratch is indexed by the resize_h×resize_w of the
+    // slice being post-processed — grow it to the fixed page size too.
+    d_ccl_labels_      = CudaPtr<int>(page_pixels);
+    d_ccl_compact_ids_ = CudaPtr<int>(page_pixels);
+    d_jfa_labels_      = CudaPtr<uint32_t>(page_pixels);
+    d_jfa_seeds_       = CudaPtr<int2>(page_pixels);
+    d_jfa_seeds_alt_   = CudaPtr<int2>(page_pixels);
+  }
+}
+
+bool PaddleDet::warmup_pdf_static(cudaStream_t stream) {
+  if (pdf_static_batch_ <= 0)
+    return false;
   // Bind the batched I/O slot — the cached static engine expects exactly
   // {B, 3, H, W}, which is what its profile was built with.
   engine_->bind_io(d_batch_input_.get(), d_batch_output_.get());
-  const size_t in_floats = static_cast<size_t>(B) * 3 * H * W;
+  const size_t in_floats = static_cast<size_t>(pdf_static_batch_) * 3 *
+                           pdf_static_h_ * pdf_static_w_;
   // Zero-fill input on device; the actual values don't matter for warmup,
   // we just need TRT to JIT and lazy-alloc with this exact shape.
   CUDA_CHECK(cudaMemsetAsync(d_batch_input_.get(), 0,
                               in_floats * sizeof(float), stream));
-  nvinfer1::Dims4 dims{B, 3, H, W};
+  nvinfer1::Dims4 dims{pdf_static_batch_, 3, pdf_static_h_, pdf_static_w_};
   bool ok = engine_->infer_dynamic(dims, stream);
   CUDA_CHECK(cudaStreamSynchronize(stream));
   // Restore single-image binding so any future dynamic-shape callers find
@@ -397,14 +441,24 @@ PaddleDet::run_batch(const std::vector<GpuImage> &gpu_imgs,
   // PDF-only static-engine mode: the engine accepts ONLY {B, 3, H, W}.
   // We always submit exactly that, padding shorter inputs by repeating
   // slot 0 (the pad slots' output gets discarded after post-processing).
-  auto env_int = [](const char *name, int def) {
-    if (const char *v = std::getenv(name)) {
-      try { return std::stoi(v); } catch (...) {}
+  const bool pdf_only = pdf_static_batch_ > 0;
+
+  // Static mode with more pages than the profile's batch dim: chunk into
+  // B-page executes instead of silently dropping the tail.
+  if (pdf_only && n > pdf_static_batch_) {
+    std::vector<std::vector<Box>> all;
+    all.reserve(n);
+    for (int off = 0; off < n; off += pdf_static_batch_) {
+      const int end = std::min(off + pdf_static_batch_, n);
+      std::vector<GpuImage> sub(gpu_imgs.begin() + off, gpu_imgs.begin() + end);
+      std::vector<std::pair<int,int>> sub_dims(orig_dims.begin() + off,
+                                                orig_dims.begin() + end);
+      auto part = run_batch(sub, sub_dims, stream);
+      for (auto &b : part)
+        all.push_back(std::move(b));
     }
-    return def;
-  };
-  const bool pdf_only = std::getenv("TURBO_OCR_PDF_ONLY") &&
-                        std::string(std::getenv("TURBO_OCR_PDF_ONLY")) == "1";
+    return all;
+  }
 
   // Fallback: single image → use optimized single path (only valid when
   // running with the dynamic engine; pdf_only's static engine can't take
@@ -424,15 +478,14 @@ PaddleDet::run_batch(const std::vector<GpuImage> &gpu_imgs,
   std::vector<PerImgInfo> infos;
 
   if (pdf_only) {
-    // Lock to the static engine's exact profile. The CUDA preprocessing
-    // kernel handles arbitrary input H/W → fixed output H/W, so callers
-    // can hand us pages of any size and we'll resize-fit to the static
-    // shape. ratio is unused in the pdf_only post-processing path —
-    // boxes are reported in resize_h/w pixel space and the caller maps
-    // back via orig_dims.
-    batch_size = env_int("TURBO_OCR_PDF_BATCH",     8);
-    resize_h   = env_int("TURBO_OCR_PDF_PAGE_H", 1280);
-    resize_w   = env_int("TURBO_OCR_PDF_PAGE_W",  960);
+    // Lock to the static engine's exact profile (set_pdf_static_profile,
+    // fed from the validated ServerConfig). The CUDA preprocessing kernel
+    // handles arbitrary input H/W → fixed output H/W, so callers can hand
+    // us pages of any size and we'll resize-fit to the static shape; the
+    // post-processing paths map boxes back to orig space via orig_dims.
+    batch_size = pdf_static_batch_;
+    resize_h   = pdf_static_h_;
+    resize_w   = pdf_static_w_;
     infos.resize(batch_size);
     for (int i = 0; i < batch_size; ++i) {
       // Real input dims for slots 0..min(n,batch_size)-1; pad slots

@@ -97,3 +97,76 @@ class TestPdfModeSemantics:
         assert total_av >= total_ocr * 0.8, (
             f"auto_verified ({total_av}) should not be much worse than ocr ({total_ocr})"
         )
+
+
+def test_geometric_reading_order_parity(server_url, small_pdfs):
+    """Geometric pages must carry reading_order/blocks when requested, same
+    as OCR pages — they are derived from the (rescaled) text + layout."""
+    probe = requests.post(
+        f"{server_url}/ocr/pdf?mode=ocr&layout=1",
+        data=small_pdfs["simple_letter"].read_bytes(),
+        headers={"Content-Type": "application/pdf"}, timeout=60)
+    if probe.status_code != 200 or not any(
+            p.get("layout") for p in probe.json().get("pages", [])):
+        pytest.skip("server started without layout")
+    r = requests.post(
+        f"{server_url}/ocr/pdf?mode=geometric&layout=1&reading_order=1&as_blocks=1",
+        data=small_pdfs["simple_letter"].read_bytes(),
+        headers={"Content-Type": "application/pdf"}, timeout=60)
+    assert r.status_code == 200, r.text
+    pages = r.json()["pages"]
+    # at least one page has text + layout → must also expose reading_order
+    enriched = [p for p in pages if p.get("results") and p.get("layout")]
+    assert enriched, "no geometric page produced both text and layout"
+    for p in enriched:
+        assert p.get("reading_order"), "geometric page missing reading_order"
+        assert "blocks" in p, "geometric page missing blocks aggregate"
+
+
+class TestPageImages:
+    """/ocr/pdf?images=inline — per-page rendered image export. Everything is
+    per-request (format/quality/lossless/max_side); default format is PNG."""
+
+    def test_no_images_by_default(self, server_url, small_pdfs):
+        r = _post_pdf(server_url, small_pdfs["simple_letter"], "ocr")
+        assert r.status_code == 200
+        assert all("image_b64" not in p for p in r.json()["pages"])
+
+    def test_inline_default_png(self, server_url, small_pdfs):
+        import base64
+        r = requests.post(
+            f"{server_url}/ocr/pdf?images=inline",
+            data=small_pdfs["simple_letter"].read_bytes(),
+            headers={"Content-Type": "application/pdf"}, timeout=120)
+        assert r.status_code == 200, r.text
+        for p in r.json()["pages"]:
+            assert p.get("image_content_type") == "image/png", p.keys()
+            raw = base64.b64decode(p["image_b64"])
+            assert raw[:8] == b"\x89PNG\r\n\x1a\n"  # PNG magic
+            assert p["results"], "OCR text must still be present"
+
+    def test_inline_jpeg_quality_max_side(self, server_url, small_pdfs):
+        import base64, io
+        r = requests.post(
+            f"{server_url}/ocr/pdf?images=inline&format=jpeg&quality=80&max_side=480",
+            data=small_pdfs["simple_letter"].read_bytes(),
+            headers={"Content-Type": "application/pdf"}, timeout=120)
+        assert r.status_code == 200, r.text
+        p0 = r.json()["pages"][0]
+        assert p0["image_content_type"] == "image/jpeg"
+        raw = base64.b64decode(p0["image_b64"])
+        assert raw[:2] == b"\xff\xd8"  # JPEG SOI
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(raw))
+            assert max(img.size) <= 480, img.size
+        except ImportError:
+            pass
+
+    def test_invalid_quality_rejected(self, server_url, small_pdfs):
+        r = requests.post(
+            f"{server_url}/ocr/pdf?images=inline&format=jpeg&quality=0",
+            data=small_pdfs["simple_letter"].read_bytes(),
+            headers={"Content-Type": "application/pdf"}, timeout=30)
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] == "INVALID_PARAMETER"

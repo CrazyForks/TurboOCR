@@ -2,6 +2,7 @@
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include <drogon/HttpAppFramework.h>
 #include <json/json.h>
@@ -9,6 +10,7 @@
 #include <format>
 
 #include "turbo_ocr/common/errors.h"
+#include "turbo_ocr/common/logger.h"
 #include "turbo_ocr/common/serialization.h"
 #include "turbo_ocr/decode/image_dims.h"
 #include "turbo_ocr/decode/image_config.h"
@@ -76,9 +78,17 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
 
         // JPEG with nvJPEG: submit GPU-direct decode + infer as one work item
         if (nvjpeg_available && NvJpegDecoder::is_jpeg(data, len)) {
-          auto out = dispatcher.submit([data, len, opts](auto &e) {
+          auto out = dispatcher.submit([data, len, opts, kMaxImageDim](auto &e) {
             auto &nvjpeg = e.get_nvjpeg();
             auto [w, h] = nvjpeg.get_dimensions(data, len);
+            // Decompression-bomb guard for JPEGs the pre-decode header sniff
+            // couldn't parse (progressive / unusual SOF markers): nvJPEG's
+            // own dims are authoritative — reject before allocating GPU
+            // memory for them.
+            if (w > kMaxImageDim || h > kMaxImageDim)
+              throw turbo_ocr::ImageTooLargeError(std::format(
+                  "Image dimensions {}x{} exceed maximum of {}x{}",
+                  w, h, kMaxImageDim, kMaxImageDim));
             if (w > 0 && h > 0) {
               auto [d_buf, pitch] = e.pipeline->ensure_gpu_buf(h, w);
               if (nvjpeg.decode_to_gpu(data, len, d_buf, pitch, w, h, e.stream)) {
@@ -100,6 +110,14 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
             }
             if (img.empty())
               throw turbo_ocr::ImageDecodeError("Failed to decode JPEG");
+            // CPU-fallback bomb guard: nvjpeg.get_dimensions returns {0,0}
+            // for headers it can't parse (so the dims check above was a
+            // no-op), and the sniff is 64KB-bounded — re-check the decoded
+            // size, same post-decode net as the non-JPEG branch.
+            if (img.cols > kMaxImageDim || img.rows > kMaxImageDim)
+              throw turbo_ocr::ImageTooLargeError(std::format(
+                  "Image dimensions {}x{} exceed maximum of {}x{}",
+                  img.cols, img.rows, kMaxImageDim, kMaxImageDim));
             return e.pipeline->run_with_layout(img, e.stream,
                                                opts.want_layout,
                                                opts.want_reading_order);
@@ -138,10 +156,10 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
 // otherwise) → post-decode dim guard → pipeline submit. Each stage tags
 // per-slot errors so the response keeps a 1:1 mapping with the input array.
 
+// One slot of the batch response: the full per-page pipeline result
+// (text + layout + tables/formulas + reading order when requested).
 struct BatchItem {
-  std::vector<OCRResultItem> results;
-  std::vector<turbo_ocr::layout::LayoutBox> layout;
-  std::vector<int> reading_order;
+  pipeline::OcrPipelineResult out;
 };
 
 // Stage 1: base64 decode every input slot. Empty inputs short-circuit to
@@ -194,6 +212,8 @@ void batch_decode_images(const std::vector<std::string> &raw_bytes,
   std::vector<size_t> jpeg_indices;
   std::vector<std::pair<const unsigned char *, size_t>> jpeg_buffers;
 
+  thread_local NvJpegDecoder tl_nvjpeg;
+  const int kMaxImageDim = decode::max_image_dim();
   if (nvjpeg_available) {
     for (size_t i = 0; i < n; ++i) {
       if (!errors[i].empty()) continue;
@@ -201,15 +221,22 @@ void batch_decode_images(const std::vector<std::string> &raw_bytes,
       if (raw.size() >= 2 &&
           static_cast<unsigned char>(raw[0]) == 0xFF &&
           static_cast<unsigned char>(raw[1]) == 0xD8) {
+        // Bomb guard: nvJPEG's own header dims are authoritative — reject
+        // oversized JPEGs per-slot BEFORE batch_decode allocates a host Mat
+        // from them (the pre-decode sniff is only 64KB-bounded).
+        const auto *p = reinterpret_cast<const unsigned char *>(raw.data());
+        auto [jw, jh] = tl_nvjpeg.get_dimensions(p, raw.size());
+        if (jw > kMaxImageDim || jh > kMaxImageDim) {
+          errors[i] = "dimensions_too_large";
+          continue;
+        }
         jpeg_indices.push_back(i);
-        jpeg_buffers.emplace_back(
-            reinterpret_cast<const unsigned char *>(raw.data()), raw.size());
+        jpeg_buffers.emplace_back(p, raw.size());
       }
     }
   }
 
   if (jpeg_buffers.size() >= 2) {
-    thread_local NvJpegDecoder tl_nvjpeg;
     auto batch_mats = tl_nvjpeg.batch_decode(jpeg_buffers);
     for (size_t j = 0; j < jpeg_indices.size(); ++j)
       imgs[jpeg_indices[j]] = std::move(batch_mats[j]);
@@ -242,9 +269,11 @@ void batch_check_dims_post(std::vector<cv::Mat> &imgs,
   }
 }
 
-// Stage 5: run the pipeline on every slot that survived decode. With layout
-// requested, we run pages serially through run_with_layout; without, we
-// chunk into kMaxBatch-sized batches through run_batch.
+// Stage 5: run the pipeline on every slot that survived decode. Chunks
+// into kMaxBatch-sized batches through run_batch_with_layout — both with
+// and without layout the batched path applies (batched det/rec; in
+// pdf_only mode layout is one batched TRT execute per chunk too), so
+// ?layout=1 no longer falls back to serial single-image inference.
 void batch_run_pipeline(pipeline::PipelineDispatcher &dispatcher,
                          std::vector<cv::Mat> &valid_imgs,
                          const std::vector<size_t> &valid_indices,
@@ -254,44 +283,72 @@ void batch_run_pipeline(pipeline::PipelineDispatcher &dispatcher,
                          std::vector<std::string> &errors) {
   if (valid_imgs.empty()) return;
 
-  if (want_layout) {
-    try {
-      dispatcher.submit([&](auto &e) {
-        for (size_t j = 0; j < valid_imgs.size(); ++j) {
-          auto out = e.pipeline->run_with_layout(valid_imgs[j], e.stream,
-                                                  true,
-                                                  opts.want_reading_order);
-          auto idx = valid_indices[j];
-          all_items[idx].results = std::move(out.results);
-          all_items[idx].layout = std::move(out.layout);
-          all_items[idx].reading_order = std::move(out.reading_order);
-        }
-      }).get();
-    } catch (const std::exception &ex) {
-      // Whole-batch inference error tags every still-empty slot
-      // so the caller knows their request didn't silently succeed.
-      for (size_t k : valid_indices)
-        if (errors[k].empty()) errors[k] = ex.what();
-    }
-  } else {
-    constexpr int kMaxBatch = 8;
-    try {
-      dispatcher.submit([&](auto &e) {
-        for (size_t offset = 0; offset < valid_imgs.size(); offset += kMaxBatch) {
-          size_t end = std::min(offset + kMaxBatch, valid_imgs.size());
+  constexpr int kMaxBatch = 8;
+  try {
+    dispatcher.submit([&](auto &e) {
+      for (size_t offset = 0; offset < valid_imgs.size(); offset += kMaxBatch) {
+        size_t end = std::min(offset + kMaxBatch, valid_imgs.size());
+        // Per-chunk try wraps chunk construction too: a failure here taints
+        // ONLY this chunk's slots, never the completed results of earlier
+        // chunks (whose errors[] are empty == success, the same sentinel a
+        // blanket outer-catch would wrongly overwrite).
+        try {
           std::vector<cv::Mat> chunk(
               std::make_move_iterator(valid_imgs.begin() + offset),
               std::make_move_iterator(valid_imgs.begin() + end));
-          auto chunk_results = e.pipeline->run_batch(chunk, e.stream);
-          for (size_t j = 0; j < chunk_results.size(); ++j)
-            all_items[valid_indices[offset + j]].results =
-                std::move(chunk_results[j]);
+          try {
+            auto chunk_results = e.pipeline->run_batch_with_layout(
+                chunk, e.stream, want_layout, opts.want_reading_order);
+            for (size_t j = 0; j < chunk_results.size(); ++j)
+              all_items[valid_indices[offset + j]].out =
+                  std::move(chunk_results[j]);
+          } catch (const std::exception &) {
+            // One degenerate image (1×1 / corrupt-decoded Mat) poisons the
+            // whole batched chunk. Retry its images individually through
+            // run_with_layout, whose internal guard degrades exactly the
+            // bad slot to an empty result and resets the stream — per-slot
+            // isolation, same as the single-image routes.
+            for (size_t j = 0; j < chunk.size(); ++j) {
+              const size_t idx = valid_indices[offset + j];
+              try {
+                all_items[idx].out = e.pipeline->run_with_layout(
+                    chunk[j], e.stream, want_layout, opts.want_reading_order);
+              } catch (const turbo_ocr::PoolExhaustedError &) {
+                throw;  // -> 503 at the route, never a per-slot tag
+              } catch (const std::exception &ex) {
+                // Don't leak raw CUDA_CHECK text (absolute source paths) to
+                // clients; log the detail, tag the slot with a stable code.
+                TOCR_LOG_ERROR_RL("batch slot inference error",
+                                  "slot", idx, "error", std::string_view(ex.what()));
+                errors[idx] = "inference_failed";
+              }
+            }
+          }
+        } catch (const turbo_ocr::PoolExhaustedError &) {
+          throw;  // queue full mid-batch -> 503, don't swallow as per-slot
+        } catch (const std::exception &ex) {
+          // chunk construction (e.g. bad_alloc) failed: tag only THIS
+          // chunk's still-empty slots, leaving completed chunks intact.
+          TOCR_LOG_ERROR_RL("batch chunk error", "offset", offset,
+                            "error", std::string_view(ex.what()));
+          for (size_t j = offset; j < end; ++j)
+            if (errors[valid_indices[j]].empty())
+              errors[valid_indices[j]] = "inference_failed";
         }
-      }).get();
-    } catch (const std::exception &ex) {
-      for (size_t k : valid_indices)
-        if (errors[k].empty()) errors[k] = ex.what();
-    }
+      }
+    }).get();
+  } catch (const turbo_ocr::PoolExhaustedError &) {
+    // GPU queue full at submit — no chunk ran. Propagate so the route's
+    // run_with_error_handling turns it into 503 SERVER_BUSY, matching every
+    // other inference route instead of a 200 with a fully-errored array.
+    throw;
+  } catch (const std::exception &ex) {
+    // Submission-level failure before any chunk ran — tag every still-empty
+    // slot so the caller knows their request didn't silently succeed (stable
+    // code, detail to the log, no raw internal text to the client).
+    TOCR_LOG_ERROR_RL("batch submission error", "error", std::string_view(ex.what()));
+    for (size_t k : valid_indices)
+      if (errors[k].empty()) errors[k] = "inference_failed";
   }
 }
 
@@ -308,9 +365,11 @@ std::string batch_emit_json(std::vector<BatchItem> &all_items,
   for (size_t i = 0; i < n; ++i) {
     if (i > 0) json_str += ',';
     if (want_layout) {
-      json_str += emit_results_json(all_items[i].results, all_items[i].layout, all_items[i].reading_order, want_blocks);
+      // Full per-page emitter: text + layout (+ tables/formulas when the
+      // CUA router fired, byte-identical to the legacy shape otherwise).
+      json_str += emit_pipeline_result_json(all_items[i].out, want_blocks);
     } else {
-      json_str += results_to_json(all_items[i].results);
+      json_str += results_to_json(all_items[i].out.results);
     }
   }
   json_str += "],\"errors\":[";
@@ -336,10 +395,12 @@ void register_ocr_batch_route_gpu(server::WorkPool &pool,
                                    pipeline::PipelineDispatcher &dispatcher,
                                    const server::ImageDecoder &decode,
                                    bool nvjpeg_available,
-                                   bool layout_available) {
+                                   bool layout_available,
+                                   int max_batch_images) {
   drogon::app().registerHandler(
       "/ocr/batch",
-      [&pool, &dispatcher, &decode, nvjpeg_available, layout_available](
+      [&pool, &dispatcher, &decode, nvjpeg_available, layout_available,
+       max_batch_images](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
@@ -367,10 +428,24 @@ void register_ocr_batch_route_gpu(server::WorkPool &pool,
       callback(server::error_response(drogon::k400BadRequest, "EMPTY_BATCH", "Empty images array"));
       return;
     }
+    // Cap before the O(n) per-slot allocations + n*1KB JSON reserve below —
+    // an unbounded images[] (tens of millions of tiny strings in a <100MB
+    // body) is otherwise a memory-amplification OOM lever.
+    if (n > static_cast<size_t>(max_batch_images)) {
+      callback(server::error_response(drogon::k400BadRequest, "BATCH_TOO_LARGE",
+          std::format("images array has {} entries, max is {}", n, max_batch_images)));
+      return;
+    }
 
+    // asString() throws Json::LogicError on a non-string element ({}/[]);
+    // guard the type so a malformed slot becomes an empty string the per-slot
+    // decode path tags, instead of an unhandled exception / 500.
     auto b64_strings = std::make_shared<std::vector<std::string>>(n);
-    for (size_t i = 0; i < n; ++i)
-      (*b64_strings)[i] = images_json[static_cast<int>(i)].asString();
+    for (size_t i = 0; i < n; ++i) {
+      const auto &el = images_json[static_cast<int>(i)];
+      if (el.isString())
+        (*b64_strings)[i] = el.asString();
+    }
 
     server::submit_work(pool, std::move(callback),
         [b64_strings, n, &dispatcher, &decode, nvjpeg_available, opts](server::DrogonCallback &cb) {
@@ -478,6 +553,11 @@ void register_ocr_pixels_route_gpu(server::WorkPool &pool,
       server::run_with_error_handling(cb, "/ocr/pixels", [&] {
         cv::Mat img(height, width, channels == 3 ? CV_8UC3 : CV_8UC1,
                     const_cast<char *>(req->body().data()));
+        // The pipeline is BGR-only: a 1-channel Mat reaches the GPU upload
+        // with step == cols, trips the degenerate-input guard, and comes
+        // back empty. Expand grayscale to BGR up front.
+        if (channels == 1)
+          cv::cvtColor(img, img, cv::COLOR_GRAY2BGR);
 
         auto out = dispatcher.submit([&img, opts](auto &e) {
           return e.pipeline->run_with_layout(img, e.stream,
@@ -496,9 +576,11 @@ void register_image_routes(server::WorkPool &pool,
                            pipeline::PipelineDispatcher &dispatcher,
                            const server::ImageDecoder &decode,
                            bool nvjpeg_available,
-                           bool layout_available) {
+                           bool layout_available,
+                           int max_batch_images) {
   register_ocr_raw_route_gpu(pool, dispatcher, decode, nvjpeg_available, layout_available);
-  register_ocr_batch_route_gpu(pool, dispatcher, decode, nvjpeg_available, layout_available);
+  register_ocr_batch_route_gpu(pool, dispatcher, decode, nvjpeg_available, layout_available,
+                               max_batch_images);
   register_ocr_pixels_route_gpu(pool, dispatcher, layout_available);
 }
 

@@ -45,6 +45,13 @@ private:
   std::vector<float> input_data_buf_;
   std::vector<int64_t> input_shape_buf_{1, 3, 0, 0};
 
+  // Preprocess scratch (reused across calls). resized_/float_img_ are reused by
+  // the default normalize path; bgr_ planes by the fused path; bitmap_ by post.
+  cv::Mat resized_;
+  cv::Mat float_img_;
+  cv::Mat bgr_[3];
+  cv::Mat bitmap_;
+
 };
 
 } // namespace turbo_ocr::detection

@@ -41,17 +41,6 @@ void PaddleCls::allocate_buffers() {
   buffers_allocated_ = true;
 }
 
-bool PaddleCls::warmup_pdf_static(int B, cudaStream_t stream) {
-  if (!buffers_allocated_) allocate_buffers();
-  const size_t in_floats = static_cast<size_t>(B) * 3 * kClsImageH * kClsImageW;
-  CUDA_CHECK(cudaMemsetAsync(d_batch_input_.get(), 0,
-                              in_floats * sizeof(float), stream));
-  nvinfer1::Dims4 dims{B, 3, kClsImageH, kClsImageW};
-  bool ok = engine_->infer_dynamic(dims, stream);
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-  return ok;
-}
-
 void PaddleCls::run(const GpuImage &img, std::vector<Box> &boxes,
                     cudaStream_t stream) {
   if (boxes.empty()) [[unlikely]]

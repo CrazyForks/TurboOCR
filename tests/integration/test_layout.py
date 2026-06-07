@@ -22,8 +22,15 @@ def _server_has_layout(server_url: str) -> bool:
         )
     except Exception:
         return False
-    if r.status_code == 400 and "ENABLE_LAYOUT" in r.text:
-        return False
+    # A layout-less server rejects ?layout=1 with the stable LAYOUT_DISABLED
+    # code (checked on the code, not a message substring, so it survives
+    # message wording changes).
+    if r.status_code == 400:
+        try:
+            if r.json().get("error", {}).get("code") == "LAYOUT_DISABLED":
+                return False
+        except Exception:
+            pass
     return True
 
 
@@ -111,7 +118,7 @@ class TestLayoutUnavailable:
             pytest.skip()
         r = _post_pdf(server_url, pdf, layout="1")
         assert r.status_code == 400
-        assert "ENABLE_LAYOUT" in r.text
+        assert r.json()["error"]["code"] == "LAYOUT_DISABLED", r.text
 
     def test_ocr_raw_layout_1_returns_400(self, server_url, fixtures_dir):
         img = fixtures_dir / "images" / "png" / "business_letter.png"
@@ -119,7 +126,7 @@ class TestLayoutUnavailable:
             pytest.skip()
         r = _post_image_raw(server_url, img, layout="1")
         assert r.status_code == 400
-        assert "ENABLE_LAYOUT" in r.text
+        assert r.json()["error"]["code"] == "LAYOUT_DISABLED", r.text
 
     def test_ocr_json_layout_1_returns_400(self, server_url, fixtures_dir):
         img = fixtures_dir / "images" / "png" / "business_letter.png"
@@ -127,7 +134,7 @@ class TestLayoutUnavailable:
             pytest.skip()
         r = _post_image_json(server_url, img, layout="1")
         assert r.status_code == 400
-        assert "ENABLE_LAYOUT" in r.text
+        assert r.json()["error"]["code"] == "LAYOUT_DISABLED", r.text
 
     def test_ocr_raw_default_works(self, server_url, fixtures_dir):
         img = fixtures_dir / "images" / "png" / "business_letter.png"
@@ -136,6 +143,30 @@ class TestLayoutUnavailable:
         r = _post_image_raw(server_url, img)
         assert r.status_code == 200
         assert not _has_layout(r.json())
+
+    @pytest.mark.parametrize("param", ["layout=1", "reading_order=1", "as_blocks=1"])
+    def test_layout_unavailable_code_is_unified(self, server_url, fixtures_dir, param):
+        # Every "layout feature unavailable" rejection returns one stable
+        # code: LAYOUT_DISABLED (layout=1 used to leak INVALID_PARAMETER).
+        img = fixtures_dir / "images" / "png" / "business_letter.png"
+        if not img.exists():
+            pytest.skip()
+        r = requests.post(
+            f"{server_url}/ocr/raw?{param}", data=img.read_bytes(),
+            headers={"Content-Type": "image/png"}, timeout=30)
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] == "LAYOUT_DISABLED", r.text
+
+    def test_malformed_layout_value_is_invalid_parameter(self, server_url, fixtures_dir):
+        # A malformed bool stays INVALID_PARAMETER, not LAYOUT_DISABLED.
+        img = fixtures_dir / "images" / "png" / "business_letter.png"
+        if not img.exists():
+            pytest.skip()
+        r = requests.post(
+            f"{server_url}/ocr/raw?layout=garbage", data=img.read_bytes(),
+            headers={"Content-Type": "image/png"}, timeout=30)
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] == "INVALID_PARAMETER", r.text
 
 
 class TestLayoutRequested:

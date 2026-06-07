@@ -11,6 +11,30 @@ endif()
 
 project(turbo_ocr VERSION 1.0.0 LANGUAGES CXX)
 
+# /opt/cuda ships its own protobuf cmake config. When gRPC's
+# find_dependency(Protobuf) resolves to it instead of the system install, its
+# protobuf-targets.cmake tries to redefine targets the system FindProtobuf
+# module already created ("Some (but not all) targets in this export set were
+# already defined"). Exclude just that directory so protobuf + gRPC both come
+# from one consistent (system) source; CUDAToolkit discovery is unaffected.
+list(APPEND CMAKE_IGNORE_PATH "/opt/cuda/lib/cmake/protobuf")
+
+# Protobuf discovery that works on BOTH distros we build on:
+#   - Arch dev host: ships protobuf-config.cmake (v35 + libupb). CONFIG mode
+#     is required there so the target set matches gRPC's config-mode protobuf
+#     ("some but not all targets already defined" otherwise).
+#   - Ubuntu Docker images (Dockerfile.cpu/gpu): apt libprotobuf-dev ships NO
+#     cmake config, so CONFIG mode fails hard — but the legacy FindProtobuf
+#     MODULE works (and gRPC there has no config either, so it uses the
+#     pkg-config fallback below and never re-finds protobuf in config mode,
+#     meaning no target clash). Prefer CONFIG, fall back to MODULE.
+macro(turbo_find_protobuf)
+  find_package(Protobuf CONFIG QUIET)
+  if(NOT Protobuf_FOUND)
+    find_package(Protobuf MODULE REQUIRED)
+  endif()
+endmacro()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -21,6 +45,40 @@ if(NATIVE_ARCH)
   set(TURBO_OCR_CXX_FLAGS -O3 -march=native -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 else()
   set(TURBO_OCR_CXX_FLAGS -O3 -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+endif()
+
+# Profile-Guided Optimization. Two-pass build on the SAME build dir:
+#   1. cmake -DPGO_MODE=generate && build  →  run a representative workload
+#   2. cmake -DPGO_MODE=use      && build  →  recompiles using the *.gcda profile
+# Scoped to host C++ only ($<COMPILE_LANGUAGE:CXX>) — CUDA .cu objects are
+# compiled by nvcc and left untouched. The .gcda files live next to the object
+# files, so generate and use must share one build directory.
+set(PGO_MODE "off" CACHE STRING "Profile-guided optimization: off|generate|use")
+set_property(CACHE PGO_MODE PROPERTY STRINGS off generate use)
+if(NOT PGO_MODE STREQUAL "off")
+    # The executable is linked by the C++ compiler, but CMake prepends CUDA's
+    # implicit link dirs — and since CUDA 13.2's nvcc host compiler is GCC 15,
+    # that dir ships a 15.x libgcov that -lgcov would resolve before the C++
+    # compiler's own. Put the actual C++ compiler's gcc lib dir first so the
+    # libgcov runtime matches the instrumentation the compiler emits.
+    execute_process(
+        COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libgcov.a
+        OUTPUT_VARIABLE _gcov_a OUTPUT_STRIP_TRAILING_WHITESPACE)
+    get_filename_component(_gcc_libdir "${_gcov_a}" DIRECTORY)
+    add_link_options("-L${_gcc_libdir}")
+endif()
+if(PGO_MODE STREQUAL "generate")
+    message(STATUS "PGO: instrumented build (-fprofile-generate); gcov dir ${_gcc_libdir}")
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fprofile-generate>)
+    add_link_options(-fprofile-generate)
+elseif(PGO_MODE STREQUAL "use")
+    message(STATUS "PGO: profile-optimized build (-fprofile-use); gcov dir ${_gcc_libdir}")
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:-fprofile-use>
+        $<$<COMPILE_LANGUAGE:CXX>:-fprofile-correction>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wno-missing-profile>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wno-coverage-mismatch>)
+    add_link_options(-fprofile-use)
 endif()
 
 option(USE_CPU_ONLY "Build CPU-only mode with ONNX Runtime" OFF)
@@ -92,6 +150,9 @@ add_library(turbo_ocr_common STATIC
     src/layout/match_unsorted.cpp
     src/layout/child_blocks.cpp
     src/layout/text_line_cluster.cpp
+    src/docassembly/repetition_guard.cpp
+    src/docassembly/title_level.cpp
+    src/docassembly/table_merge.cpp
     third_party/clipper/clipper.cpp
     third_party/simdutf/simdutf.cpp
 )
@@ -118,6 +179,7 @@ add_executable(turbo_ocr_tests
     tests/cpp/test_xy_cut.cpp
     tests/cpp/test_logger_ratelimit.cpp
     tests/cpp/test_server_config.cpp
+    tests/cpp/test_docassembly.cpp
     src/render/pdf_renderer.cpp
     third_party/catch2/catch_amalgamated.cpp
 )
@@ -156,8 +218,8 @@ if(USE_CPU_ONLY)
     endif()
     message(STATUS "ONNX Runtime: ${ONNXRUNTIME_LIB}")
 
-    # Protobuf + gRPC (same discovery logic as GPU build)
-    find_package(Protobuf REQUIRED)
+    # Protobuf + gRPC (same discovery logic as GPU build).
+    turbo_find_protobuf()
     find_package(gRPC CONFIG QUIET)
     if(NOT gRPC_FOUND)
         find_package(PkgConfig REQUIRED)
@@ -201,13 +263,17 @@ if(USE_CPU_ONLY)
         src/layout/cpu_paddle_layout.cpp
         src/render/pdf_renderer.cpp
         src/pdf/pdf_text_layer.cpp
+        src/pdf/page_image_encoder.cpp
     )
+    # libjpeg-turbo: fast JPEG encode for inline page-image export.
+    find_library(TURBOJPEG_LIB turbojpeg REQUIRED)
     target_include_directories(turbo_ocr_cpu PUBLIC
         ${CMAKE_SOURCE_DIR}/third_party/pdfium/include
         ${ONNXRUNTIME_INCLUDE_DIR}
     )
     target_link_libraries(turbo_ocr_cpu PUBLIC turbo_ocr_common ${ONNXRUNTIME_LIB}
-        ${CMAKE_SOURCE_DIR}/third_party/pdfium/lib/libpdfium.so pthread)
+        ${CMAKE_SOURCE_DIR}/third_party/pdfium/lib/libpdfium.so pthread
+        ${TURBOJPEG_LIB})
     target_compile_options(turbo_ocr_cpu PRIVATE ${TURBO_OCR_CXX_FLAGS})
     target_compile_definitions(turbo_ocr_cpu PUBLIC USE_CPU_ONLY)
     add_library(turbo_ocr::cpu ALIAS turbo_ocr_cpu)
@@ -238,8 +304,8 @@ else()
 
     set(TENSORRT_DIR "/usr/local/tensorrt" CACHE PATH "Path to TensorRT")
 
-    # Protobuf + gRPC
-    find_package(Protobuf REQUIRED)
+    # Protobuf + gRPC (see turbo_find_protobuf for the CONFIG/MODULE rationale).
+    turbo_find_protobuf()
     find_package(gRPC CONFIG QUIET)
     if(NOT gRPC_FOUND)
         find_package(PkgConfig REQUIRED)
@@ -308,6 +374,7 @@ else()
         src/kernels/jfa.cu
         src/render/pdf_renderer.cpp
         src/pdf/pdf_text_layer.cpp
+        src/pdf/page_image_encoder.cpp
         # CUA router + table + formula stages (referenced by ocr_pipeline's
         # dispatch_router_). Pulled in here so paddle_highspeed_cpp links;
         # the operator's prior in-progress integration left these source
@@ -340,6 +407,10 @@ else()
     # in bin/ by scripts/install_fastpdf2png.sh (so native dev + Docker
     # builds both resolve it at runtime). Docker additionally copies it to
     # /usr/lib via ldconfig in Dockerfile.gpu:49.
+    # libjpeg-turbo: CPU JPEG encode fallback for inline page-image export
+    # (nvJPEG handles the GPU default path; already linked below).
+    find_library(TURBOJPEG_LIB turbojpeg REQUIRED)
+    message(STATUS "libjpeg-turbo: ${TURBOJPEG_LIB}")
     target_link_libraries(turbo_ocr_gpu PUBLIC
         turbo_ocr_common
         nvinfer
@@ -348,6 +419,7 @@ else()
         nvjpeg
         cudart
         ${CMAKE_SOURCE_DIR}/third_party/pdfium/lib/libpdfium.so
+        ${TURBOJPEG_LIB}
     )
     target_compile_options(turbo_ocr_gpu PRIVATE ${TURBO_OCR_CXX_FLAGS})
     add_library(turbo_ocr::gpu ALIAS turbo_ocr_gpu)

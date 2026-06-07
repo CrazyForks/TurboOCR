@@ -11,6 +11,10 @@
 
 namespace turbo_ocr::layout {
 
+// Defined below collect(); shared by collect() and collect_batch().
+static std::vector<LayoutBox>
+postfilter_layout_boxes(std::vector<LayoutBox> out, int orig_h, int orig_w);
+
 PaddleLayout::~PaddleLayout() noexcept {
   if (d2h_event_)
     cudaEventDestroy(d2h_event_);
@@ -215,10 +219,19 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
     out.push_back(lb);
   }
 
+  return postfilter_layout_boxes(std::move(out), orig_h, orig_w);
+}
+
+// Shared post-decode cleanup for both the single-image and batched paths:
+// score sort, layout NMS, containment dedup, oversized-"image" filter.
+// Both collect() and collect_batch() feed the router (table/formula crops
+// are dispatched per surviving box), so skipping any of this on one path
+// would mean duplicate downstream inference and divergent client output.
+static std::vector<LayoutBox>
+postfilter_layout_boxes(std::vector<LayoutBox> out, int orig_h, int orig_w) {
   // Layout NMS (matches PaddleX layout_nms=True):
   //   same-class IoU > 0.6  → suppress the lower-scoring box
   //   cross-class IoU > 0.98 → suppress the lower-scoring box
-  // Boxes are already sorted by descending score (model output order).
   std::sort(out.begin(), out.end(),
             [](const LayoutBox &a, const LayoutBox &b) {
               return a.score > b.score;
@@ -367,12 +380,6 @@ bool PaddleLayout::enqueue_batch(const std::vector<GpuImage> &gpu_imgs,
   const size_t img_stride =
       static_cast<size_t>(3) * kInputSize * kInputSize;
   for (int i = 0; i < B; ++i) {
-    GpuImage out_slot{
-        d_image_.get() + i * img_stride,
-        static_cast<size_t>(kInputSize) * sizeof(float),
-        kInputSize, kInputSize
-    };
-    (void)out_slot;  // kernel writes directly to d_image_+offset below
     kernels::cuda_fused_resize_normalize_layout(
         gpu_imgs[i],
         d_image_.get() + i * img_stride,
@@ -464,15 +471,10 @@ PaddleLayout::collect_batch(float score_threshold) {
       lb.box[3] = {x0, y1};
       out.push_back(lb);
     }
-    // NMS skipped on the batched path. The throughput hook in
-    // OcrPipeline::run_batch discards the layout output (only used to
-    // gate dispatch_router_), so the NMS cleanup is unobservable. If a
-    // future caller surfaces these boxes to clients, re-add the same
-    // NMS + containment pass from collect() above.
-    std::sort(out.begin(), out.end(),
-              [](const LayoutBox &a, const LayoutBox &b) {
-                return a.score > b.score;
-              });
+    // Same NMS + containment + page-image cleanup as collect(): the boxes
+    // feed dispatch_router_ (and are surfaced to batch clients), so the
+    // batched path must not emit duplicates the single path would drop.
+    out = postfilter_layout_boxes(std::move(out), orig_h, orig_w);
     offset += n;
   }
   pending_batch_ = 0;

@@ -1,5 +1,8 @@
 #include "turbo_ocr/routes/pdf_routes.h"
 
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 #include <format>
 #include <future>
 
@@ -17,7 +20,10 @@
 #include <json/json.h>
 
 #include "turbo_ocr/common/serialization.h"
+#include "turbo_ocr/layout/reading_order.h"
+#include "turbo_ocr/pdf/page_image_encoder.h"
 #include "turbo_ocr/pdf/pdf_text_layer.h"
+#include "simdutf.h"
 #include "turbo_ocr/server/server_types.h"
 
 using turbo_ocr::OCRResultItem;
@@ -27,13 +33,19 @@ namespace turbo_ocr::routes {
 
 namespace {
 
-int max_pdf_pages() {
-  static int val = [] {
-    if (auto *env = std::getenv("MAX_PDF_PAGES"))
-      return std::max(1, std::atoi(env));
-    return 2000;
-  }();
-  return val;
+// Parse a query-param int safely (std::atoi is UB on overflow). Returns the
+// `fallback` for empty/non-numeric/out-of-int-range input, so the caller's
+// own range check then rejects it deterministically instead of acting on a
+// wrapped/garbage value.
+[[nodiscard]] int query_int(const std::string &s, int fallback) {
+  if (s.empty()) return fallback;
+  errno = 0;
+  char *end = nullptr;
+  long v = std::strtol(s.c_str(), &end, 10);
+  if (end == s.c_str() || *end != '\0' || errno == ERANGE ||
+      v < INT_MIN || v > INT_MAX)
+    return fallback;
+  return static_cast<int>(v);
 }
 
 // ---------------------------------------------------------------------------
@@ -58,7 +70,78 @@ struct PdfPageResultBase {
   int width = 0, height = 0, effective_dpi = 0;
   pdf::PdfMode resolved_mode = pdf::PdfMode::Ocr;
   std::string_view text_layer_quality = "absent";
+  // Optional: encoded page image bytes (set when ?images=inline).
+  std::vector<uint8_t> encoded_image;
 };
+
+// Image mode for /ocr/pdf?images=... — only "inline" is supported: the page
+// image is embedded as base64 in the JSON response. No server-side cache, no
+// GET retrieval endpoint.
+enum class ImageMode { None, Inline };
+
+ImageMode parse_image_mode(const std::string &s) noexcept {
+  if (s == "1" || s == "true" || s == "on" || s == "yes" || s == "inline")
+    return ImageMode::Inline;
+  return ImageMode::None;
+}
+
+// Parse image-capture query params (?images=inline&format=png|jpeg|webp&
+// quality=1-100&lossless=0/1&png_compression=0-9&max_side=N). Everything is
+// per-request; the only env knob is which JPEG encoder backend runs
+// (TURBO_PDF_IMAGE_ENCODER gpu|cpu — same bytes either way). Returns an
+// error message on invalid values, empty on success.
+std::string parse_image_query_params(const drogon::HttpRequestPtr &req,
+                                      ImageMode &image_mode,
+                                      pdf::EncodeOptions &encode_opts) {
+  image_mode = ImageMode::None;
+  encode_opts = {};
+
+  auto images_str = req->getParameter("images");
+  if (!images_str.empty())
+    image_mode = parse_image_mode(std::string(images_str));
+
+  auto fmt_str = req->getParameter("format");
+  if (!fmt_str.empty())
+    encode_opts.format = pdf::parse_page_image_format(fmt_str.c_str());
+
+  // lossless: defaults to true (set in EncodeOptions).
+  auto lossless_str = req->getParameter("lossless");
+  if (!lossless_str.empty()) {
+    if (lossless_str == "0" || lossless_str == "false" || lossless_str == "no" || lossless_str == "off")
+      encode_opts.lossless = false;
+    else if (lossless_str == "1" || lossless_str == "true" || lossless_str == "yes" || lossless_str == "on")
+      encode_opts.lossless = true;
+    else
+      return "lossless must be 0/1/true/false";
+  }
+
+  auto png_comp_str = req->getParameter("png_compression");
+  if (!png_comp_str.empty()) {
+    int c = query_int(std::string(png_comp_str), -1);
+    if (c < 0 || c > 9) return "png_compression must be 0-9";
+    encode_opts.png_compression = c;
+  }
+
+  auto quality_str = req->getParameter("quality");
+  if (!quality_str.empty()) {
+    int q = query_int(std::string(quality_str), -1);
+    if (q < 1 || q > 100)
+      return "quality must be 1-100";
+    encode_opts.quality = q;
+    // An explicit quality means the client wants lossy. Honor it.
+    if (lossless_str.empty()) encode_opts.lossless = false;
+  }
+
+  auto max_side_str = req->getParameter("max_side");
+  if (!max_side_str.empty()) {
+    int ms = query_int(std::string(max_side_str), -1);
+    if (ms < 0)
+      return "max_side must be >= 0";
+    encode_opts.max_side = ms;
+  }
+
+  return {};
+}
 
 template <typename PageResult>
 void fill_from_text_layer_pt(PageResult &pg, const pdf::PdfPageText &text) {
@@ -147,53 +230,14 @@ bool extract_pdf_bytes(const drogon::HttpRequestPtr &req,
   return true;
 }
 
-// Common request-time params we parse off the wire: layout flag, dpi, mode.
-// Both GPU and CPU paths share the same query-string contract.
-struct PdfRequestParams {
-  bool layout_enabled = false;
-  int dpi = 100;
-  pdf::PdfMode mode;
-};
-
-// Parse and validate /ocr/pdf query params. Calls callback with a 400 on
-// any validation failure and returns false. Caller must `return` on false.
-bool parse_pdf_request_params(
-    const drogon::HttpRequestPtr &req,
-    bool layout_available,
-    pdf::PdfMode default_pdf_mode,
-    PdfRequestParams &out,
-    const std::function<void(const drogon::HttpResponsePtr &)> &callback) {
-  if (auto err = server::parse_layout_query(req, layout_available,
-                                             &out.layout_enabled);
-      !err.empty()) {
-    callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER", err));
-    return false;
-  }
-
-  out.dpi = 100;
-  auto dpi_str = req->getParameter("dpi");
-  if (!dpi_str.empty()) out.dpi = std::atoi(dpi_str.c_str());
-  if (out.dpi < 50 || out.dpi > 600) {
-    callback(server::error_response(drogon::k400BadRequest, "INVALID_DPI",
-        "Image DPI must be between 50 and 600"));
-    return false;
-  }
-
-  out.mode = default_pdf_mode;
-  auto mode_str = req->getParameter("mode");
-  if (!mode_str.empty())
-    out.mode = pdf::parse_pdf_mode(mode_str.c_str(), default_pdf_mode);
-  return true;
-}
-
-// Inline page-count guard: emits PDF_TOO_LARGE if the document exceeds
-// MAX_PDF_PAGES. Returns true on guard-trip (caller should abort).
+// Inline page-count guard: emits PDF_TOO_LARGE if the document exceeds the
+// configured limit (cfg.max_pdf_pages — honors --max-pdf-pages AND
+// MAX_PDF_PAGES, matching gRPC). Returns true on guard-trip (caller aborts).
 bool reject_if_too_many_pages(const uint8_t *pdf_data, size_t pdf_len_local,
-                               server::DrogonCallback &cb) {
+                               int limit, server::DrogonCallback &cb) {
   pdf::PdfDocument check_doc(pdf_data, pdf_len_local);
   if (!check_doc.ok()) return false;
   int np = check_doc.page_count();
-  int limit = max_pdf_pages();
   if (np > limit) {
     cb(server::error_response(drogon::k400BadRequest, "PDF_TOO_LARGE",
         std::format("PDF has {} pages, maximum is {} (set MAX_PDF_PAGES to increase)",
@@ -235,7 +279,8 @@ void prepopulate_pages(pdf::PdfMode mode,
                        const std::vector<pdf::PdfPageText> &page_text_cache,
                        std::vector<PageResult> &page_results,
                        std::vector<uint8_t> &need_render,
-                       bool *any_need_render) {
+                       bool *any_need_render,
+                       bool want_page_image = false) {
   int np = static_cast<int>(page_text_cache.size());
   page_results.resize(static_cast<size_t>(np));
   need_render.assign(static_cast<size_t>(np), 0);
@@ -282,6 +327,16 @@ void prepopulate_pages(pdf::PdfMode mode,
         break;
       default: break;
     }
+
+    // A page image was requested. Text-layer pages (geometric / auto with a
+    // trusted layer) skip rasterization for OCR, so force a render here —
+    // otherwise the encoder has no pixels and the page comes back with no
+    // image. The text still comes from the resolved mode; only the rendered
+    // image is added.
+    if (want_page_image && !need_render[static_cast<size_t>(p)]) {
+      need_render[static_cast<size_t>(p)] = 1;
+      if (any_need_render) *any_need_render = true;
+    }
   }
 }
 
@@ -291,13 +346,19 @@ void prepopulate_pages(pdf::PdfMode mode,
 template <typename PageResult>
 std::string emit_pdf_response(std::vector<PageResult> &page_results,
                                int request_dpi,
-                               bool want_blocks = false) {
+                               bool want_blocks = false,
+                               ImageMode image_mode = ImageMode::None,
+                               const pdf::EncodeOptions &encode_opts = {}) {
   size_t n_pages = page_results.size();
   size_t total_results = 0;
-  for (size_t i = 0; i < n_pages; ++i)
+  size_t total_image_bytes = 0;
+  for (size_t i = 0; i < n_pages; ++i) {
     total_results += page_results[i].results.size() + page_results[i].layout.size();
+    total_image_bytes += page_results[i].encoded_image.size();
+  }
   std::string json_str;
-  json_str.reserve(total_results * 256 + n_pages * 256 + 64);
+  json_str.reserve(total_results * 256 + n_pages * 256 + 64 +
+                   (total_image_bytes * 4) / 3 + n_pages * 48);
   json_str += "{\"pages\":[";
   for (size_t i = 0; i < n_pages; ++i) {
     if (i > 0) json_str += ',';
@@ -323,7 +384,24 @@ std::string emit_pdf_response(std::vector<PageResult> &page_results,
     json_str += pdf::mode_name(pg.resolved_mode);
     json_str += "\",\"text_layer_quality\":\"";
     json_str += pg.text_layer_quality;
-    json_str += "\"}";
+    json_str += '"';
+
+    // Inline page image: base64 of the encoded bytes (simdutf, SIMD path).
+    if (image_mode == ImageMode::Inline && !pg.encoded_image.empty()) {
+      const auto &raw = pg.encoded_image;
+      size_t b64_len = ((raw.size() + 2) / 3) * 4;
+      std::string b64(b64_len, '\0');
+      simdutf::binary_to_base64(
+          reinterpret_cast<const char *>(raw.data()), raw.size(),
+          b64.data());
+      json_str += ",\"image_b64\":\"";
+      json_str += b64;
+      json_str += "\",\"image_content_type\":\"";
+      json_str += pdf::page_image_content_type(encode_opts.format);
+      json_str += '"';
+    }
+
+    json_str += '}';
   }
   json_str += "]}";
   return json_str;
@@ -335,10 +413,170 @@ std::string emit_pdf_response(std::vector<PageResult> &page_results,
 // thread pool and writes back into this shared vector under results_mutex.
 struct GpuPdfPageResult : public PdfPageResultBase {};
 
-// GPU streamed render callback: decodes PPM, runs layout-only or full
-// pipeline + AutoVerified verification depending on resolved mode, and
-// writes results into `page_results[page_idx]` under `results_mutex`. The
-// callback is invoked from inside pdf_renderer.render_streamed().
+// Shared state every streamed-render page task writes into. Constructed in
+// the route handler, whose scope outlives every page future (the handler
+// joins them before returning) — so tasks may hold a reference to it.
+// Task lambdas must capture this sink plus their per-task values
+// EXPLICITLY: an implicit [&] would bind value parameters of intermediate
+// helper frames that die before the tasks run.
+struct PdfPageSink {
+  std::mutex &results_mutex;
+  std::vector<GpuPdfPageResult> &page_results;
+  pdf::PdfDocument *pdf_doc;  // null when no text layer was opened
+  const std::vector<pdf::PdfPageText> &page_text_cache;
+  int dpi;
+  // Page-image export (?images=inline): encode each rendered page on the
+  // worker right after decode and stash the bytes in the slot.
+  ImageMode image_mode = ImageMode::None;
+  pdf::EncodeOptions encode_opts{};
+  // Rendered pages whose PPM could not be read back (tmpfs pressure,
+  // truncated write). We rendered these ourselves, so a failure here is a
+  // server-side error: any non-zero count turns the response into a 500
+  // instead of emitting silently blank pages in a 200.
+  std::atomic<int> decode_failures{0};
+};
+
+// Encode the rendered page when ?images=inline. Runs on the worker thread,
+// piggy-backing on decode: JPEG goes through nvJPEG on the GPU by default
+// (TURBO_PDF_IMAGE_ENCODER=cpu opts out), PNG/WebP through the CPU encoders.
+[[nodiscard]] std::vector<uint8_t>
+maybe_encode_page(const PdfPageSink &sink, const cv::Mat &img) {
+  if (sink.image_mode != ImageMode::Inline) return {};
+  return pdf::encode_page_image(img, sink.encode_opts);
+}
+
+// Effective mode of a rendered page. Final by render time: prepopulate_pages
+// ran before the render started, and mode==Ocr never resolves per page.
+[[nodiscard]] pdf::PdfMode page_mode_of(PdfPageSink &sink, int page_idx) {
+  std::lock_guard<std::mutex> lock(sink.results_mutex);
+  return page_idx < static_cast<int>(sink.page_results.size())
+      ? sink.page_results[page_idx].resolved_mode
+      : pdf::PdfMode::Ocr;
+}
+
+// Store one OCR'd page: tag sources, apply the auto_verified text-layer
+// replacement, write the slot under the sink lock.
+void store_ocr_page(PdfPageSink &sink, int page_idx,
+                    pipeline::OcrPipelineResult out, int width, int height,
+                    std::vector<uint8_t> encoded_image = {}) {
+  for (auto &it : out.results) it.source = "ocr";
+
+  const pdf::PdfMode page_mode = page_mode_of(sink, page_idx);
+  if (page_mode == pdf::PdfMode::AutoVerified &&
+      page_idx < static_cast<int>(sink.page_text_cache.size()) && sink.pdf_doc)
+    pdf::verify_results_with_text_layer(out.results, *sink.pdf_doc,
+                                        page_idx, sink.dpi);
+
+  std::lock_guard<std::mutex> lock(sink.results_mutex);
+  auto &slot = sink.page_results[page_idx];
+  slot.results       = std::move(out.results);
+  slot.layout        = std::move(out.layout);
+  slot.reading_order = std::move(out.reading_order);
+  slot.width         = width;
+  slot.height        = height;
+  slot.effective_dpi = sink.dpi;
+  slot.encoded_image = std::move(encoded_image);
+  if (page_mode == pdf::PdfMode::Ocr)
+    slot.resolved_mode = pdf::PdfMode::Ocr;
+}
+
+// Geometric page: text already came from the PDF layer in pt-space; store
+// the layout detections and rescale the stored text boxes to pixel space
+// matching the rendered image. When reading order was requested, compute it
+// over the (now pixel-space) text + layout so geometric pages carry the same
+// reading_order/blocks keys as OCR pages in the same response.
+void store_geometric_page(PdfPageSink &sink, int page_idx,
+                          std::vector<layout::LayoutBox> layout,
+                          int width, int height, bool want_reading_order,
+                          std::vector<uint8_t> encoded_image = {}) {
+  std::lock_guard<std::mutex> lock(sink.results_mutex);
+  auto &slot = sink.page_results[page_idx];
+  const float pt_to_px = static_cast<float>(sink.dpi) / 72.0f;
+  for (auto &item : slot.results)
+    for (int k = 0; k < 4; ++k) {
+      item.box[k][0] = static_cast<int>(std::round(item.box[k][0] * pt_to_px));
+      item.box[k][1] = static_cast<int>(std::round(item.box[k][1] * pt_to_px));
+    }
+  slot.layout        = std::move(layout);
+  slot.width         = width;
+  slot.height        = height;
+  slot.effective_dpi = sink.dpi;
+  slot.encoded_image = std::move(encoded_image);
+  if (want_reading_order && !slot.layout.empty()) {
+    turbo_ocr::assign_layout_ids(slot.results, slot.layout);
+    slot.reading_order =
+        turbo_ocr::layout::assign_reading_order_for_results(slot.results,
+                                                            slot.layout);
+  }
+}
+
+// Single-page task: decode the PPM and run layout-only (Geometric) or the
+// full pipeline (everything else). Runs on a dispatcher worker.
+void ocr_single_page(pipeline::GpuPipelineEntry &e, PdfPageSink &sink,
+                     bool layout_enabled, bool want_reading_order,
+                     int page_idx, const std::string &path) {
+  cv::Mat img = render::PdfRenderer::decode_ppm(path);
+  if (img.empty()) {
+    TOCR_LOG_ERROR("Failed to decode PPM for page",
+                   "route", "/ocr/pdf", "page", page_idx);
+    sink.decode_failures.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  auto encoded = maybe_encode_page(sink, img);
+
+  if (page_mode_of(sink, page_idx) == pdf::PdfMode::Geometric) {
+    // Geometric pages can be rendered just for their image (?images=inline);
+    // only pay the layout inference when the client actually asked for it.
+    auto layout = layout_enabled
+        ? e.pipeline->run_layout_only(img, e.stream).layout
+        : std::vector<layout::LayoutBox>{};
+    store_geometric_page(sink, page_idx, std::move(layout),
+                         img.cols, img.rows, want_reading_order,
+                         std::move(encoded));
+  } else {
+    auto out = e.pipeline->run_with_layout(img, e.stream, layout_enabled,
+                                           want_reading_order);
+    store_ocr_page(sink, page_idx, std::move(out), img.cols, img.rows,
+                   std::move(encoded));
+  }
+}
+
+// pdf_only chunk task: decode a chunk of rendered pages and run them
+// through the pipeline's batched path — one static-shape det execute +
+// cross-image batched rec + one batched layout execute per chunk, which is
+// the throughput point of the mode. Runs on a dispatcher worker.
+void ocr_page_chunk(pipeline::GpuPipelineEntry &e, PdfPageSink &sink,
+                    bool layout_enabled, bool want_reading_order,
+                    const std::vector<int> &idxs,
+                    const std::vector<std::string> &paths) {
+  std::vector<cv::Mat> imgs;
+  std::vector<int> live;  // page index per successfully decoded image
+  imgs.reserve(paths.size());
+  live.reserve(paths.size());
+  for (size_t j = 0; j < paths.size(); ++j) {
+    cv::Mat img = render::PdfRenderer::decode_ppm(paths[j]);
+    if (img.empty()) {
+      TOCR_LOG_ERROR("Failed to decode PPM for page",
+                     "route", "/ocr/pdf", "page", idxs[j]);
+      sink.decode_failures.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    imgs.push_back(std::move(img));
+    live.push_back(idxs[j]);
+  }
+  if (imgs.empty()) return;
+
+  auto outs = e.pipeline->run_batch_with_layout(imgs, e.stream,
+                                                layout_enabled,
+                                                want_reading_order);
+  for (size_t j = 0; j < outs.size(); ++j)
+    store_ocr_page(sink, live[j], std::move(outs[j]),
+                   imgs[j].cols, imgs[j].rows,
+                   maybe_encode_page(sink, imgs[j]));
+}
+
+// GPU streamed render: per rendered page, either accumulate into a pdf_only
+// batch chunk or submit a single-page task; the tasks above do the work.
 //
 // Returns the StreamHandle by value: the caller MUST keep it alive until
 // every future in `page_futures` has completed. The handle owns the
@@ -352,19 +590,53 @@ struct GpuPdfPageResult : public PdfPageResultBase {};
     pipeline::PipelineDispatcher &dispatcher,
     render::PdfRenderer &pdf_renderer,
     const uint8_t *pdf_data, size_t pdf_len_local,
-    int dpi, bool layout_enabled, bool want_reading_order,
+    bool layout_enabled, bool want_reading_order,
     pdf::PdfMode mode,
-    pdf::PdfDocument *pdf_doc,
-    const std::vector<pdf::PdfPageText> &page_text_cache,
-    std::mutex &results_mutex,
-    std::vector<GpuPdfPageResult> &page_results,
+    PdfPageSink &sink,
     std::vector<uint8_t> &need_render,
     std::vector<std::future<void>> &page_futures,
-    std::mutex &futures_mutex) {
-  return pdf_renderer.render_streamed(pdf_data, pdf_len_local, dpi,
+    std::mutex &futures_mutex,
+    int pdf_only_batch,
+    std::vector<int> &dropped_pages) {
+  // pdf_only batching: OCR pages accumulate here (render callbacks are
+  // synchronous inside render_streamed, so no lock needed) and ship to the
+  // dispatcher in chunks of pdf_only_batch — matching the static det
+  // engine's batch dim. Geometric pages never enter the accumulator.
+  std::vector<int> acc_idxs;
+  std::vector<std::string> acc_paths;
+
+  auto submit_ocr_chunk = [&](std::vector<int> idxs,
+                              std::vector<std::string> paths) {
+    std::future<void> fut;
+    try {
+      // idxs is copied (≤ 8 ints) rather than moved: submit() constructs
+      // the task — consuming a move — BEFORE it can throw PoolExhausted,
+      // and the catch below still needs the indices.
+      fut = dispatcher.submit(
+          [&sink, layout_enabled, want_reading_order,
+           idxs, paths = std::move(paths)](auto &e) {
+            ocr_page_chunk(e, sink, layout_enabled, want_reading_order,
+                           idxs, paths);
+          });
+    } catch (const turbo_ocr::PoolExhaustedError &) {
+      // Record the loss instead of emitting silently blank pages — the
+      // caller turns any drop into a 503, same contract as every other
+      // route's PoolExhaustedError handling.
+      TOCR_LOG_WARN("GPU queue full, dropping page chunk", "route", "/ocr/pdf",
+                    "first_page", idxs.front(), "pages", idxs.size());
+      dropped_pages.insert(dropped_pages.end(), idxs.begin(), idxs.end());
+      return;
+    }
+    std::lock_guard lock(futures_mutex);
+    page_futures.push_back(std::move(fut));
+  };
+
+  auto handle = pdf_renderer.render_streamed(pdf_data, pdf_len_local, sink.dpi,
       [&](int page_idx, std::string ppm_path) {
+        bool is_geometric = false;
         {
-          std::lock_guard<std::mutex> rlock(results_mutex);
+          std::lock_guard<std::mutex> rlock(sink.results_mutex);
+          auto &page_results = sink.page_results;
           if (page_idx >= static_cast<int>(page_results.size())) {
             page_results.resize(page_idx + 1);
             if (mode != pdf::PdfMode::Ocr &&
@@ -375,94 +647,46 @@ struct GpuPdfPageResult : public PdfPageResultBase {};
               page_idx < static_cast<int>(need_render.size()) &&
               !need_render[page_idx])
             return;
+          // Per-page modes are final by render time (prepopulate_pages ran
+          // before the render started; mode==Ocr never sets Geometric).
+          is_geometric = mode != pdf::PdfMode::Ocr &&
+              page_results[page_idx].resolved_mode == pdf::PdfMode::Geometric;
+        }
+
+        if (pdf_only_batch > 0 && !is_geometric) {
+          acc_idxs.push_back(page_idx);
+          acc_paths.push_back(std::move(ppm_path));
+          if (static_cast<int>(acc_idxs.size()) >= pdf_only_batch) {
+            submit_ocr_chunk(std::move(acc_idxs), std::move(acc_paths));
+            acc_idxs.clear();
+            acc_paths.clear();
+          }
+          return;
         }
 
         std::future<void> fut;
         try {
           fut = dispatcher.submit(
-              [&, page_idx, path = std::move(ppm_path)](auto &e) {
-            cv::Mat img = render::PdfRenderer::decode_ppm(path);
-            if (img.empty()) {
-              TOCR_LOG_ERROR("Failed to decode PPM for page", "route", "/ocr/pdf", "page", page_idx);
-              return;
-            }
-            int pw = img.cols, ph = img.rows;
-
-            pdf::PdfMode page_mode;
-            {
-              std::lock_guard<std::mutex> rlock(results_mutex);
-              page_mode = (page_idx < static_cast<int>(page_results.size()))
-                  ? page_results[page_idx].resolved_mode
-                  : pdf::PdfMode::Ocr;
-            }
-
-            std::vector<OCRResultItem> rec_results;
-            std::vector<layout::LayoutBox> layout_snapshot;
-
-            if (page_mode == pdf::PdfMode::Geometric) {
-              auto lo = e.pipeline->run_layout_only(img, e.stream);
-              layout_snapshot = std::move(lo.layout);
-            } else {
-              auto pipeline_out = e.pipeline->run_with_layout(
-                  img, e.stream, layout_enabled, want_reading_order);
-              rec_results = std::move(pipeline_out.results);
-              layout_snapshot = std::move(pipeline_out.layout);
-              for (auto &it : rec_results) it.source = "ocr";
-              if (want_reading_order) {
-                std::lock_guard<std::mutex> rlock(results_mutex);
-                page_results[page_idx].reading_order =
-                    std::move(pipeline_out.reading_order);
-              }
-            }
-
-            if (page_mode == pdf::PdfMode::AutoVerified &&
-                page_idx < static_cast<int>(page_text_cache.size()) && pdf_doc) {
-              for (auto &item : rec_results) {
-                const float px_to_pt = 72.0f / static_cast<float>(dpi);
-                auto [ix0, iy0, ix1, iy1] = turbo_ocr::aabb(item.box);
-                float x0 = ix0 * px_to_pt, y0 = iy0 * px_to_pt;
-                float x1 = ix1 * px_to_pt, y1 = iy1 * px_to_pt;
-                std::string native =
-                    pdf_doc->text_in_rect_pt(page_idx, x0, y0, x1, y1);
-                auto verdict = pdf::passes_sanity_check(
-                    native, x1 - x0, y1 - y0);
-                if (verdict.accept) {
-                  item.text = std::move(native);
-                  item.source = "pdf";
-                  item.confidence = 1.0f;
-                }
-              }
-            }
-
-            std::lock_guard<std::mutex> rlock(results_mutex);
-            auto &slot = page_results[page_idx];
-            if (page_mode == pdf::PdfMode::Geometric) {
-              const float pt_to_px = static_cast<float>(dpi) / 72.0f;
-              for (auto &item : slot.results) {
-                for (int k = 0; k < 4; ++k) {
-                  item.box[k][0] = static_cast<int>(
-                      std::round(item.box[k][0] * pt_to_px));
-                  item.box[k][1] = static_cast<int>(
-                      std::round(item.box[k][1] * pt_to_px));
-                }
-              }
-            } else {
-              slot.results = std::move(rec_results);
-            }
-            slot.layout        = std::move(layout_snapshot);
-            slot.width         = pw;
-            slot.height        = ph;
-            slot.effective_dpi = dpi;
-            if (page_mode == pdf::PdfMode::Ocr)
-              slot.resolved_mode = pdf::PdfMode::Ocr;
-          });
+              [&sink, layout_enabled, want_reading_order, page_idx,
+               path = std::move(ppm_path)](auto &e) {
+                ocr_single_page(e, sink, layout_enabled, want_reading_order,
+                                page_idx, path);
+              });
         } catch (const turbo_ocr::PoolExhaustedError &) {
-          TOCR_LOG_WARN("GPU queue full, skipping page", "route", "/ocr/pdf", "page", page_idx);
+          TOCR_LOG_WARN("GPU queue full, dropping page", "route", "/ocr/pdf", "page", page_idx);
+          dropped_pages.push_back(page_idx);
           return;
         }
         std::lock_guard lock(futures_mutex);
         page_futures.push_back(std::move(fut));
       });
+
+  // render_streamed is synchronous (all callbacks have fired) — flush the
+  // partial last chunk so trailing pages aren't dropped.
+  if (!acc_idxs.empty())
+    submit_ocr_chunk(std::move(acc_idxs), std::move(acc_paths));
+
+  return handle;
 }
 #endif // !USE_CPU_ONLY
 
@@ -470,26 +694,47 @@ struct GpuPdfPageResult : public PdfPageResultBase {};
 // inline. mode==Ocr means we never visited prepopulate_pages, so resolved
 // mode is pinned here. Geometric pages keep their layer-derived text and
 // just rescale point→pixel coords.
+// CPU streamed render. Returns num_pages; reports the count of pages that
+// failed to read back their rendered PPM via `decode_failures` (a server-side
+// fault → the caller surfaces 500, parity with the GPU route). The callback
+// body is wrapped in try/catch: it runs INSIDE render_streamed's poll loop on
+// the thread that owns the (still-joinable) render thread, so an exception
+// escaping here would unwind past that std::thread and std::terminate the
+// whole process. Catch everything, tag the page as failed-empty, continue.
 int run_streamed_render_cpu(
     const server::InferFunc &infer,
     render::PdfRenderer &pdf_renderer,
     const uint8_t *pdf_data, size_t pdf_len_local,
     int dpi, bool want_layout, bool want_reading_order, pdf::PdfMode mode,
     std::vector<PdfPageResultBase> &page_results,
-    const std::vector<uint8_t> &need_render) {
+    const std::vector<uint8_t> &need_render,
+    int &decode_failures,
+    ImageMode image_mode = ImageMode::None,
+    const pdf::EncodeOptions &encode_opts = {}) {
   auto stream_handle = pdf_renderer.render_streamed(pdf_data, pdf_len_local, dpi,
-      [&](int page_idx, std::string ppm_path) {
+      [&](int page_idx, std::string ppm_path) noexcept {
+       try {
         if (mode != pdf::PdfMode::Ocr &&
             page_idx < static_cast<int>(need_render.size()) &&
             !need_render[static_cast<size_t>(page_idx)])
           return;
 
         cv::Mat img = render::PdfRenderer::decode_ppm(ppm_path);
-        if (img.empty()) return;
+        if (img.empty()) {
+          TOCR_LOG_ERROR("Failed to decode PPM for page",
+                         "route", "/ocr/pdf", "page", page_idx);
+          ++decode_failures;
+          return;
+        }
 
         if (page_idx >= static_cast<int>(page_results.size()))
           page_results.resize(page_idx + 1);
         auto &pg = page_results[static_cast<size_t>(page_idx)];
+
+        // Page-image export (?images=inline): encode right after decode —
+        // JPEG via libjpeg-turbo on this build (no GPU), PNG/WebP via OpenCV.
+        if (image_mode == ImageMode::Inline)
+          pg.encoded_image = pdf::encode_page_image(img, encode_opts);
 
         turbo_ocr::server::InferOptions inf_opts;
         inf_opts.want_layout = want_layout;
@@ -521,6 +766,15 @@ int run_streamed_render_cpu(
                   std::round(item.box[k][1] * pt_to_px));
             }
           }
+          // Same reading-order parity as OCR pages (see GPU
+          // store_geometric_page): geometric pages must carry the
+          // reading_order/blocks keys when the client requested them.
+          if (want_reading_order && !pg.layout.empty()) {
+            turbo_ocr::assign_layout_ids(pg.results, pg.layout);
+            pg.reading_order =
+                turbo_ocr::layout::assign_reading_order_for_results(
+                    pg.results, pg.layout);
+          }
         } else {
           // Ocr branch: full pipeline, results from rec.
           auto inf = infer(img, inf_opts);
@@ -532,6 +786,16 @@ int run_streamed_render_cpu(
           pg.effective_dpi = dpi;
           for (auto &item : pg.results) item.source = "ocr";
         }
+       } catch (const std::exception &e) {
+        // Per-page inference failure (ORT/OpenCV throw). Log and leave the
+        // page empty — matches the GPU route's per-page f.get() catch.
+        // NEVER let this escape render_streamed (joinable render thread).
+        TOCR_LOG_ERROR("PDF page inference error", "route", "/ocr/pdf",
+                       "page", page_idx, "error", std::string_view(e.what()));
+       } catch (...) {
+        TOCR_LOG_ERROR("PDF page inference error (unknown)",
+                       "route", "/ocr/pdf", "page", page_idx);
+       }
       });
   return stream_handle.num_pages;
 }
@@ -543,11 +807,15 @@ void register_pdf_route(server::WorkPool &pool,
                         pipeline::PipelineDispatcher &dispatcher,
                         render::PdfRenderer &pdf_renderer,
                         pdf::PdfMode default_pdf_mode,
-                        bool layout_available) {
+                        bool layout_available,
+                        int pdf_only_batch,
+                        int default_dpi,
+                        int max_pdf_pages) {
 
   drogon::app().registerHandler(
       "/ocr/pdf",
-      [&pool, &dispatcher, &pdf_renderer, default_pdf_mode, layout_available](
+      [&pool, &dispatcher, &pdf_renderer, default_pdf_mode, layout_available,
+       pdf_only_batch, default_dpi, max_pdf_pages](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
@@ -570,9 +838,10 @@ void register_pdf_route(server::WorkPool &pool,
     const bool want_reading_order = opts.want_reading_order;
     const bool want_blocks = opts.want_blocks;
 
-    int dpi = 100;
     auto dpi_str = req->getParameter("dpi");
-    if (!dpi_str.empty()) dpi = std::atoi(dpi_str.c_str());
+    // Absent -> default; present-but-garbage/overflow -> -1 -> rejected below
+    // (don't silently fall back to default on a bad explicit value).
+    int dpi = dpi_str.empty() ? default_dpi : query_int(std::string(dpi_str), -1);
     if (dpi < 50 || dpi > 600) {
       callback(server::error_response(drogon::k400BadRequest, "INVALID_DPI", "DPI must be between 50 and 600"));
       return;
@@ -583,6 +852,16 @@ void register_pdf_route(server::WorkPool &pool,
     if (!mode_str.empty())
       req_mode = pdf::parse_pdf_mode(mode_str.c_str(), default_pdf_mode);
 
+    // Page-image export params (?images=inline&format=...&quality=...)
+    ImageMode image_mode;
+    pdf::EncodeOptions encode_opts;
+    if (auto err = parse_image_query_params(req, image_mode, encode_opts);
+        !err.empty()) {
+      callback(server::error_response(drogon::k400BadRequest,
+                                       "INVALID_PARAMETER", err));
+      return;
+    }
+
     // For raw body case, pdf_ptr points into req->body() — copy into pdf_buf
     if (pdf_buf->empty())
       pdf_buf->assign(pdf_ptr, pdf_len);
@@ -590,11 +869,17 @@ void register_pdf_route(server::WorkPool &pool,
     server::submit_work(pool, std::move(callback),
         [pdf_buf, req, &dispatcher, &pdf_renderer,
          layout_enabled, want_reading_order, want_blocks,
-         dpi, req_mode](server::DrogonCallback &cb) {
+         dpi, req_mode, pdf_only_batch, image_mode,
+         encode_opts, max_pdf_pages](server::DrogonCallback &cb) {
+     // Wrap the whole body: post-render work (emit_pdf_response's multi-GB
+     // reserve under images=inline, page_results.resize) can throw bad_alloc,
+     // which the WorkPool worker would otherwise swallow — leaving the client
+     // hung with no response. run_with_error_handling turns it into 500.
+     server::run_with_error_handling(cb, "/ocr/pdf", [&] {
       const auto *pdf_data = reinterpret_cast<const uint8_t *>(pdf_buf->data());
       size_t pdf_len_local = pdf_buf->size();
 
-      if (reject_if_too_many_pages(pdf_data, pdf_len_local, cb)) return;
+      if (reject_if_too_many_pages(pdf_data, pdf_len_local, max_pdf_pages, cb)) return;
 
       // Open PDF for text-layer modes
       pdf::PdfMode mode = req_mode;
@@ -614,7 +899,8 @@ void register_pdf_route(server::WorkPool &pool,
 
       if (mode != pdf::PdfMode::Ocr) {
         prepopulate_pages(mode, layout_enabled, page_text_cache,
-                          page_results, need_render, &any_need_render);
+                          page_results, need_render, &any_need_render,
+                          image_mode == ImageMode::Inline);
       }
 
       // Streamed render + OCR.
@@ -626,19 +912,29 @@ void register_pdf_route(server::WorkPool &pool,
       // unlinks the PPMs out from under them and they decode to empty
       // images. Declared at handler scope and intentionally kept alive
       // through the f.get() loop below.
+      // Everything the async page tasks reference is declared BEFORE
+      // page_futures so it outlives the futures' blocking destructors on
+      // EVERY unwind path (not just the happy join below): `sink` (holds the
+      // decode_failures atomic), `dropped_pages`, and `stream_handle` (owns
+      // the PPM tmpdir the tasks read). Reverse-destruction then joins the
+      // futures before any of these go away.
+      PdfPageSink sink{results_mutex, page_results, pdf_doc.get(),
+                       page_text_cache, dpi, image_mode, encode_opts};
+      std::vector<int> dropped_pages;  // pages that couldn't be queued -> 503
+      render::PdfRenderer::StreamHandle stream_handle;
+
       std::mutex futures_mutex;
       std::vector<std::future<void>> page_futures;
-      render::PdfRenderer::StreamHandle stream_handle;
       int num_pages = 0;
 
       if (any_need_render) {
         try {
           stream_handle = run_streamed_render_gpu(dispatcher, pdf_renderer,
                                    pdf_data, pdf_len_local,
-                                   dpi, layout_enabled, want_reading_order, mode,
-                                   pdf_doc.get(), page_text_cache,
-                                   results_mutex, page_results, need_render,
-                                   page_futures, futures_mutex);
+                                   layout_enabled, want_reading_order, mode,
+                                   sink, need_render,
+                                   page_futures, futures_mutex, pdf_only_batch,
+                                   dropped_pages);
           num_pages = stream_handle.num_pages;
         } catch (const std::exception &e) {
           for (auto &f : page_futures) { try { f.get(); } catch (...) {} }
@@ -667,6 +963,26 @@ void register_pdf_route(server::WorkPool &pool,
         return;
       }
 
+      if (!dropped_pages.empty()) {
+        cb(server::error_response(drogon::k503ServiceUnavailable, "SERVER_BUSY",
+            std::format("GPU queue full: {} of {} pages could not be processed "
+                        "(first dropped page: {}). Retry with backoff.",
+                        dropped_pages.size(), num_pages, dropped_pages.front())));
+        return;
+      }
+
+      if (const int failed = sink.decode_failures.load(std::memory_order_relaxed);
+          failed > 0) {
+        // We rendered these PPMs ourselves — failing to read them back is a
+        // server-side fault (tmpfs pressure, truncated write), not client
+        // input. Surfacing 500 beats emitting silently blank pages.
+        cb(server::error_response(drogon::k500InternalServerError,
+            "PAGE_DECODE_FAILED",
+            std::format("{} of {} rendered pages could not be decoded; retry",
+                        failed, num_pages)));
+        return;
+      }
+
       // num_pages may have grown the vector under page_futures completion;
       // trim to its actual number reported by the renderer.
       std::vector<GpuPdfPageResult> trimmed;
@@ -676,7 +992,9 @@ void register_pdf_route(server::WorkPool &pool,
         for (int i = 0; i < num_pages && i < static_cast<int>(page_results.size()); ++i)
           trimmed.push_back(std::move(page_results[i]));
       }
-      cb(server::json_response(emit_pdf_response(trimmed, dpi, want_blocks)));
+      cb(server::json_response(emit_pdf_response(trimmed, dpi, want_blocks,
+                                                  image_mode, encode_opts)));
+     });
     });
   }, {drogon::Post});
 }
@@ -687,11 +1005,13 @@ void register_pdf_route(server::WorkPool &pool,
                         const server::InferFunc &infer,
                         render::PdfRenderer &pdf_renderer,
                         pdf::PdfMode default_pdf_mode,
-                        bool layout_available) {
+                        bool layout_available,
+                        int max_pdf_pages) {
 
   drogon::app().registerHandler(
       "/ocr/pdf",
-      [&pool, &infer, &pdf_renderer, default_pdf_mode, layout_available](
+      [&pool, &infer, &pdf_renderer, default_pdf_mode, layout_available,
+       max_pdf_pages](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
@@ -713,9 +1033,8 @@ void register_pdf_route(server::WorkPool &pool,
     const bool want_reading_order = opts.want_reading_order;
     const bool want_blocks = opts.want_blocks;
 
-    int dpi = 100;
     auto dpi_str = req->getParameter("dpi");
-    if (!dpi_str.empty()) dpi = std::atoi(dpi_str.c_str());
+    int dpi = dpi_str.empty() ? 100 : query_int(std::string(dpi_str), -1);
     if (dpi < 50 || dpi > 600) {
       callback(server::error_response(drogon::k400BadRequest, "INVALID_DPI", "DPI must be between 50 and 600"));
       return;
@@ -726,16 +1045,29 @@ void register_pdf_route(server::WorkPool &pool,
     if (!mode_str.empty())
       req_mode = pdf::parse_pdf_mode(mode_str.c_str(), default_pdf_mode);
 
+    // Page-image export params (?images=inline&format=...&quality=...)
+    ImageMode image_mode;
+    pdf::EncodeOptions encode_opts;
+    if (auto err = parse_image_query_params(req, image_mode, encode_opts);
+        !err.empty()) {
+      callback(server::error_response(drogon::k400BadRequest,
+                                       "INVALID_PARAMETER", err));
+      return;
+    }
+
     auto pdf_buf = std::make_shared<std::string>(pdf_ptr, pdf_len);
 
     server::submit_work(pool, std::move(callback),
         [pdf_buf, &infer, &pdf_renderer, want_layout,
          want_reading_order, want_blocks, dpi,
-         req_mode](server::DrogonCallback &cb) {
+         req_mode, image_mode, encode_opts, max_pdf_pages](server::DrogonCallback &cb) {
+     // See GPU route: wrap the body so a post-render bad_alloc returns 500
+     // instead of being swallowed by the WorkPool (client hang).
+     server::run_with_error_handling(cb, "/ocr/pdf", [&] {
       const auto *pdf_data = reinterpret_cast<const uint8_t *>(pdf_buf->data());
       size_t pdf_len_local = pdf_buf->size();
 
-      if (reject_if_too_many_pages(pdf_data, pdf_len_local, cb)) return;
+      if (reject_if_too_many_pages(pdf_data, pdf_len_local, max_pdf_pages, cb)) return;
 
       // CPU server runs sequentially; the GPU AutoVerified path
       // cross-checks every OCR detection against the text layer in
@@ -763,12 +1095,14 @@ void register_pdf_route(server::WorkPool &pool,
       // render when necessary.
       if (mode != pdf::PdfMode::Ocr) {
         prepopulate_pages(mode, want_layout, page_text_cache,
-                          page_results, need_render, /*any_need_render=*/nullptr);
+                          page_results, need_render, /*any_need_render=*/nullptr,
+                          image_mode == ImageMode::Inline);
       }
 
       // Render + OCR pass. mode=ocr runs every page; non-ocr modes only
       // render pages that flagged need_render (image-only pages, layout=1
       // requests, auto-fallback OCR pages, auto_verified pages).
+      int decode_failures = 0;
       try {
         bool any_need_render = (mode == pdf::PdfMode::Ocr) ||
             std::any_of(need_render.begin(), need_render.end(),
@@ -778,7 +1112,8 @@ void register_pdf_route(server::WorkPool &pool,
           int num_pages = run_streamed_render_cpu(infer, pdf_renderer,
               pdf_data, pdf_len_local, dpi, want_layout,
               want_reading_order, mode,
-              page_results, need_render);
+              page_results, need_render, decode_failures,
+              image_mode, encode_opts);
           if (static_cast<int>(page_results.size()) < num_pages)
             page_results.resize(num_pages);
         }
@@ -794,7 +1129,20 @@ void register_pdf_route(server::WorkPool &pool,
         return;
       }
 
-      cb(server::json_response(emit_pdf_response(page_results, dpi, want_blocks)));
+      if (decode_failures > 0) {
+        // We rendered these PPMs ourselves; a read-back failure is a
+        // server-side fault (tmpfs pressure / truncated write). Surface 500
+        // instead of emitting silently blank pages (parity with GPU route).
+        cb(server::error_response(drogon::k500InternalServerError,
+            "PAGE_DECODE_FAILED",
+            std::format("{} of {} rendered pages could not be decoded; retry",
+                        decode_failures, static_cast<int>(page_results.size()))));
+        return;
+      }
+
+      cb(server::json_response(emit_pdf_response(page_results, dpi, want_blocks,
+                                                  image_mode, encode_opts)));
+     });
     });
   }, {drogon::Post});
 }

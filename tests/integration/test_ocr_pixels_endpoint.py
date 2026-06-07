@@ -48,16 +48,16 @@ class TestOcrPixelsHappyPath:
         joined = " ".join(item["text"] for item in data["results"]).upper()
         assert "HELLO" in joined or "HELL" in joined
 
-    @pytest.mark.xfail(
-        reason="server returns 500 on channels=1 — tracked separately; 3-channel works",
-        strict=False,
-    )
     def test_pixels_grayscale_1channel(self, server_url):
+        # channels=1 is expanded to BGR in the handler (the pipeline is
+        # BGR-only); grayscale input must OCR like its 3-channel twin.
         img = make_text_image("WORLD", width=400, height=100, font_size=40)
         raw, w, h, ch = _pil_to_gray_bytes(img)
         r = _post_pixels(server_url, raw, w, h, ch)
         assert r.status_code == 200, r.text
         assert "results" in r.json()
+        joined = " ".join(item["text"] for item in r.json()["results"])
+        assert "WORLD" in joined or "WORL" in joined
 
     def test_pixels_matches_raw_endpoint(self, server_url):
         """Same underlying image through /ocr/raw and /ocr/pixels should

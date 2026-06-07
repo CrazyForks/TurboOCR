@@ -81,20 +81,6 @@ void PaddleRec::allocate_buffers() {
   buffers_allocated_ = true;
 }
 
-bool PaddleRec::warmup_pdf_static(int B, int W, cudaStream_t stream) {
-  if (!buffers_allocated_) allocate_buffers();
-  // rec input is 48 high (CRNN-style backbone); width is the free dim that
-  // the static engine pins to W.
-  constexpr int H = 48;
-  const size_t in_floats = static_cast<size_t>(B) * 3 * H * W;
-  CUDA_CHECK(cudaMemsetAsync(d_batch_input_.get(), 0,
-                              in_floats * sizeof(float), stream));
-  nvinfer1::Dims4 dims{B, 3, H, W};
-  bool ok = engine_->infer_dynamic(dims, stream);
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-  return ok;
-}
-
 std::vector<std::pair<std::string, float>>
 PaddleRec::run(const GpuImage &img, const std::vector<Box> &boxes,
                cudaStream_t stream) {

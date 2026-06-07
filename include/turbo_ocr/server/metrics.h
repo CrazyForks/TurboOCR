@@ -30,12 +30,14 @@ public:
     kOcrPixels,
     kOcrPdf,
     kHealth,
+    kOther,
     kRouteCount
   };
 
   static constexpr const char *route_name(Route r) {
     constexpr const char *names[] = {
-        "/ocr", "/ocr/raw", "/ocr/batch", "/ocr/pixels", "/ocr/pdf", "/health"};
+        "/ocr", "/ocr/raw", "/ocr/batch", "/ocr/pixels", "/ocr/pdf",
+        "/health", "other"};
     return names[r];
   }
 
@@ -45,7 +47,11 @@ public:
     if (path == "/ocr/batch")  return kOcrBatch;
     if (path == "/ocr/pixels") return kOcrPixels;
     if (path == "/ocr/pdf")    return kOcrPdf;
-    return kHealth;
+    if (path == "/health" || path == "/health/live" || path == "/health/ready")
+      return kHealth;
+    // Any other matched handler (e.g. the CPU build's /profile) is bucketed
+    // under "other" so it can't corrupt /health's request/error counters.
+    return kOther;
   }
 
   // ── Recording ──────────────────────────────────────────────────────────
@@ -59,17 +65,22 @@ public:
     else if (http_status >= 500)
       r.server_err.fetch_add(1, std::memory_order_relaxed);
 
-    // Histogram: increment the first bucket that fits (serializer accumulates).
+    // Histogram: bump _count and _sum BEFORE the per-bucket counter so a
+    // concurrent /metrics scrape can never observe a cumulative bucket count
+    // exceeding _count (Prometheus requires le-buckets <= +Inf == _count).
+    // The bucket increment is RELEASE and serialize() reads it ACQUIRE so the
+    // ordering holds on weakly-ordered targets (aarch64), not just x86 TSO —
+    // program order alone doesn't order two relaxed RMWs on distinct atomics.
     // Values above all buckets only appear in _count/_sum (+Inf bucket).
+    r.hist_count.fetch_add(1, std::memory_order_relaxed);
+    r.hist_sum.fetch_add(
+        static_cast<uint64_t>(duration_s * 1e6), std::memory_order_relaxed);
     for (size_t i = 0; i < kNumBuckets; ++i) {
       if (duration_s <= kBuckets[i]) {
-        r.hist_buckets[i].fetch_add(1, std::memory_order_relaxed);
+        r.hist_buckets[i].fetch_add(1, std::memory_order_release);
         break;
       }
     }
-    r.hist_sum.fetch_add(
-        static_cast<uint64_t>(duration_s * 1e6), std::memory_order_relaxed);
-    r.hist_count.fetch_add(1, std::memory_order_relaxed);
   }
 
   void record_request_size(size_t bytes) {
@@ -122,7 +133,9 @@ public:
       auto name = route_name(static_cast<Route>(i));
       uint64_t cumulative = 0;
       for (size_t b = 0; b < kNumBuckets; ++b) {
-        cumulative += r.hist_buckets[b].load(std::memory_order_relaxed);
+        // ACQUIRE pairs with the RELEASE bucket increment so a bucket count
+        // is never seen ahead of the _count bump that preceded it.
+        cumulative += r.hist_buckets[b].load(std::memory_order_acquire);
         char le_buf[32];
         std::snprintf(le_buf, sizeof(le_buf), "%.3f", kBuckets[b]);
         append_histogram_bucket(out, name, le_buf, cumulative);

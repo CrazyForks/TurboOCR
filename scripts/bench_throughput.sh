@@ -4,7 +4,7 @@
 
 HEY=~/go/bin/hey
 SERVER=${OCR_URL:-http://localhost:8000}
-IMAGE=${1:-tests/test_data/png/receipt.png}
+IMAGE=${1:-tests/fixtures/images/png/receipt.png}
 CONCURRENCY=${2:-16}
 TOTAL=${3:-1000}
 CONTENT_TYPE="image/png"

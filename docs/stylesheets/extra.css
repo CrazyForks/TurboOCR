@@ -1,0 +1,331 @@
+/* ============================================================
+ * paddle-highspeed-cpp — custom typographic + visual layer
+ * Sits on top of mkdocs-material's defaults. All custom tokens
+ * live under --phc-*; do not override Material variables that
+ * the toggle palette switches at runtime.
+ * ============================================================ */
+
+/* ---------- palette tokens, light + dark ---------- */
+
+[data-md-color-scheme="default"] {
+  --phc-bg-elevated: #ffffff;
+  --phc-bg-subtle: #f8fafc;
+  --phc-border-subtle: #e2e8f0;
+  --phc-border-strong: #cbd5e1;
+  --phc-text-muted: #475569;
+  --phc-accent-soft: rgba(244, 114, 182, 0.08);
+  --phc-accent-line: #f472b6;
+  --phc-code-bg: #f1f5f9;
+  --phc-code-shadow: 0 1px 2px rgba(15, 23, 42, 0.06),
+                     0 1px 3px rgba(15, 23, 42, 0.04);
+  --phc-table-row-alt: #f8fafc;
+  --phc-hero-shadow: 0 4px 24px rgba(15, 23, 42, 0.06),
+                     0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+[data-md-color-scheme="slate"] {
+  --phc-bg-elevated: #0f172a;
+  --phc-bg-subtle: #111c2e;
+  --phc-border-subtle: #1e293b;
+  --phc-border-strong: #334155;
+  --phc-text-muted: #94a3b8;
+  --phc-accent-soft: rgba(244, 114, 182, 0.10);
+  --phc-accent-line: #f472b6;
+  --phc-code-bg: #0b1220;
+  --phc-code-shadow: 0 1px 2px rgba(0, 0, 0, 0.40),
+                     0 2px 8px rgba(0, 0, 0, 0.20);
+  --phc-table-row-alt: #111c2e;
+  --phc-hero-shadow: 0 4px 32px rgba(0, 0, 0, 0.40),
+                     0 1px 2px rgba(0, 0, 0, 0.20);
+}
+
+/* ---------- typographic scale ---------- */
+
+.md-typeset {
+  font-size: 1rem;
+  line-height: 1.65;
+}
+
+.md-typeset h1 {
+  font-size: 2.5rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  margin-top: 0.25rem;
+  margin-bottom: 1.25rem;
+}
+
+.md-typeset h2 {
+  font-size: 1.875rem;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  line-height: 1.25;
+  margin-top: 2.5rem;
+  margin-bottom: 0.875rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid var(--phc-border-subtle);
+}
+
+.md-typeset h3 {
+  font-size: 1.375rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+  margin-top: 1.875rem;
+  margin-bottom: 0.625rem;
+}
+
+.md-typeset h4 {
+  font-size: 1.125rem;
+  font-weight: 600;
+  margin-top: 1.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.md-typeset p,
+.md-typeset li {
+  line-height: 1.65;
+}
+
+/* tighten paragraphs that follow a heading */
+.md-typeset h2 + p,
+.md-typeset h3 + p {
+  margin-top: 0.25rem;
+}
+
+/* ---------- code blocks ---------- */
+
+.md-typeset pre > code,
+.md-typeset .highlight pre {
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+.md-typeset .highlight {
+  border-radius: 6px;
+  box-shadow: var(--phc-code-shadow);
+  background: var(--phc-code-bg);
+}
+
+.md-typeset .highlight pre {
+  padding: 1rem 1.1rem;
+}
+
+.md-typeset code {
+  font-size: 0.875em;
+  padding: 0.12em 0.36em;
+  border-radius: 4px;
+}
+
+/* inline code inside headings inherits heading scale */
+.md-typeset h1 code,
+.md-typeset h2 code,
+.md-typeset h3 code,
+.md-typeset h4 code {
+  font-size: 0.92em;
+  background: var(--phc-code-bg);
+  padding: 0.08em 0.32em;
+}
+
+/* ---------- tables ---------- */
+
+.md-typeset table:not([class]) {
+  border: 1px solid var(--phc-border-subtle);
+  border-radius: 6px;
+  overflow: hidden;
+  font-size: 0.9rem;
+}
+
+.md-typeset table:not([class]) th,
+.md-typeset table:not([class]) td {
+  border-top: 1px solid var(--phc-border-subtle);
+  border-right: 1px solid var(--phc-border-subtle);
+  padding: 0.55rem 0.85rem;
+}
+
+.md-typeset table:not([class]) th:last-child,
+.md-typeset table:not([class]) td:last-child {
+  border-right: none;
+}
+
+.md-typeset table:not([class]) thead th {
+  background: var(--phc-bg-subtle);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  border-top: none;
+}
+
+.md-typeset table:not([class]) tbody tr:nth-child(even) {
+  background: var(--phc-table-row-alt);
+}
+
+/* ---------- admonitions ---------- */
+
+.md-typeset .admonition,
+.md-typeset details {
+  border-radius: 6px;
+  border-width: 0 0 0 4px;
+  padding: 0.6rem 1rem 0.85rem;
+  box-shadow: var(--phc-code-shadow);
+  font-size: 0.92rem;
+}
+
+.md-typeset .admonition-title,
+.md-typeset summary {
+  padding-top: 0.5rem;
+  padding-bottom: 0.5rem;
+  font-weight: 600;
+  letter-spacing: 0.005em;
+}
+
+/* ---------- mermaid centering + dark-mode bg ---------- */
+
+.md-typeset .mermaid,
+.md-typeset div.mermaid {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin: 1.5rem 0;
+  padding: 0.75rem;
+  background: var(--phc-bg-subtle);
+  border: 1px solid var(--phc-border-subtle);
+  border-radius: 6px;
+  overflow-x: auto;
+}
+
+.md-typeset .mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* ---------- landing-page hero card grid ---------- */
+
+.md-typeset .grid.cards > ul > li,
+.md-typeset .grid.cards > ol > li,
+.md-typeset .grid > .card {
+  border: 1px solid var(--phc-border-subtle);
+  border-radius: 8px;
+  background: var(--phc-bg-elevated);
+  box-shadow: var(--phc-hero-shadow);
+  padding: 1.1rem 1.25rem;
+  transition: transform 120ms ease, border-color 120ms ease,
+              box-shadow 120ms ease;
+}
+
+.md-typeset .grid.cards > ul > li:hover,
+.md-typeset .grid.cards > ol > li:hover,
+.md-typeset .grid > .card:hover {
+  transform: translateY(-2px);
+  border-color: var(--phc-accent-line);
+  box-shadow: 0 8px 32px rgba(244, 114, 182, 0.08),
+              0 2px 4px rgba(15, 23, 42, 0.06);
+}
+
+.md-typeset .grid.cards > ul > li > hr,
+.md-typeset .grid.cards > ol > li > hr {
+  border: none;
+  border-top: 1px solid var(--phc-border-subtle);
+  margin: 0.5rem 0 0.75rem;
+}
+
+/* hero block (first paragraph or abstract on the landing) */
+.md-typeset .admonition.abstract {
+  border-left-color: var(--phc-accent-line);
+  background: var(--phc-accent-soft);
+}
+
+/* ---------- hero stat tiles (landing-page numbers row) ---------- */
+
+.md-typeset .grid.phc-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.75rem;
+  margin: 1.25rem 0 2rem;
+}
+
+.md-typeset .phc-stat {
+  border: 1px solid var(--phc-border-subtle);
+  border-radius: 8px;
+  background: var(--phc-bg-elevated);
+  padding: 1rem 1.1rem 0.9rem;
+  box-shadow: var(--phc-hero-shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  position: relative;
+  overflow: hidden;
+  transition: border-color 120ms ease, transform 120ms ease;
+}
+
+.md-typeset .phc-stat::before {
+  content: "";
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+  background: var(--phc-accent-line);
+  opacity: 0.85;
+}
+
+.md-typeset .phc-stat:hover {
+  border-color: var(--phc-accent-line);
+  transform: translateY(-1px);
+}
+
+.md-typeset .phc-stat p {
+  margin: 0;
+}
+
+.md-typeset .phc-stat-num {
+  font-size: 1.85rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.05;
+  color: var(--md-default-fg-color);
+}
+
+.md-typeset .phc-stat-num strong {
+  font-weight: 700;
+}
+
+.md-typeset .phc-stat-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--md-default-fg-color);
+  margin-top: 0.25rem;
+}
+
+.md-typeset .phc-stat-foot {
+  font-size: 0.75rem;
+  color: var(--phc-text-muted);
+  letter-spacing: 0.01em;
+}
+
+/* ---------- nav + toc polish ---------- */
+
+.md-nav__title {
+  font-weight: 600;
+}
+
+.md-nav__link {
+  font-size: 0.92rem;
+}
+
+/* footer */
+.md-footer {
+  font-size: 0.9rem;
+}
+
+/* ---------- horizontal rule ---------- */
+
+.md-typeset hr {
+  border-top: 1px solid var(--phc-border-subtle);
+  margin: 2rem 0;
+}
+
+/* ---------- responsive tweaks ---------- */
+
+@media screen and (max-width: 60em) {
+  .md-typeset h1 { font-size: 2rem; }
+  .md-typeset h2 { font-size: 1.5rem; }
+  .md-typeset h3 { font-size: 1.2rem; }
+}

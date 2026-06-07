@@ -10,6 +10,7 @@
 #include "turbo_ocr/table/table_stage.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -193,35 +194,30 @@ bool OcrPipeline::load_layout_model(const std::string &layout_trt_path) {
   return true;
 }
 
-void OcrPipeline::warmup_gpu(cudaStream_t stream) {
-  // PDF-only static-engine warmup. The static engines accept only the
-  // single profile shape they were built with, so the normal dynamic-shape
-  // warmup below (run() on a 100×100 dummy, then 5 rec width buckets)
-  // would abort with InferenceError. Issue exactly one batched dummy
-  // inference at the static shape on each engine instead. Env vars match
-  // ServerConfig: TURBO_OCR_PDF_BATCH/_PAGE_H/_PAGE_W and _REC_BATCH/_REC_W.
-  auto env_int = [](const char *name, int def) {
-    if (const char *v = std::getenv(name)) {
-      try { return std::stoi(v); } catch (...) {}
-    }
-    return def;
-  };
-  const char *pdf_only_env = std::getenv("TURBO_OCR_PDF_ONLY");
-  const bool pdf_only = pdf_only_env && std::string(pdf_only_env) == "1";
+void OcrPipeline::enable_pdf_only_mode(int batch, int page_h, int page_w) {
+  pdf_only_   = true;
+  pdf_batch_  = batch;
+  pdf_page_h_ = page_h;
+  pdf_page_w_ = page_w;
+  // Det owns the static profile: locks run_batch to {batch,3,H,W} and
+  // grows its batch/CCL buffers when the fixed page exceeds DET_MAX_SIDE².
+  det_->set_pdf_static_profile(batch, page_h, page_w);
+}
 
-  if (pdf_only) {
+void OcrPipeline::warmup_gpu(cudaStream_t stream) {
+  if (pdf_only_) {
     // HYBRID pdf_only warmup: static det (fixed page size) + batched layout
     // (fixed 800x800) are warmed at their exact profile shapes here. The
-    // recognition engine is the DYNAMIC 5-bucket rec (see main.cpp:rec_type)
-    // because a single static rec width squishes wide text lines and tanks
-    // accuracy on multi-column/dense pages — so rec is warmed by the shared
-    // 5-bucket loop below, exactly like the non-pdf path. We deliberately
-    // skip the run(dummy) full-pipeline warmup since it issues a dynamic
-    // det shape the static det engine rejects.
-    const int B = env_int("TURBO_OCR_PDF_BATCH",     8);
-    const int H = env_int("TURBO_OCR_PDF_PAGE_H", 1280);
-    const int W = env_int("TURBO_OCR_PDF_PAGE_W",  960);
-    if (!det_->warmup_pdf_static(B, H, W, stream))
+    // recognition engine is the DYNAMIC 5-bucket rec (see main.cpp) because
+    // a single static rec width squishes wide text lines and tanks accuracy
+    // on multi-column/dense pages — so rec is warmed by the shared 5-bucket
+    // loop below, exactly like the non-pdf path. We deliberately skip the
+    // run(dummy) full-pipeline warmup since it issues a dynamic det shape
+    // the static det engine rejects.
+    const int B = pdf_batch_;
+    const int H = pdf_page_h_;
+    const int W = pdf_page_w_;
+    if (!det_->warmup_pdf_static(stream))
       throw turbo_ocr::InferenceError("[pdf_only] det static warmup failed");
 
     // Batched layout warmup at {B,3,800,800}: build B dummy page GpuImages
@@ -317,6 +313,12 @@ GpuImage OcrPipeline::upload_image(const cv::Mat &img, cudaStream_t stream,
   if (img.rows > buf.cap_rows || img.cols > buf.cap_cols) [[unlikely]] {
     cudaFree(buf.d_buf);
     buf.d_buf = nullptr;
+    // Zero the cap BEFORE the alloc: if cudaMallocPitch throws (OOM), the
+    // slot must stay {nullptr, cap 0} so the NEXT request re-enters this
+    // realloc branch instead of skipping it and writing to a null buffer
+    // with a stale (larger) cap.
+    buf.cap_rows = 0;
+    buf.cap_cols = 0;
     CUDA_CHECK(cudaMallocPitch(&buf.d_buf, &buf.pitch, img.cols * 3, img.rows));
     buf.cap_rows = img.rows;
     buf.cap_cols = img.cols;
@@ -327,6 +329,7 @@ GpuImage OcrPipeline::upload_image(const cv::Mat &img, cudaStream_t stream,
   if (needed > h_pinned_size_) [[unlikely]] {
     cudaFreeHost(h_pinned_buf_);
     h_pinned_buf_ = nullptr;
+    h_pinned_size_ = 0;  // zero before alloc — see d_buf cap reset above
     // Upload-only pinned buffer: CPU writes (memcpy) once and the GPU DMAs
     // it. Write-combined uncached memory is ~10-15% faster for this access
     // pattern (no read-back from CPU).
@@ -434,7 +437,16 @@ OcrPipelineResult OcrPipeline::run_with_layout(const cv::Mat &img,
               << img.cols << "x" << img.rows
               << " — returning empty result: " << e.what() << '\n';
     cudaStreamSynchronize(stream);
-    cudaGetLastError(); // clear sticky error so next request works
+    cudaGetLastError(); // clears a non-sticky error so the next request works
+    if (cudaGetLastError() != cudaSuccess) {
+      // Still erroring after a clear → STICKY error (e.g. illegal address):
+      // the CUDA context is poisoned and every future request on every
+      // pipeline would fail. Fail fast so the orchestrator restarts a
+      // healthy process instead of leaving a zombie returning errors.
+      std::cerr << "[Pipeline] FATAL: sticky CUDA error, context is "
+                   "unrecoverable — aborting for supervisor restart\n";
+      std::abort();
+    }
     return OcrPipelineResult{};
   }
 
@@ -447,11 +459,16 @@ OcrPipelineResult OcrPipeline::run_with_layout(const cv::Mat &img,
   // that waits only on det (via det_only_event_), so layout TRT execute
   // overlaps with cls on `stream` AND with rec on `rec_stream_`. The
   // host-side decode happens in collect() at the very end of run().
+  // collect() must only run when enqueue succeeded: on an enqueue failure
+  // it would sync the stale d2h_event_ of the LAST successful execute and
+  // hand this page the previous page's boxes.
+  bool layout_enqueued = false;
   if (layout_active) {
     CUDA_CHECK(cudaEventRecord(det_only_event_, stream));
     CUDA_CHECK(cudaStreamWaitEvent(layout_stream_, det_only_event_, 0));
     timer.gpu_start("layout_enqueue");
-    (void)layout_->enqueue(gpu_img, img.rows, img.cols, layout_stream_);
+    layout_enqueued = layout_->enqueue(gpu_img, img.rows, img.cols,
+                                       layout_stream_);
     timer.gpu_stop();
   }
 
@@ -521,7 +538,7 @@ OcrPipelineResult OcrPipeline::run_with_layout(const cv::Mat &img,
   // layout and rec run on separate streams, total wall-clock is bounded by
   // max(layout, cls+rec); on typical pages rec dominates so the wait is a
   // no-op.
-  if (layout_active) {
+  if (layout_enqueued) {
     out.layout = layout_->collect();
   }
 
@@ -566,8 +583,8 @@ OcrPipelineResult OcrPipeline::run_layout_only(const cv::Mat &img,
   CUDA_CHECK(cudaStreamWaitEvent(layout_stream_, det_only_event_, 0));
 
   timer.gpu_start("layout_only");
-  (void)layout_->enqueue(gpu_img, img.rows, img.cols, layout_stream_);
-  out.layout = layout_->collect();
+  if (layout_->enqueue(gpu_img, img.rows, img.cols, layout_stream_))
+    out.layout = layout_->collect();
   timer.gpu_stop();
 
   // Mirror the event bookkeeping of run_with_layout so the next
@@ -586,6 +603,11 @@ std::pair<void *, size_t> OcrPipeline::ensure_gpu_buf(int rows, int cols) {
   if (rows > buf.cap_rows || cols > buf.cap_cols) {
     cudaFree(buf.d_buf);
     buf.d_buf = nullptr;
+    // Zero the cap BEFORE the alloc so an OOM throw leaves {nullptr, cap 0}:
+    // otherwise a later smaller request would skip the realloc and hand a
+    // null device buffer to nvjpeg decode → sticky illegal-address → abort.
+    buf.cap_rows = 0;
+    buf.cap_cols = 0;
     CUDA_CHECK(cudaMallocPitch(&buf.d_buf, &buf.pitch, cols * 3, rows));
     buf.cap_rows = rows;
     buf.cap_cols = cols;
@@ -622,12 +644,15 @@ OcrPipelineResult OcrPipeline::run_with_layout(GpuImage gpu_img,
   sorted_boxes(boxes);
   timer.cpu_stop();
 
-  // Optional layout detection (see run(cv::Mat, stream) for rationale).
+  // Optional layout detection (see run(cv::Mat, stream) for rationale,
+  // including why collect() is gated on the enqueue result).
+  bool layout_enqueued = false;
   if (layout_active) {
     CUDA_CHECK(cudaEventRecord(det_only_event_, stream));
     CUDA_CHECK(cudaStreamWaitEvent(layout_stream_, det_only_event_, 0));
     timer.gpu_start("layout_enqueue");
-    (void)layout_->enqueue(gpu_img, gpu_img.rows, gpu_img.cols, layout_stream_);
+    layout_enqueued = layout_->enqueue(gpu_img, gpu_img.rows, gpu_img.cols,
+                                       layout_stream_);
     timer.gpu_stop();
   }
 
@@ -683,7 +708,7 @@ OcrPipelineResult OcrPipeline::run_with_layout(GpuImage gpu_img,
   }
 
   // Layout collect — see run(cv::Mat, stream) above.
-  if (layout_active) {
+  if (layout_enqueued) {
     out.layout = layout_->collect();
   }
 
@@ -705,13 +730,29 @@ OcrPipelineResult OcrPipeline::run_with_layout(GpuImage gpu_img,
 
 std::vector<std::vector<OCRResultItem>> OcrPipeline::run_batch(
     const std::vector<cv::Mat> &imgs, cudaStream_t stream) {
-  // Layout is not supported on the batch path in v1.
+  auto outs = run_batch_with_layout(imgs, stream,
+                                    /*want_layout=*/false,
+                                    /*want_reading_order=*/false);
+  std::vector<std::vector<OCRResultItem>> results;
+  results.reserve(outs.size());
+  for (auto &out : outs)
+    results.push_back(std::move(out.results));
+  return results;
+}
+
+std::vector<OcrPipelineResult> OcrPipeline::run_batch_with_layout(
+    const std::vector<cv::Mat> &imgs, cudaStream_t stream,
+    bool want_layout, bool want_reading_order) {
   if (imgs.empty())
     return {};
 
   // If only one image, just use single-image path
-  if (imgs.size() == 1)
-    return {run(imgs[0], stream)};
+  if (imgs.size() == 1) {
+    std::vector<OcrPipelineResult> single;
+    single.push_back(run_with_layout(imgs[0], stream, want_layout,
+                                     want_reading_order));
+    return single;
+  }
 
   const int n = static_cast<int>(imgs.size());
 
@@ -744,6 +785,11 @@ std::vector<std::vector<OCRResultItem>> OcrPipeline::run_batch(
     auto &bbuf = batch_img_bufs_[i];
     if (img.rows > bbuf.cap_rows || img.cols > bbuf.cap_cols) [[unlikely]] {
       if (bbuf.d_buf) cudaFree(bbuf.d_buf);
+      bbuf.d_buf = nullptr;
+      // Zero cap before alloc so an OOM throw leaves {nullptr, cap 0}
+      // (see upload_image) — never a stale-cap null buffer next request.
+      bbuf.cap_rows = 0;
+      bbuf.cap_cols = 0;
       CUDA_CHECK(cudaMallocPitch(&bbuf.d_buf, &bbuf.pitch, img.cols * 3, img.rows));
       bbuf.cap_rows = img.rows;
       bbuf.cap_cols = img.cols;
@@ -777,10 +823,8 @@ std::vector<std::vector<OCRResultItem>> OcrPipeline::run_batch(
   // we go straight through det's batched static-shape path (one TRT call
   // per batch chunk). In normal mode, det uses batch=1 per image for
   // optimal single-image latency.
-  const bool pdf_only_pipe = std::getenv("TURBO_OCR_PDF_ONLY") &&
-                              std::string(std::getenv("TURBO_OCR_PDF_ONLY")) == "1";
   std::vector<std::vector<Box>> all_det_boxes(batch_n);
-  if (pdf_only_pipe) {
+  if (pdf_only_) {
     std::vector<GpuImage> gpu_imgs;
     std::vector<std::pair<int,int>> dims;
     gpu_imgs.reserve(batch_n); dims.reserve(batch_n);
@@ -800,13 +844,12 @@ std::vector<std::vector<OCRResultItem>> OcrPipeline::run_batch(
 
   // Assign detection results and run angle classification per-image.
   // pdf_only skips cls — PDF pages from a renderer are upright by
-  // construction, and routing crops through the static cls engine
-  // would add a redundant pass that costs more than it saves.
+  // construction, so an angle pass would be a redundant cost.
   for (int i = 0; i < batch_n; i++) {
     per_img[i].boxes = std::move(all_det_boxes[i]);
     sorted_boxes(per_img[i].boxes);
 
-    if (use_cls_ && !pdf_only_pipe) {
+    if (use_cls_ && !pdf_only_) {
       vertical_box_indices_.clear();
       for (int vi = 0; vi < static_cast<int>(per_img[i].boxes.size()); ++vi) {
         if (is_vertical_box(per_img[i].boxes[vi]))
@@ -845,12 +888,12 @@ std::vector<std::vector<OCRResultItem>> OcrPipeline::run_batch(
 
   // --- Phase 3: Combine results and filter by drop_score ---
   constexpr float kDropScore = turbo_ocr::kDropScore;
-  std::vector<std::vector<OCRResultItem>> all_results(batch_n);
+  std::vector<OcrPipelineResult> all_results(batch_n);
 
   for (int i = 0; i < batch_n; i++) {
     const auto &boxes = image_crops[i].boxes;
     auto &rec_results = all_rec_results[i];
-    auto &final_results = all_results[i];
+    auto &final_results = all_results[i].results;
     final_results.reserve(boxes.size());
 
     for (size_t j = 0; j < boxes.size(); ++j) {
@@ -868,59 +911,73 @@ std::vector<std::vector<OCRResultItem>> OcrPipeline::run_batch(
     }
   }
 
-  // Per-image layout + router (table/formula) when enabled. We keep the
-  // pipeline's normal contract (run_batch returns text-only result lists),
-  // but compute layout/table/formula on each page so the cost of the full
-  // stack is paid in the batched path. The structured outputs are surfaced
-  // via the existing run_with_layout() single-image API; here we just
-  // ensure the routing is exercised for throughput measurement. This
-  // engages only when the operator has loaded a layout model.
-  if (use_layout_ && layout_) {
-    // pdf_only mode → every page is the same rendered size, so layout can
-    // batch all of them in one TRT execute (engine profile {1..8, 3, 800,
-    // 800}, FP16). The non-batched fallback below keeps the legacy
-    // per-image path for variable-size workloads.
-    const bool pdf_only_pipe2 = std::getenv("TURBO_OCR_PDF_ONLY") &&
-                  std::string(std::getenv("TURBO_OCR_PDF_ONLY")) == "1";
-    if (pdf_only_pipe2) {
-      std::vector<GpuImage> gpu_imgs;
-      std::vector<std::pair<int,int>> dims;
-      gpu_imgs.reserve(batch_n); dims.reserve(batch_n);
-      for (int i = 0; i < batch_n; ++i) {
-        gpu_imgs.push_back({per_img[i].d_buf, per_img[i].pitch,
-                            per_img[i].rows, per_img[i].cols});
-        dims.emplace_back(per_img[i].rows, per_img[i].cols);
-      }
-      if (layout_->enqueue_batch(gpu_imgs, dims, layout_stream_)) {
-        auto all_layout = layout_->collect_batch();
-        // dispatch_router_ per image (router internals are per-page —
-        // table/formula stages crop per region). Layout is now amortized
-        // across the whole batch.
-        PipelineTimer t;
-        for (int i = 0; i < batch_n; ++i) {
-          OcrPipelineResult out;
-          out.results = all_results[i];
-          out.layout = i < (int)all_layout.size() ? std::move(all_layout[i])
-                                                  : std::vector<turbo_ocr::layout::LayoutBox>{};
-          dispatch_router_(out, gpu_imgs[i], image_crops[i].boxes, t);
-        }
-      }
-    } else {
-      for (int i = 0; i < batch_n; i++) {
-        GpuImage gpu_img{per_img[i].d_buf, per_img[i].pitch,
-                         per_img[i].rows, per_img[i].cols};
-        (void)layout_->enqueue(gpu_img, per_img[i].rows, per_img[i].cols,
-                                layout_stream_);
-        OcrPipelineResult out;
-        out.results = all_results[i];
-        out.layout = layout_->collect();
-        PipelineTimer t;
-        dispatch_router_(out, gpu_img, image_crops[i].boxes, t);
-      }
-    }
-  }
+  // --- Phase 4 (opt-in): layout + CUA router (table/formula) per page ---
+  // Engages only when the caller asked for layout AND the operator loaded
+  // a layout model — text-only batches pay zero layout/router cost.
+  if (want_layout && use_layout_ && layout_)
+    run_batch_layout_stage_(image_crops, want_reading_order, stream,
+                            all_results);
 
   // No cleanup needed — batch_img_bufs_ are pre-allocated and reused
 
   return all_results;
+}
+
+void OcrPipeline::run_batch_layout_stage_(
+    const std::vector<PaddleRec::ImageCrops> &image_crops,
+    bool want_reading_order, cudaStream_t stream,
+    std::vector<OcrPipelineResult> &outs) {
+  const int batch_n = static_cast<int>(image_crops.size());
+
+  // All det/rec GPU work is host-synced by this point (run_multi syncs
+  // internally), but table/formula streams gate on det_only_event_, so
+  // record it on the caller's stream to give them a valid ordering point.
+  CUDA_CHECK(cudaEventRecord(det_only_event_, stream));
+
+  if (pdf_only_) {
+    // Every page is the same rendered size, so layout runs as a single
+    // batched TRT execute (engine profile {1..kMaxBatch, 3, 800, 800})
+    // instead of batch_n sequential executes.
+    std::vector<GpuImage> gpu_imgs;
+    std::vector<std::pair<int,int>> dims;
+    gpu_imgs.reserve(batch_n); dims.reserve(batch_n);
+    for (int i = 0; i < batch_n; ++i) {
+      gpu_imgs.push_back(image_crops[i].img);
+      dims.emplace_back(image_crops[i].img.rows, image_crops[i].img.cols);
+    }
+    if (layout_->enqueue_batch(gpu_imgs, dims, layout_stream_)) {
+      auto all_layout = layout_->collect_batch();  // one entry per image
+      PipelineTimer t;
+      for (int i = 0; i < batch_n; ++i) {
+        outs[i].layout = std::move(all_layout[i]);
+        dispatch_router_(outs[i], gpu_imgs[i], image_crops[i].boxes, t);
+      }
+    }
+  } else {
+    for (int i = 0; i < batch_n; i++) {
+      const GpuImage &gpu_img = image_crops[i].img;
+      // collect() only after a successful enqueue — on failure it would
+      // sync the stale d2h_event_ of the last successful execute and hand
+      // this page the PREVIOUS page's boxes (which the router would then
+      // crop at wrong coordinates on the wrong image).
+      if (!layout_->enqueue(gpu_img, gpu_img.rows, gpu_img.cols,
+                            layout_stream_))
+        continue;
+      outs[i].layout = layout_->collect();
+      PipelineTimer t;
+      dispatch_router_(outs[i], gpu_img, image_crops[i].boxes, t);
+    }
+  }
+
+  // Reading order — same contract as run_with_layout: helper handles
+  // orphan results (missing layout match) via synthetic XY-cut entries.
+  if (!want_reading_order)
+    return;
+  for (auto &out : outs) {
+    if (out.layout.empty()) continue;
+    turbo_ocr::assign_layout_ids(out.results, out.layout);
+    out.reading_order =
+        turbo_ocr::layout::assign_reading_order_for_results(out.results,
+                                                            out.layout);
+  }
 }

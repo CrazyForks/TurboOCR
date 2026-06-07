@@ -53,6 +53,14 @@ public:
                      const std::string &formula_onnx,
                      const std::string &formula_tokenizer_json);
 
+  // PDF-only hybrid mode: static batched det at the fixed render size +
+  // batched layout; rec stays the dynamic 5-bucket engine and cls is
+  // skipped entirely (rendered PDF pages are upright by construction).
+  // Call once after init() with the validated ServerConfig values —
+  // the pipeline and its stages never read TURBO_OCR_PDF_* env directly,
+  // so the engine profile and the runtime path can't disagree.
+  void enable_pdf_only_mode(int batch, int page_h, int page_w);
+
   // IOcrPipeline interface — delegates to stream-aware overloads with stream=0
   void warmup() override { warmup_gpu(0); }
   [[nodiscard]] std::vector<OCRResultItem> run(const cv::Mat &img) override { return run(img, 0); }
@@ -106,9 +114,24 @@ public:
   // Useful for callers that want to decode directly into the pipeline's GPU buffer.
   [[nodiscard]] std::pair<void *, size_t> ensure_gpu_buf(int rows, int cols);
 
-  // Batch: process multiple images, return results per image
+  // Batch: process multiple images, return text results per image.
+  // Delegates to run_batch_with_layout with want_layout=false, so
+  // text-only batches pay zero layout/router cost.
   [[nodiscard]] std::vector<std::vector<OCRResultItem>>
   run_batch(const std::vector<cv::Mat> &imgs, cudaStream_t stream = 0);
+
+  // Batch counterpart of run_with_layout: batched det (static-shape in
+  // pdf_only mode), cross-image batched rec, and — when want_layout —
+  // layout (one batched TRT execute in pdf_only mode) + CUA router per
+  // page. Returns full per-page results: text, layout, tables, formulas,
+  // and reading order when requested. Callers should chunk at most
+  // kMaxBatchImages images per call (extra images are dropped with a
+  // warning, same contract as run_batch).
+  [[nodiscard]] std::vector<OcrPipelineResult>
+  run_batch_with_layout(const std::vector<cv::Mat> &imgs,
+                        cudaStream_t stream = 0,
+                        bool want_layout = false,
+                        bool want_reading_order = false);
 
 private:
   std::unique_ptr<detection::PaddleDet> det_;
@@ -118,6 +141,13 @@ private:
 
   bool use_cls_ = false;
   bool use_layout_ = false;
+
+  // PDF-only hybrid mode (see enable_pdf_only_mode). batch/page dims are
+  // the static det engine's only accepted profile shape.
+  bool pdf_only_ = false;
+  int pdf_batch_ = 0;
+  int pdf_page_h_ = 0;
+  int pdf_page_w_ = 0;
 
   // Shared GPU upload: wait for previous rec, toggle double-buffer, grow-only
   // realloc, pinned staging memcpy, async H2D. Used by run_with_layout and
@@ -204,6 +234,16 @@ private:
                         const GpuImage &gpu_img,
                         const std::vector<Box> &boxes,
                         PipelineTimer &timer);
+
+  // Phase 4 of run_batch_with_layout: layout (one batched TRT execute in
+  // pdf_only mode, per-image otherwise), CUA router dispatch, and reading-
+  // order assignment. `image_crops[i].img` is page i on GPU; `.boxes` are
+  // the det boxes recognition ran on. Caller guarantees layout_ is loaded.
+  void run_batch_layout_stage_(
+      const std::vector<recognition::PaddleRec::ImageCrops> &image_crops,
+      bool want_reading_order,
+      cudaStream_t stream,
+      std::vector<OcrPipelineResult> &outs);
 };
 
 } // namespace turbo_ocr::pipeline

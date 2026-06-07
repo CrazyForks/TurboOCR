@@ -1,6 +1,9 @@
 #include "turbo_ocr/pdf/page_image_encoder.h"
 
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -8,7 +11,45 @@
 // libjpeg-turbo C API — faster than OpenCV's JPEG path for BGR images.
 #include <turbojpeg.h>
 
+#ifndef USE_CPU_ONLY
+#include "turbo_ocr/encode/nvjpeg_encoder.h"
+#endif
+
 namespace turbo_ocr::pdf {
+
+#ifndef USE_CPU_ONLY
+namespace {
+// GPU JPEG encode is opt-out via TURBO_PDF_IMAGE_ENCODER=cpu (validated to
+// {cpu, gpu} at startup by ServerConfig). Default is the GPU path so a
+// CPU-starved host offloads entropy coding off its scarce core.
+bool gpu_jpeg_enabled() {
+  static const bool enabled = [] {
+    const char *e = std::getenv("TURBO_PDF_IMAGE_ENCODER");
+    return !(e && std::strcmp(e, "cpu") == 0);
+  }();
+  return enabled;
+}
+
+// Encode BGR -> JPEG on the GPU. One encoder per worker thread (nvJPEG encoder
+// state is single-threaded). Returns empty on any failure -> CPU fallback.
+std::vector<uint8_t> encode_jpeg_gpu(const cv::Mat &bgr, int quality) {
+  static thread_local turbo_ocr::encode::NvJpegEncoder enc;
+  if (!enc.available()) return {};
+  auto out = enc.encode(bgr, quality);
+  static std::atomic<bool> logged{false};
+  if (!out.empty() && !logged.exchange(true))
+    std::cerr << "[NvJpegEnc] page-image JPEG encode running on GPU (nvJPEG)\n";
+  return out;
+}
+
+void note_cpu_jpeg_fallback() {
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true))
+    std::cerr << "[NvJpegEnc] page-image JPEG encode using CPU (libjpeg-turbo)\n";
+}
+} // namespace
+#endif
+
 
 PageImageFormat parse_page_image_format(const char *s) noexcept {
   if (!s) return PageImageFormat::Png;
@@ -69,6 +110,15 @@ std::vector<uint8_t> encode_page_image(const cv::Mat &bgr,
   const cv::Mat &src = maybe_resize(bgr, opts.max_side, resized_tmp);
 
   if (opts.format == PageImageFormat::Jpeg) {
+#ifndef USE_CPU_ONLY
+    // GPU path: nvJPEG entropy-codes on the device, leaving the CPU core free
+    // for PDF rasterization. Falls through to libjpeg-turbo on any failure.
+    if (gpu_jpeg_enabled()) {
+      std::vector<uint8_t> gpu_out = encode_jpeg_gpu(src, opts.quality);
+      if (!gpu_out.empty()) return gpu_out;
+    }
+    note_cpu_jpeg_fallback();
+#endif
     // libjpeg-turbo fast path: BGR → JPEG in one call, no intermediate copy.
     tjhandle tj = tjInitCompress();
     if (!tj) return {};

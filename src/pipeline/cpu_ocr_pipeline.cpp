@@ -9,6 +9,7 @@
 
 #include "turbo_ocr/common/box.h"
 #include "turbo_ocr/common/serialization.h"
+#include "turbo_ocr/common/stage_profiler.h"
 #include "turbo_ocr/layout/reading_order.h"
 
 namespace turbo_ocr::pipeline {
@@ -56,21 +57,36 @@ void CpuOcrPipeline::warmup() {
 }
 
 std::vector<OCRResultItem> CpuOcrPipeline::run(const cv::Mat &img) {
+  namespace prof = turbo_ocr::prof;
+
   // Detection
-  auto boxes = det_->run(img);
+  std::vector<Box> boxes;
+  {
+    prof::Scope _s(prof::DET);
+    boxes = det_->run(img);
+  }
 
   // Sort boxes top-to-bottom, left-to-right
-  sorted_boxes(boxes);
+  {
+    prof::Scope _s(prof::SORT);
+    sorted_boxes(boxes);
+  }
 
   // Optional angle classification -- only classify if any box looks vertical
   if (use_cls_ && cls_ && std::ranges::any_of(boxes, is_vertical_box)) {
+    prof::Scope _s(prof::CLS);
     cls_->run(img, boxes);
   }
 
   // Recognition
-  auto rec_results = rec_->run(img, boxes);
+  std::vector<std::pair<std::string, float>> rec_results;
+  {
+    prof::Scope _s(prof::REC);
+    rec_results = rec_->run(img, boxes);
+  }
 
   // Combine (filter by drop_score)
+  prof::Scope _scombine(prof::COMBINE);
   constexpr float kDropScore = turbo_ocr::kDropScore;
   std::vector<OCRResultItem> final_results;
   final_results.reserve(boxes.size());
@@ -105,8 +121,10 @@ OcrPipelineResult CpuOcrPipeline::run_with_layout(const cv::Mat &img,
                                                     bool want_reading_order) {
   OcrPipelineResult out;
   out.results = run(img);
-  if (want_layout && layout_)
+  if (want_layout && layout_) {
+    turbo_ocr::prof::Scope _s(turbo_ocr::prof::LAYOUT);
     out.layout = layout_->run(img);
+  }
 
   // Reading-order over layout regions, with synthetic XY-cut entries
   // for orphan results (results whose centroid falls outside every

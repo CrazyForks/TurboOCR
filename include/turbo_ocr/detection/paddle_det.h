@@ -24,6 +24,22 @@ public:
   /// Load a TensorRT detection engine and allocate GPU buffers.
   [[nodiscard]] bool load_model(const std::string &model_path);
 
+  /// PDF-only static-engine mode: lock run_batch to the single profile
+  /// shape {batch, 3, page_h, page_w} the cached det_pdf_static engine
+  /// was built with. Must be called once after load_model(); grows the
+  /// batch + CCL buffers when the fixed page exceeds the DET_MAX_SIDE²
+  /// sizing they were allocated with (e.g. default 1280×960 > 960²).
+  /// Values come from the validated ServerConfig — never read from env
+  /// here, so the engine profile and the runtime path can't disagree.
+  void set_pdf_static_profile(int batch, int page_h, int page_w);
+
+  /// PDF-only static-engine warmup: issue one inference at exactly the
+  /// set_pdf_static_profile shape (the only shape the static engine
+  /// accepts) on dummy device data. Caller-owned stream; the call
+  /// syncs the stream once before returning. Returns false on a TRT
+  /// infer error or when no static profile is set, true otherwise.
+  [[nodiscard]] bool warmup_pdf_static(cudaStream_t stream = 0);
+
   // Takes GpuImage directly - no double upload
   [[nodiscard]] std::vector<Box> run(const GpuImage &gpu_img, int orig_h, int orig_w,
                                      cudaStream_t stream = 0);
@@ -54,6 +70,11 @@ private:
   int gpu_ccl_mode_ = 1;
   float box_thresh_ = kDetDbBoxThresh;
   float unclip_scale_ = 1.0f;
+
+  // PDF-only static profile (0 = disabled, dynamic-shape engine).
+  int pdf_static_batch_ = 0;
+  int pdf_static_h_ = 0;
+  int pdf_static_w_ = 0;
 
   std::unique_ptr<engine::TrtEngine> engine_;
 

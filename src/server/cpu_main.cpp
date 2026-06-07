@@ -11,12 +11,14 @@
 
 #include <drogon/HttpAppFramework.h>
 #include <json/json.h>
+#include <opencv2/imgproc.hpp>
 
 #include "turbo_ocr/common/logger.h"
 #include "turbo_ocr/decode/image_dims.h"
 #include "turbo_ocr/decode/image_config.h"
 
 #include "turbo_ocr/pdf/pdf_extraction_mode.h"
+#include "turbo_ocr/common/stage_profiler.h"
 #include "turbo_ocr/pdf/pdf_text_layer.h"
 #include "turbo_ocr/pipeline/cpu_pipeline_pool.h"
 #include "turbo_ocr/render/pdf_renderer.h"
@@ -165,19 +167,31 @@ int main(int argc, char **argv) {
   turbo_ocr::server::register_metrics_route();
 
   // Single readiness probe shared by HTTP /health/ready and gRPC Health.
-  // Acquires a pool handle to verify the work pool isn't wedged; cheap
-  // and matches what the GPU binary does at /health/ready.
+  // Bounded try-acquire (the CPU pool's acquire() is unbounded, so a plain
+  // acquire could never return NOT-ready and would block the probe forever
+  // under saturation). 250ms is long enough to ride out a brief burst but
+  // short enough to answer the k8s probe before its timeout.
   auto readiness = [&pool]() -> bool {
     try {
-      auto handle = pool->acquire();
-      (void)handle;
-      return true;
+      return pool->try_acquire_for(std::chrono::milliseconds(250)).has_value();
     } catch (...) {
       return false;
     }
   };
   turbo_ocr::routes::register_common_routes(work_pool, infer, decode,
                                              layout_available, readiness);
+
+  // --- /profile endpoint: read+reset per-stage timing (PROFILE_STAGES=1) ---
+  drogon::app().registerHandler(
+      "/profile",
+      [](const drogon::HttpRequestPtr &,
+         std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
+        auto resp = drogon::HttpResponse::newHttpResponse();
+        resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+        resp->setBody(turbo_ocr::prof::dump_json_and_reset());
+        callback(resp);
+      },
+      {drogon::Get});
 
   // --- /ocr/pixels endpoint (raw BGR pixel data, zero decode overhead) ---
   drogon::app().registerHandler(
@@ -245,6 +259,11 @@ int main(int argc, char **argv) {
             cv::Mat img(height, width,
                         channels == 3 ? CV_8UC3 : CV_8UC1,
                         const_cast<char *>(req->body().data()));
+            // The detector is BGR-only; a 1-channel Mat hits a nullptr
+            // memcpy in CpuPaddleDet's cv::split path (SIGSEGV). Expand
+            // grayscale up front, matching the GPU /ocr/pixels handler.
+            if (channels == 1)
+              cv::cvtColor(img, img, cv::COLOR_GRAY2BGR);
             auto inf = infer(img, opts);
             cb(turbo_ocr::server::json_response(
                 turbo_ocr::emit_results_json(inf.results, inf.layout, inf.reading_order, opts.want_blocks)));
@@ -262,12 +281,15 @@ int main(int argc, char **argv) {
 
   const turbo_ocr::pdf::PdfMode default_pdf_mode = cfg.default_pdf_mode;
 
-  turbo_ocr::routes::register_pdf_route(work_pool, infer, pdf_renderer, default_pdf_mode, layout_available);
+  turbo_ocr::routes::register_pdf_route(work_pool, infer, pdf_renderer, default_pdf_mode, layout_available,
+                                        cfg.max_pdf_pages);
 
   // --- /ocr/batch endpoint (CPU version) ---
+  const int max_batch_images = cfg.max_batch_images;
   drogon::app().registerHandler(
       "/ocr/batch",
-      [&work_pool, &pool, pool_size, &decode, layout_available](
+      [&work_pool, &pool, pool_size, &decode, layout_available,
+       max_batch_images](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
@@ -297,14 +319,27 @@ int main(int argc, char **argv) {
           callback(turbo_ocr::server::error_response(drogon::k400BadRequest, "EMPTY_BATCH", "Empty images array"));
           return;
         }
+        // Cap before O(n) per-slot allocations (see GPU route): an unbounded
+        // images[] is a memory-amplification OOM lever.
+        if (n > static_cast<size_t>(max_batch_images)) {
+          callback(turbo_ocr::server::error_response(drogon::k400BadRequest, "BATCH_TOO_LARGE",
+              std::format("images array has {} entries, max is {}", n, max_batch_images)));
+          return;
+        }
 
-        // Pre-decode base64
+        // Pre-decode base64. asString() throws Json::LogicError on a
+        // non-string element ({}/[]), so guard the type — a malformed slot
+        // becomes an empty string the per-slot path tags, not a crash.
         auto raw_bytes = std::make_shared<std::vector<std::string>>(n);
-        for (size_t i = 0; i < n; ++i)
-          (*raw_bytes)[i] = base64_decode(images_json[static_cast<int>(i)].asString());
+        for (size_t i = 0; i < n; ++i) {
+          const auto &el = images_json[static_cast<int>(i)];
+          if (el.isString())
+            (*raw_bytes)[i] = base64_decode(el.asString());
+        }
 
         turbo_ocr::server::submit_work(work_pool, std::move(callback),
             [raw_bytes, n, &pool, pool_size, &decode, opts](turbo_ocr::server::DrogonCallback &cb) {
+         turbo_ocr::server::run_with_error_handling(cb, "/ocr/batch", [&] {
           const bool want_layout = opts.want_layout;
           // Same MAX_IMAGE_DIM cap as /ocr, /ocr/raw, /ocr/pixels.
           const int kMaxImageDim = turbo_ocr::decode::max_image_dim();
@@ -450,6 +485,7 @@ int main(int argc, char **argv) {
           }
           json_str += "]}";
           cb(turbo_ocr::server::json_response(std::move(json_str)));
+         });
         });
       },
       {drogon::Post});

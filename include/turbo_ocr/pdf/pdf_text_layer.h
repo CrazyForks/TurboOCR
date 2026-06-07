@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include "turbo_ocr/common/types.h"
+
 namespace turbo_ocr::pdf {
 
 // One "rectangle" as PDFium merges them via FPDFText_CountRects /
@@ -91,5 +93,14 @@ struct SanityVerdict {
 [[nodiscard]] SanityVerdict passes_sanity_check(
     const std::string &text,
     float box_width_pt, float box_height_pt);
+
+// mode=auto_verified core: for every OCR result, look up the native text
+// inside its detection box (rendered-pixel space at `dpi`) and replace the
+// OCR text with it when the sanity check accepts — the native layer then
+// becomes the trusted source for that region (source="pdf", confidence 1).
+// Shared by the HTTP and gRPC PDF routes (single-page and batched paths).
+void verify_results_with_text_layer(std::vector<OCRResultItem> &results,
+                                    const PdfDocument &doc, int page_index,
+                                    int dpi);
 
 } // namespace turbo_ocr::pdf

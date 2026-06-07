@@ -99,10 +99,15 @@ private:
 };
 
 /// Factory: create, init, warmup GPU pipelines and wrap in a dispatcher.
+/// `pdf_only_batch > 0` enables the PDF-only hybrid mode on every pipeline
+/// (static batched det at {batch, 3, page_h, page_w}; values from the
+/// validated ServerConfig) before warmup, so the static-engine warmup path
+/// is taken instead of the dynamic-shape one.
 [[nodiscard]] inline std::unique_ptr<PipelineDispatcher> make_pipeline_dispatcher(
     int pool_size, const std::string &det_model, const std::string &rec_model,
     const std::string &rec_dict, const std::string &cls_model = "",
-    const std::string &layout_model = "") {
+    const std::string &layout_model = "",
+    int pdf_only_batch = 0, int pdf_only_page_h = 0, int pdf_only_page_w = 0) {
 
   if (pool_size <= 0) [[unlikely]]
     throw std::invalid_argument(
@@ -115,6 +120,9 @@ private:
       std::cerr << std::format("[Dispatcher] Failed to init GPU pipeline {} of {}", i, pool_size) << '\n';
       continue;
     }
+    if (pdf_only_batch > 0)
+      pipeline->enable_pdf_only_mode(pdf_only_batch, pdf_only_page_h,
+                                     pdf_only_page_w);
     if (!layout_model.empty()) {
       if (!pipeline->load_layout_model(layout_model)) {
         throw turbo_ocr::ModelLoadError(std::format(

@@ -37,6 +37,35 @@ void cuda_fused_resize_normalize_layout(const GpuImage &src, float *dst_chw,
                                          int dst_w, int dst_h,
                                          cudaStream_t stream = 0);
 
+// Sub-rect overload for cell-det. Resizes the sub-rect (rect_x, rect_y,
+// rect_w, rect_h) of `src` to dst_w × dst_h with `pixel / 255` normalization
+// (mean=0, std=1), BGR CHW. Implementation lives in src/table/kernels/.
+void cuda_fused_resize_normalize_layout(const GpuImage &src,
+                                        int rect_x, int rect_y,
+                                        int rect_w, int rect_h,
+                                        float *dst_chw,
+                                        int dst_w, int dst_h,
+                                        cudaStream_t stream = 0);
+
+// TableCls preprocess: from sub-rect of src GpuImage, resize-short(256) →
+// center-crop(224) → ImageNet normalize → BGR CHW into dst_chw[3*224*224].
+// Implementation in src/table/kernels/table_kernels.cu.
+void cuda_fused_table_cls_pre(const GpuImage &src,
+                              int rect_x, int rect_y,
+                              int rect_w, int rect_h,
+                              float *dst_chw,
+                              cudaStream_t stream = 0);
+
+// SLANeXt preprocess: from sub-rect, ResizeByLong(488) preserve AR →
+// ImageNet normalize → bottom-right pad with PAD_VALUE=(0-mean)/std →
+// BGR CHW into dst_chw[3*488*488].
+// Implementation in src/table/kernels/table_kernels.cu.
+void cuda_fused_slanext_pre(const GpuImage &src,
+                            int rect_x, int rect_y,
+                            int rect_w, int rect_h,
+                            float *dst_chw,
+                            cudaStream_t stream = 0);
+
 // Batched fused resize + normalize + CHW for detection
 // Processes N images (each with different src dimensions) into a single
 // batched CHW tensor [N, 3, dst_h, dst_w].

@@ -1,0 +1,11 @@
+# Integration A/B sweep. First line = reference (all opts off -> must reproduce baseline).
+# Format: label KEY=VAL ...   (cpu_sweep.py runs each, gates accuracy vs first row)
+baseline_off PIPELINE_POOL_SIZE=4
+shared_pool PIPELINE_POOL_SIZE=4 ORT_SHARED_POOL=1
+rec_batch8 PIPELINE_POOL_SIZE=4 REC_BATCH_N=8
+rec_batch16 PIPELINE_POOL_SIZE=4 REC_BATCH_N=16
+cls_batch PIPELINE_POOL_SIZE=4 CLS_BATCH=1
+batch_plus_pool PIPELINE_POOL_SIZE=4 REC_BATCH_N=8 CLS_BATCH=1 ORT_SHARED_POOL=1
+batch_pool_p7 PIPELINE_POOL_SIZE=7 ORT_NUM_THREADS=2 REC_BATCH_N=8 CLS_BATCH=1
+int8_rec PIPELINE_POOL_SIZE=4 REC_BATCH_N=8 CLS_BATCH=1 REC_ONNX=models/rec.int8.static.onnx
+full_stack PIPELINE_POOL_SIZE=7 ORT_NUM_THREADS=2 REC_BATCH_N=8 CLS_BATCH=1 ORT_SHARED_POOL=1 REC_ONNX=models/rec.int8.static.onnx

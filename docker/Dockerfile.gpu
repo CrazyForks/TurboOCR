@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nginx \
     gosu \
     libwebp-dev \
+    libturbojpeg0-dev \
     libgrpc++-dev \
     libprotobuf-dev \
     protobuf-compiler-grpc \
@@ -31,7 +32,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     uuid-dev \
     zlib1g-dev \
     libssl-dev \
-    libturbojpeg0-dev \
     libc-ares-dev \
     git \
     wget \

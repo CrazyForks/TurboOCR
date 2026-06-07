@@ -30,6 +30,13 @@ class ImageDecodeError : public OcrError {
   using OcrError::OcrError;
 };
 
+// Decoded/declared image dimensions exceed MAX_IMAGE_DIM. Distinct from
+// ImageDecodeError so the routes can map it to the stable DIMENSIONS_TOO_LARGE
+// code (same as the pre/post-decode sniffs) instead of IMAGE_DECODE_FAILED.
+class ImageTooLargeError : public OcrError {
+  using OcrError::OcrError;
+};
+
 class PdfRenderError : public OcrError {
   using OcrError::OcrError;
 };

@@ -54,10 +54,27 @@ public:
   [[nodiscard]] std::vector<LayoutBox>
   collect(float score_threshold = 0.3f);
 
+  // Batched variant for pdf_only fixed-resolution mode: every page renders
+  // to the same dimensions, so layout can run as a single TRT execute at
+  // {B, 3, 800, 800}. Lazy-allocates the buffers grow-only when first
+  // called with batch>1 (so non-pdf workloads pay zero extra VRAM).
+  [[nodiscard]] bool
+  enqueue_batch(const std::vector<GpuImage> &gpu_imgs,
+                 const std::vector<std::pair<int,int>> &orig_dims,
+                 cudaStream_t stream);
+
+  // Counterpart to enqueue_batch. Returns one LayoutBox vector per image,
+  // in input order. Output is empty for any image whose detector returned
+  // no boxes above `score_threshold`.
+  [[nodiscard]] std::vector<std::vector<LayoutBox>>
+  collect_batch(float score_threshold = 0.3f);
+
   static constexpr int kInputSize = 800;
   // PP-DocLayoutV3's decoder emits up to 300 queries per image. Most FUNSD
   // pages produce 10-30 detections after score filtering.
   static constexpr int kMaxDetections = 300;
+  // Batched profile MAX from onnx_to_trt.cpp: {1-4-8, 3, 800, 800}.
+  static constexpr int kMaxBatch = 8;
 
 private:
   std::unique_ptr<engine::TrtEngine> engine_;
@@ -71,6 +88,11 @@ private:
   int pending_orig_h_ = 0;
   int pending_orig_w_ = 0;
   cudaStream_t pending_stream_ = nullptr;
+
+  // Per-enqueue_batch state that collect_batch() needs.
+  int pending_batch_ = 0;
+  std::vector<std::pair<int,int>> pending_batch_dims_;
+  int current_buf_batch_ = 1;  // tracks the batch size buffers are sized for
 
   // Device buffers sized for batch=1 inference. If we later want to use the
   // batch=4/8 profile for /ocr/batch, these get re-allocated to the max
@@ -101,6 +123,9 @@ private:
   std::string name_out2_;   // the mask tensor we ignore
 
   [[nodiscard]] bool init_buffers();
+  // Grow GPU + pinned buffers so they fit `batch` images. No-op if buffers
+  // are already at least that size. Called lazily from enqueue_batch.
+  [[nodiscard]] bool resize_buffers_for(int batch);
   [[nodiscard]] bool discover_tensor_names();
 };
 

@@ -58,6 +58,16 @@ struct ServerConfig {
   int grpc_cqs           = 10;            // GRPC_CQS / --grpc-cqs
   int grpc_batch_workers = 8;             // GRPC_BATCH_WORKERS / --grpc-batch-workers
   int max_pdf_pages      = 2000;          // MAX_PDF_PAGES / --max-pdf-pages
+  // Max images per /ocr/batch (HTTP + gRPC RecognizeBatch) request. The
+  // handlers allocate O(n) per-slot vectors + an n*1KB JSON reserve before
+  // touching any image, so an unbounded array is an OOM lever — reject over
+  // this with 400. MAX_BATCH_IMAGES.
+  int max_batch_images   = 1024;
+  // Max rendered pixels per PDF page (width*height after mediabox*dpi). Caps
+  // both the rasterized buffer and any inline page image, independent of the
+  // per-side decode_ppm cap. ~33.5M = 16384*2048; a full 16384² page is ~268M
+  // and would be rejected. MAX_PDF_PAGE_PIXELS.
+  int64_t max_pdf_page_pixels = 40000000;  // ~40 MP (e.g. 5000x8000)
   GrpcResponseMode grpc_response_mode = GrpcResponseMode::json_bytes;
 
   // ---- Model paths ----
@@ -75,6 +85,13 @@ struct ServerConfig {
   std::string trt_engine_cache;        // TRT_ENGINE_CACHE (empty = "~/.cache/turbo-ocr")
   int         max_image_dim   = 16384; // MAX_IMAGE_DIM [64, 65535]
 
+  // ---- Page-image export / PDF render tuning (validated here; consumed by
+  //      the encode + render subsystems via the same env vars they read) ----
+  // page_image_encoder is honored only by the GPU build's JPEG page-image
+  // path; on the CPU-only build it is reported but inert (no nvJPEG present).
+  std::string page_image_encoder = "gpu";  // TURBO_PDF_IMAGE_ENCODER {cpu, gpu}
+  std::string ppm_swap           = "simd"; // TURBO_PPM_SWAP {simd, scalar}
+
   // ---- Logging ----
   std::string log_level  = "info";     // LOG_LEVEL {debug, info, warn, error}
   std::string log_format = "json";     // LOG_FORMAT {json, text}
@@ -84,6 +101,27 @@ struct ServerConfig {
   bool        layout_disabled   = false;
   pdf::PdfMode default_pdf_mode = pdf::PdfMode::Ocr;
   bool        default_pdf_mode_was_set = false;
+
+  // ---- PDF-only hybrid mode -----------------------------------------------
+  // When `pdf_only` is true, the DET engine is built with a STATIC input
+  // shape (min==opt==max) at {pdf_batch, 3, pdf_page_h, pdf_page_w} — TRT
+  // specializes tactics for one shape with zero dynamic-shape overhead at
+  // execute time. Pages render at `pdf_dpi` (the /ocr/pdf default; an
+  // explicit ?dpi= still wins) and det resize-fits each page into the
+  // static shape, so pick page_h/w to match pdf_dpi renders of the
+  // dominant page size. REC stays the dynamic 5-bucket engine (a static
+  // single-width rec squishes wide lines and tanks recall) and CLS is
+  // skipped entirely (rendered pages are upright by construction).
+  //   TURBO_OCR_PDF_ONLY=1                  enable
+  //   TURBO_OCR_PDF_DPI=150                 default render DPI for /ocr/pdf
+  //   TURBO_OCR_PDF_PAGE_H=1280  PAGE_W=960 static det dims (multiple of 32)
+  //   TURBO_OCR_PDF_BATCH=8                 static det batch dim (≤ the
+  //                                          pipeline's 8-image batch chunk)
+  bool pdf_only       = false;
+  int  pdf_dpi        = 150;
+  int  pdf_page_h     = 1280;
+  int  pdf_page_w     = 960;
+  int  pdf_batch      = 8;
 
   /// Effective profile this config was loaded for. Set by from_env.
   Profile profile = build_profile();
@@ -197,6 +235,8 @@ inline std::string ServerConfig::to_json() const {
   j += ",\"grpc_cqs\":"          + std::to_string(grpc_cqs);
   j += ",\"grpc_batch_workers\":" + std::to_string(grpc_batch_workers);
   j += ",\"max_pdf_pages\":"     + std::to_string(max_pdf_pages);
+  j += ",\"max_batch_images\":"  + std::to_string(max_batch_images);
+  j += ",\"max_pdf_page_pixels\":" + std::to_string(max_pdf_page_pixels);
   j += ",\"grpc_response_mode\":" + esc(detail::grpc_mode_str(grpc_response_mode));
   j += ",\"det_onnx\":"          + esc(det_onnx);
   j += ",\"cls_onnx\":"          + esc(cls_onnx);
@@ -207,11 +247,18 @@ inline std::string ServerConfig::to_json() const {
   j += ",\"ocr_lang\":"          + esc(ocr_lang_value);
   j += ",\"disable_angle_cls\":" + std::string(disable_angle_cls ? "true" : "false");
   j += ",\"layout_disabled\":"   + std::string(layout_disabled ? "true" : "false");
+  j += ",\"pdf_only\":"          + std::string(pdf_only ? "true" : "false");
+  j += ",\"pdf_dpi\":"           + std::to_string(pdf_dpi);
+  j += ",\"pdf_page_h\":"        + std::to_string(pdf_page_h);
+  j += ",\"pdf_page_w\":"        + std::to_string(pdf_page_w);
+  j += ",\"pdf_batch\":"         + std::to_string(pdf_batch);
   j += ",\"default_pdf_mode\":"  + esc(pdf::mode_name(default_pdf_mode));
   j += ",\"det_max_side\":"      + std::to_string(det_max_side);
   j += ",\"trt_opt_level\":"     + std::to_string(trt_opt_level);
   j += ",\"trt_engine_cache\":"  + esc(trt_engine_cache);
   j += ",\"max_image_dim\":"     + std::to_string(max_image_dim);
+  j += ",\"page_image_encoder\":" + esc(page_image_encoder);
+  j += ",\"ppm_swap\":"          + esc(ppm_swap);
   j += ",\"log_level\":"         + esc(log_level);
   j += ",\"log_format\":"        + esc(log_format);
   j += "}";
@@ -257,6 +304,9 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
   c.grpc_cqs           = env_int_strict("GRPC_CQS", 10, 1, 1024, c.errors);
   c.grpc_batch_workers = env_int_strict("GRPC_BATCH_WORKERS", 8, 1, 256, c.errors);
   c.max_pdf_pages      = env_int_strict("MAX_PDF_PAGES", 2000, 1, 100000, c.errors);
+  c.max_batch_images   = env_int_strict("MAX_BATCH_IMAGES", 1024, 1, 1000000, c.errors);
+  c.max_pdf_page_pixels = static_cast<int64_t>(
+      env_int_strict("MAX_PDF_PAGE_PIXELS_MP", 40, 1, 268, c.errors)) * 1000000;
 
   {
     auto mode_s = env_choice_strict("GRPC_RESPONSE_MODE", "json_bytes",
@@ -279,6 +329,10 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
   c.trt_opt_level      = env_int_strict("TRT_OPT_LEVEL", 5,     0,  5,     c.errors);
   c.trt_engine_cache   = env_or("TRT_ENGINE_CACHE", "");
   c.max_image_dim      = env_int_strict("MAX_IMAGE_DIM", 16384, 64, 65535, c.errors);
+  c.page_image_encoder = env_choice_strict("TURBO_PDF_IMAGE_ENCODER", "gpu",
+      {"cpu", "gpu"}, c.errors);
+  c.ppm_swap           = env_choice_strict("TURBO_PPM_SWAP", "simd",
+      {"simd", "scalar"}, c.errors);
   c.log_level  = env_choice_strict("LOG_LEVEL",  "info",
       {"debug", "info", "warn", "error"}, c.errors);
   c.log_format = env_choice_strict("LOG_FORMAT", "json",
@@ -286,6 +340,23 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
 
   c.disable_angle_cls = env_bool_strict("DISABLE_ANGLE_CLS", false, c.errors);
   c.layout_disabled   = env_bool_strict("DISABLE_LAYOUT",    false, c.errors);
+
+  // PDF-only hybrid mode (env-only by design — operators flip this at
+  // boot, not per-request). Defaults match A4 portrait at 150 DPI rounded
+  // to multiples of 32: 1280 × 960. Sizes outside [32, 4096] are rejected.
+  // pdf_batch is capped at 8 = the pipeline's batch chunk size — a larger
+  // static det batch dim could never be filled and would only pad.
+  c.pdf_only       = env_bool_strict("TURBO_OCR_PDF_ONLY", false, c.errors);
+  c.pdf_dpi        = env_int_strict("TURBO_OCR_PDF_DPI",        150,  50,  600,  c.errors);
+  c.pdf_page_h     = env_int_strict("TURBO_OCR_PDF_PAGE_H",     1280, 32,  4096, c.errors);
+  c.pdf_page_w     = env_int_strict("TURBO_OCR_PDF_PAGE_W",     960,  32,  4096, c.errors);
+  c.pdf_batch      = env_int_strict("TURBO_OCR_PDF_BATCH",      8,    1,   8,    c.errors);
+  if (c.pdf_only && (c.pdf_page_h % 32 != 0 || c.pdf_page_w % 32 != 0)) {
+    c.errors.push_back("TURBO_OCR_PDF_PAGE_H/_PAGE_W must each be a multiple "
+                       "of 32 (det engine requires it); got H=" +
+                       std::to_string(c.pdf_page_h) + " W=" +
+                       std::to_string(c.pdf_page_w));
+  }
   // ENABLE_LAYOUT removed — operators must migrate.
   if (env_present("ENABLE_LAYOUT")) {
     c.errors.push_back(
@@ -331,6 +402,7 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
     app.add_option("--grpc-cqs",            c.grpc_cqs,            "gRPC completion queue count")->capture_default_str()->check(CLI::Range(1, 1024));
     app.add_option("--grpc-batch-workers",  c.grpc_batch_workers,  "Parallel workers in gRPC RecognizeBatch")->capture_default_str()->check(CLI::Range(1, 256));
     app.add_option("--max-pdf-pages",       c.max_pdf_pages,       "Max pages per PDF request")->capture_default_str()->check(CLI::Range(1, 100000));
+    app.add_option("--max-batch-images",    c.max_batch_images,    "Max images per /ocr/batch request")->capture_default_str()->check(CLI::Range(1, 1000000));
 
     std::string grpc_mode_cli = (c.grpc_response_mode == GrpcResponseMode::structured)
                                   ? "structured" : "json_bytes";

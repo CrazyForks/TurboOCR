@@ -44,7 +44,8 @@ using decode::max_image_dim;
 }
 } // namespace
 
-void register_health_route(std::function<bool()> readiness_check) {
+void register_health_route(std::function<bool()> readiness_check,
+                           server::WorkPool *pool) {
   auto health_ok = [](const drogon::HttpRequestPtr &,
                       std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
     callback(server::make_response(drogon::k200OK, "ok"));
@@ -52,18 +53,34 @@ void register_health_route(std::function<bool()> readiness_check) {
   drogon::app().registerHandler("/health", health_ok, {drogon::Get});
   drogon::app().registerHandler("/health/live", health_ok, {drogon::Get});
 
-  // /health/ready — verifies the pipeline is actually responsive
+  // /health/ready — verifies the pipeline is actually responsive. The check
+  // may run a real GPU inference (cache miss), so offload it to the WorkPool
+  // when one is available; running it inline would block the event-loop
+  // thread for the GPU-queue-drain duration.
   auto ready_check = std::make_shared<std::function<bool()>>(std::move(readiness_check));
+  auto respond = [](server::DrogonCallback &cb, bool ready) {
+    if (ready) cb(server::make_response(drogon::k200OK, "ok"));
+    else       cb(server::error_response(drogon::k503ServiceUnavailable,
+                                          "NOT_READY", "Pipeline not ready"));
+  };
   drogon::app().registerHandler(
       "/health/ready",
-      [ready_check](const drogon::HttpRequestPtr &,
-                    std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
-        if (*ready_check && !(*ready_check)()) {
-          callback(server::error_response(drogon::k503ServiceUnavailable,
-              "NOT_READY", "Pipeline not ready"));
+      [ready_check, pool, respond](
+          const drogon::HttpRequestPtr &,
+          std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
+        const bool has_check = static_cast<bool>(*ready_check);
+        if (pool && has_check) {
+          server::submit_work(*pool, std::move(callback),
+              [ready_check, respond](server::DrogonCallback &cb) {
+            respond(cb, (*ready_check)());
+          });
           return;
         }
-        callback(server::make_response(drogon::k200OK, "ok"));
+        // No pool (cheap CPU check) or no check configured: run inline.
+        callback(has_check && !(*ready_check)()
+                     ? server::error_response(drogon::k503ServiceUnavailable,
+                                               "NOT_READY", "Pipeline not ready")
+                     : server::make_response(drogon::k200OK, "ok"));
       },
       {drogon::Get});
 }
@@ -179,7 +196,11 @@ void register_common_routes(server::WorkPool &pool,
                              const server::ImageDecoder &decode,
                              bool layout_available,
                              std::function<bool()> readiness_check) {
-  register_health_route(std::move(readiness_check));
+  // Forward the pool so /health/ready offloads the readiness probe off the
+  // event loop — the CPU readiness check calls pool->acquire(), which blocks
+  // on a condition variable (unbounded for the CPU pool) when all pipelines
+  // are busy; running it inline would wedge a Drogon IO thread under load.
+  register_health_route(std::move(readiness_check), &pool);
   register_ocr_base64_route(pool, infer, decode, layout_available);
   register_ocr_raw_route(pool, infer, decode, layout_available);
 }

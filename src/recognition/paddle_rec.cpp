@@ -350,7 +350,7 @@ PaddleRec::run_multi(const std::vector<ImageCrops> &image_crops,
                                 cur_batch * sizeof(int),
                                 cudaMemcpyHostToDevice, stream));
 
-    // Warp crops per source image
+    // Warp crops per source image.
     {
       size_t slot_stride = static_cast<size_t>(3) * rec_image_h_ * imgW;
       int j = 0;

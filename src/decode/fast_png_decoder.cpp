@@ -1,4 +1,5 @@
 #include "turbo_ocr/decode/fast_png_decoder.h"
+#include "turbo_ocr/decode/image_config.h"
 
 // Wuffs — Google's fastest PNG decoder (Apache 2.0 / MIT)
 // Single-file C library, used in Chrome
@@ -29,7 +30,10 @@ cv::Mat FastPngDecoder::decode(const unsigned char *data, std::size_t len) {
   uint32_t w = wuffs_base__pixel_config__width(&ic.pixcfg);
   uint32_t h = wuffs_base__pixel_config__height(&ic.pixcfg);
 
-  if (w == 0 || h == 0 || w > 16384 || h > 16384)
+  // Track the configurable cap (env MAX_IMAGE_DIM) so valid in-spec PNGs
+  // aren't falsely rejected when the operator raised the limit above 16384.
+  const uint32_t cap = static_cast<uint32_t>(decode::max_image_dim());
+  if (w == 0 || h == 0 || w > cap || h > cap)
     return {};
 
   // 4. Set up pixel buffer — decode directly to BGR (OpenCV CV_8UC3)

@@ -40,6 +40,20 @@ using turbo_ocr::detection::kDetMaxSideMin;
   return v;
 }
 
+// ---------- PDF-only fixed-resolution mode ----------------------------------
+// When the operator boots with TURBO_OCR_PDF_ONLY=1, the DET TRT engine is
+// built with a STATIC (min==opt==max) input profile at {pdf_batch, 3,
+// pdf_page_h, pdf_page_w} — TRT picks tactics optimal for that exact size
+// and elides every dynamic-shape branch at execute time. Pages render at
+// the pdf_dpi default and det resize-fits them into the static shape. Rec
+// stays dynamic 5-bucket and cls is skipped (hybrid mode — see ServerConfig).
+//
+// Same env vars + bounds as ServerConfig (which validates them and aborts
+// boot on errors before any engine builds, so these reads see sane values).
+[[nodiscard]] static int read_pdf_page_h() { return server::env_int("TURBO_OCR_PDF_PAGE_H", 1280, 32, 4096); }
+[[nodiscard]] static int read_pdf_page_w() { return server::env_int("TURBO_OCR_PDF_PAGE_W", 960,  32, 4096); }
+[[nodiscard]] static int read_pdf_batch()  { return server::env_int("TURBO_OCR_PDF_BATCH",  8,    1,  8); }
+
 static class BuildLogger : public nvinfer1::ILogger {
 public:
   void log(Severity severity, const char *msg) noexcept override {
@@ -119,6 +133,14 @@ std::string get_cached_engine_path(const std::string &onnx_path,
   // so each operator config gets its own engine (Triton/vLLM pattern).
   if (type == "det")
     key += ":dms" + std::to_string(read_det_max_side());
+  // PDF-only static det engine: the cache must distinguish between
+  // different fixed shapes / batches, so bake the page dims + batch into
+  // the cache key — a DPI change rebuilds rather than reusing stale.
+  if (type == "det_pdf_static") {
+    key += ":pdfh" + std::to_string(read_pdf_page_h()) +
+           ":pdfw" + std::to_string(read_pdf_page_w()) +
+           ":pdfb" + std::to_string(read_pdf_batch());
+  }
   // TRT_OPT_LEVEL changes which kernels TensorRT picks, so the produced
   // engine differs. Operators that toggle the level get separate cached
   // engines instead of silently reusing a stale one.
@@ -176,8 +198,19 @@ static bool build_engine(const std::string &onnx_path,
     size_t scaled = static_cast<size_t>((1ULL << 30) * scale);
     workspace_bytes = std::min(scaled, size_t(4ULL << 30));
     if (workspace_bytes < (1ULL << 30)) workspace_bytes = 1ULL << 30;
+  } else if (type == "slanext_wired" || type == "slanext_wireless" ||
+             type == "formula") {
+    workspace_bytes = 2ULL << 30;          // 2 GiB (plan 07 §5)
+  } else if (type == "det_pdf_static") {
+    // Static-shape PDF det engine: same workspace policy as dynamic det,
+    // scaled by the larger of the two PDF page dims (since both are fixed).
+    double side = std::max(read_pdf_page_h(), read_pdf_page_w());
+    double scale = (side / 960.0) * (side / 960.0);
+    size_t scaled = static_cast<size_t>((1ULL << 30) * scale);
+    workspace_bytes = std::min(scaled, size_t(4ULL << 30));
+    if (workspace_bytes < (1ULL << 30)) workspace_bytes = 1ULL << 30;
   } else {
-    workspace_bytes = 1ULL << 30;          // rec, cls
+    workspace_bytes = 1ULL << 30;          // rec, cls, table_cls, table_cell_*
   }
   config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, workspace_bytes);
   config->setFlag(nvinfer1::BuilderFlag::kFP16);
@@ -201,6 +234,20 @@ static bool build_engine(const std::string &onnx_path,
         nvinfer1::Dims4{1, 3, det_opt, det_opt});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
         nvinfer1::Dims4{1, 3, det_max, det_max});
+  } else if (type == "det_pdf_static") {
+    // PDF-only mode: every page is rendered to the SAME (H, W) at a fixed
+    // DPI, so we pin the profile to a single shape (min==opt==max) at the
+    // configured batch. TRT can fully specialize: no dynamic-shape branches
+    // at execute time, tactic search runs once for this exact shape.
+    const int B = read_pdf_batch();
+    const int H = read_pdf_page_h();
+    const int W = read_pdf_page_w();
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{B, 3, H, W});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{B, 3, H, W});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{B, 3, H, W});
   } else if (type == "rec") {
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
         nvinfer1::Dims4{1, 3, 48, 48});
@@ -235,6 +282,66 @@ static bool build_engine(const std::string &onnx_path,
         return false;
       }
     }
+  } else if (type == "table_cls") {
+    // PP-LCNet_x1_0_table_cls (224×224, 2 classes wired/wireless). Shape
+    // profile from turbostruct-rs/crates/turbostruct-engine/src/builder/
+    // profiles.rs::populate_table_cls (lines 166-183).
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{1, 3, 224, 224});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{1, 3, 224, 224});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{8, 3, 224, 224});
+  } else if (type == "table_cell_wired" || type == "table_cell_wireless") {
+    // RT-DETR-L_{wired,wireless}_table_cell_det — same triple-input contract
+    // as PP-DocLayoutV3 but at 640×640. Profile from profiles.rs::
+    // populate_table_cell (lines 185-222).
+    for (int i = 0; i < network->getNbInputs(); ++i) {
+      auto *in = network->getInput(i);
+      std::string name = in->getName();
+      if (name == "image") {
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kMIN,
+            nvinfer1::Dims4{1, 3, 640, 640});
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kOPT,
+            nvinfer1::Dims4{1, 3, 640, 640});
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kMAX,
+            nvinfer1::Dims4{4, 3, 640, 640});
+      } else if (name == "im_shape" || name == "scale_factor") {
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kMIN,
+            nvinfer1::Dims2{1, 2});
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kOPT,
+            nvinfer1::Dims2{1, 2});
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kMAX,
+            nvinfer1::Dims2{4, 2});
+      } else {
+        std::cerr << "[TRT] Unexpected input for " << type << ": " << name
+                  << '\n';
+        return false;
+      }
+    }
+  } else if (type == "slanext_wired" || type == "slanext_wireless") {
+    // SLANeXt {wired,wireless} encoder, 488×488. Decoder Loop body is part
+    // of the same engine — internal dynamic dim handled by TRT. Profile from
+    // profiles.rs::populate_slanext (lines 224-243).
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{1, 3, 488, 488});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{1, 3, 488, 488});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{4, 3, 488, 488});
+  } else if (type == "formula") {
+    // PP-FormulaNet-S — single grayscale 384×384 input, MTP-K=3 decoder
+    // Loop op. Profile from profiles.rs::populate_formula (lines 245-276).
+    // HGNetV2-B4 encoder carries Q/DQ ops baked into the ONNX; TRT honors
+    // those under FP16 weakly-typed networks. Do NOT setFlag(kINT8) with a
+    // fresh calibrator here — the decoder Loop body must stay FP16 (plan
+    // 07 §5).
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{1, 1, 384, 384});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{1, 1, 384, 384});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{8, 1, 384, 384});
   } else {
     // cls: PP-OCRv5 textline orientation classifier (PP-LCNet_x0_25), input
     // 80x160. Must match kClsImageH/kClsImageW in classification/paddle_cls.h.

@@ -11,6 +11,10 @@
 
 namespace turbo_ocr::layout {
 
+// Defined below collect(); shared by collect() and collect_batch().
+static std::vector<LayoutBox>
+postfilter_layout_boxes(std::vector<LayoutBox> out, int orig_h, int orig_w);
+
 PaddleLayout::~PaddleLayout() noexcept {
   if (d2h_event_)
     cudaEventDestroy(d2h_event_);
@@ -215,10 +219,19 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
     out.push_back(lb);
   }
 
+  return postfilter_layout_boxes(std::move(out), orig_h, orig_w);
+}
+
+// Shared post-decode cleanup for both the single-image and batched paths:
+// score sort, layout NMS, containment dedup, oversized-"image" filter.
+// Both collect() and collect_batch() feed the router (table/formula crops
+// are dispatched per surviving box), so skipping any of this on one path
+// would mean duplicate downstream inference and divergent client output.
+static std::vector<LayoutBox>
+postfilter_layout_boxes(std::vector<LayoutBox> out, int orig_h, int orig_w) {
   // Layout NMS (matches PaddleX layout_nms=True):
   //   same-class IoU > 0.6  → suppress the lower-scoring box
   //   cross-class IoU > 0.98 → suppress the lower-scoring box
-  // Boxes are already sorted by descending score (model output order).
   std::sort(out.begin(), out.end(),
             [](const LayoutBox &a, const LayoutBox &b) {
               return a.score > b.score;
@@ -307,6 +320,165 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
   });
 
   return nms_out;
+}
+
+// ============================================================================
+// Batched layout for pdf_only fixed-resolution mode
+// ============================================================================
+
+bool PaddleLayout::resize_buffers_for(int batch) {
+  if (batch <= current_buf_batch_) return true;
+  if (batch > kMaxBatch) return false;
+
+  // Grow GPU + pinned buffers to fit `batch` images. The TRT engine output
+  // schema (PP-DocLayoutV3 paddle2onnx export) is flat:
+  //   out0 (bbox)     : (total_N, 7)   — concatenated across batch
+  //   out1 (bbox_num) : (B,)           — per-image count
+  //   out2 (mask)     : (total_N, 200, 200) — ignored
+  // Per-image cap is kMaxDetections, so we reserve batch * kMaxDetections.
+  d_image_.reset(static_cast<size_t>(batch) * 3 * kInputSize * kInputSize);
+  d_im_shape_.reset(static_cast<size_t>(batch) * 2);
+  d_scale_factor_.reset(static_cast<size_t>(batch) * 2);
+  d_out0_.reset(static_cast<size_t>(batch) * kMaxDetections * 7);
+  d_out1_.reset(static_cast<size_t>(batch));
+  d_out2_.reset(static_cast<size_t>(batch) * kMaxDetections * 200 * 200);
+
+  h_out0_.reset(static_cast<size_t>(batch) * kMaxDetections * 7);
+  h_out1_.reset(static_cast<size_t>(batch));
+  h_im_shape_.reset(static_cast<size_t>(batch) * 2);
+  h_scale_factor_.reset(static_cast<size_t>(batch) * 2);
+
+  // TRT tracks the bound pointers by name; new allocations need a re-bind.
+  engine_->set_tensor_address(name_image_,        d_image_.get());
+  engine_->set_tensor_address(name_im_shape_,     d_im_shape_.get());
+  engine_->set_tensor_address(name_scale_factor_, d_scale_factor_.get());
+  engine_->set_tensor_address(name_out0_,         d_out0_.get());
+  engine_->set_tensor_address(name_out1_,         d_out1_.get());
+  engine_->set_tensor_address(name_out2_,         d_out2_.get());
+
+  current_buf_batch_ = batch;
+  return true;
+}
+
+bool PaddleLayout::enqueue_batch(const std::vector<GpuImage> &gpu_imgs,
+                                  const std::vector<std::pair<int,int>> &orig_dims,
+                                  cudaStream_t stream) {
+  const int B = static_cast<int>(gpu_imgs.size());
+  if (B == 0) return false;
+  if (B > kMaxBatch) return false;
+  if (!engine_) return false;
+  if (!resize_buffers_for(B)) return false;
+
+  pending_batch_ = B;
+  pending_batch_dims_ = orig_dims;
+  pending_stream_ = stream;
+
+  // Preprocess: per-image resize+normalize into successive slices of
+  // d_image_. The preprocess kernel is per-image; looping it B times on
+  // the same stream still wins over per-image TRT execute because the
+  // expensive part (TRT inference) is fused into a single batched call.
+  const size_t img_stride =
+      static_cast<size_t>(3) * kInputSize * kInputSize;
+  for (int i = 0; i < B; ++i) {
+    kernels::cuda_fused_resize_normalize_layout(
+        gpu_imgs[i],
+        d_image_.get() + i * img_stride,
+        kInputSize, kInputSize, stream);
+
+    h_im_shape_.get()[i * 2 + 0] = static_cast<float>(kInputSize);
+    h_im_shape_.get()[i * 2 + 1] = static_cast<float>(kInputSize);
+    h_scale_factor_.get()[i * 2 + 0] =
+        static_cast<float>(kInputSize) / static_cast<float>(orig_dims[i].first);
+    h_scale_factor_.get()[i * 2 + 1] =
+        static_cast<float>(kInputSize) / static_cast<float>(orig_dims[i].second);
+  }
+
+  CUDA_CHECK(cudaMemcpyAsync(d_im_shape_.get(), h_im_shape_.get(),
+                              sizeof(float) * 2 * B,
+                              cudaMemcpyHostToDevice, stream));
+  CUDA_CHECK(cudaMemcpyAsync(d_scale_factor_.get(), h_scale_factor_.get(),
+                              sizeof(float) * 2 * B,
+                              cudaMemcpyHostToDevice, stream));
+
+  nvinfer1::Dims4 img_dims{B, 3, kInputSize, kInputSize};
+  nvinfer1::Dims2 vec_dims{B, 2};
+  if (!engine_->set_input_shape(name_image_, img_dims))        return false;
+  if (!engine_->set_input_shape(name_im_shape_, vec_dims))     return false;
+  if (!engine_->set_input_shape(name_scale_factor_, vec_dims)) return false;
+
+  if (!engine_->execute(stream)) {
+    std::cerr << "[layout] batched TRT execute failed\n";
+    return false;
+  }
+  CUDA_CHECK(cudaEventRecord(d2h_event_, stream));
+  return true;
+}
+
+std::vector<std::vector<LayoutBox>>
+PaddleLayout::collect_batch(float score_threshold) {
+  std::vector<std::vector<LayoutBox>> all;
+  if (!engine_ || !d2h_event_ || pending_batch_ == 0) return all;
+
+  CUDA_CHECK(cudaEventSynchronize(d2h_event_));
+
+  auto out_dims = engine_->tensor_shape(name_out0_);
+  const int total_rows = (out_dims.nbDims >= 2 ? out_dims.d[0] : 0);
+  const int rows_cap = std::min(total_rows, pending_batch_ * kMaxDetections);
+
+  // D2H bbox tensor + per-image count tensor. The count tensor tells us
+  // where each image's rows start in the flat bbox layout.
+  if (rows_cap > 0) {
+    CUDA_CHECK(cudaMemcpyAsync(h_out0_.get(), d_out0_.get(),
+        sizeof(float) * static_cast<size_t>(rows_cap) * 7,
+        cudaMemcpyDeviceToHost, pending_stream_));
+  }
+  CUDA_CHECK(cudaMemcpyAsync(h_out1_.get(), d_out1_.get(),
+      sizeof(int32_t) * static_cast<size_t>(pending_batch_),
+      cudaMemcpyDeviceToHost, pending_stream_));
+  CUDA_CHECK(cudaStreamSynchronize(pending_stream_));
+
+  all.resize(pending_batch_);
+  int offset = 0;
+  for (int i = 0; i < pending_batch_; ++i) {
+    int n = h_out1_.get()[i];
+    if (n < 0) n = 0;
+    n = std::min(n, kMaxDetections);
+    if (offset + n > rows_cap) n = std::max(0, rows_cap - offset);
+
+    const int orig_h = pending_batch_dims_[i].first;
+    const int orig_w = pending_batch_dims_[i].second;
+
+    auto &out = all[i];
+    out.reserve(n);
+    const float *rows = h_out0_.get() + static_cast<size_t>(offset) * 7;
+    for (int r = 0; r < n; ++r) {
+      const float *row = rows + r * 7;
+      float score = row[1];
+      if (score < score_threshold) continue;
+      int cls = static_cast<int>(row[0]);
+      if (cls < 0 || cls >= static_cast<int>(kLayoutLabels.size())) continue;
+      int x0 = std::clamp(static_cast<int>(row[2]), 0, orig_w - 1);
+      int y0 = std::clamp(static_cast<int>(row[3]), 0, orig_h - 1);
+      int x1 = std::clamp(static_cast<int>(row[4]), 0, orig_w - 1);
+      int y1 = std::clamp(static_cast<int>(row[5]), 0, orig_h - 1);
+      if (x1 <= x0 || y1 <= y0) continue;
+      LayoutBox lb;
+      lb.class_id = cls;
+      lb.score = score;
+      lb.box[0] = {x0, y0};
+      lb.box[1] = {x1, y0};
+      lb.box[2] = {x1, y1};
+      lb.box[3] = {x0, y1};
+      out.push_back(lb);
+    }
+    // Same NMS + containment + page-image cleanup as collect(): the boxes
+    // feed dispatch_router_ (and are surfaced to batch clients), so the
+    // batched path must not emit duplicates the single path would drop.
+    out = postfilter_layout_boxes(std::move(out), orig_h, orig_w);
+    offset += n;
+  }
+  pending_batch_ = 0;
+  return all;
 }
 
 } // namespace turbo_ocr::layout

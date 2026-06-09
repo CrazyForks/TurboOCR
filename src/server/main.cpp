@@ -183,11 +183,22 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Document-orientation engine (optional) — powers /ocr/pdf?autorotate=1.
+  // Soft-disable if the model is absent: ensure_trt_engine returns "" and
+  // autorotate requests are then rejected with AUTOROTATE_DISABLED.
+  std::string doc_ori_model =
+      turbo_ocr::engine::ensure_trt_engine(cfg.doc_ori_onnx, "doc_ori");
+  if (doc_ori_model.empty())
+    TOCR_LOG_WARN("Doc-orientation model (doc_ori.onnx) not found; autorotate disabled");
+  else
+    TOCR_LOG_INFO("Doc-orientation (autorotate) enabled");
+
   auto dispatcher = turbo_ocr::pipeline::make_pipeline_dispatcher(
       pool_size, det_model, rec_model, rec_dict, cls_model, layout_model,
       cfg.pdf_only ? cfg.pdf_batch  : 0,
       cfg.pdf_only ? cfg.pdf_page_h : 0,
-      cfg.pdf_only ? cfg.pdf_page_w : 0);
+      cfg.pdf_only ? cfg.pdf_page_w : 0,
+      doc_ori_model);
 
   // PDF renderer
   const int pdf_daemons = cfg.pdf_daemons;
@@ -302,7 +313,8 @@ int main(int argc, char **argv) {
   turbo_ocr::routes::register_pdf_route(work_pool, *dispatcher, pdf_renderer, default_pdf_mode, layout_available,
                                         cfg.pdf_only ? cfg.pdf_batch : 0,
                                         cfg.pdf_only ? cfg.pdf_dpi : 100,
-                                        cfg.max_pdf_pages);
+                                        cfg.max_pdf_pages,
+                                        /*doc_ori_available=*/!doc_ori_model.empty());
 
   // gRPC
   auto grpc_handle = turbo_ocr::server::start_grpc_server(

@@ -170,3 +170,79 @@ class TestPageImages:
             headers={"Content-Type": "application/pdf"}, timeout=30)
         assert r.status_code == 400
         assert r.json()["error"]["code"] == "INVALID_PARAMETER"
+
+
+class TestAutorotate:
+    """/ocr/pdf?autorotate=1 — de-rotate scanned pages upright via the
+    doc-orientation model. Returned image, boxes and text end up upright;
+    orientation_deg reports the detected clockwise rotation."""
+
+    def _make_rotated_pdf(self, upright_png: bytes, transpose):
+        import io
+        try:
+            import img2pdf
+            from PIL import Image
+        except ImportError:
+            pytest.skip("img2pdf/PIL not available")
+        img = Image.open(io.BytesIO(upright_png)).convert("RGB")
+        if transpose is not None:
+            img = img.transpose(transpose)
+        b = io.BytesIO(); img.save(b, "PNG")
+        return img2pdf.convert(b.getvalue())
+
+    @pytest.fixture(scope="class")
+    def upright_png(self, server_url, small_pdfs):
+        import base64
+        r = requests.post(
+            f"{server_url}/ocr/pdf?images=inline&format=png&mode=ocr",
+            data=small_pdfs["simple_letter"].read_bytes(),
+            headers={"Content-Type": "application/pdf"}, timeout=120)
+        assert r.status_code == 200
+        return base64.b64decode(r.json()["pages"][0]["image_b64"])
+
+    @pytest.fixture(scope="class")
+    def _skip_if_no_autorotate(self, server_url, small_pdfs):
+        r = requests.post(
+            f"{server_url}/ocr/pdf?autorotate=1",
+            data=small_pdfs["simple_letter"].read_bytes(),
+            headers={"Content-Type": "application/pdf"}, timeout=60)
+        if r.status_code == 400 and r.json().get("error", {}).get("code") == "AUTOROTATE_DISABLED":
+            pytest.skip("server started without the doc-orientation model")
+
+    @pytest.mark.parametrize("cw_deg,transpose_name", [
+        (0, None), (90, "ROTATE_270"), (180, "ROTATE_180"), (270, "ROTATE_90")])
+    def test_detects_and_uprights(self, server_url, upright_png,
+                                   _skip_if_no_autorotate, cw_deg, transpose_name):
+        import base64, io
+        from PIL import Image
+        transpose = getattr(Image, transpose_name) if transpose_name else None
+        pdf = self._make_rotated_pdf(upright_png, transpose)
+        r = requests.post(
+            f"{server_url}/ocr/pdf?images=inline&format=png&mode=ocr&autorotate=1",
+            data=pdf, headers={"Content-Type": "application/pdf"}, timeout=120)
+        assert r.status_code == 200, r.text
+        p0 = r.json()["pages"][0]
+        assert p0["orientation_deg"] == cw_deg, f"detected {p0['orientation_deg']} != {cw_deg}"
+        # Returned image is upright (portrait, like the original letter).
+        ret = Image.open(io.BytesIO(base64.b64decode(p0["image_b64"])))
+        assert ret.size[1] > ret.size[0], f"returned image not portrait: {ret.size}"
+        # De-rotated BEFORE OCR, so text recovers (born-upright result count).
+        assert len(p0["results"]) > 150
+
+    def test_off_by_default(self, server_url, upright_png, _skip_if_no_autorotate):
+        from PIL import Image
+        pdf = self._make_rotated_pdf(upright_png, Image.ROTATE_270)
+        r = requests.post(
+            f"{server_url}/ocr/pdf?images=inline&format=png&mode=ocr",
+            data=pdf, headers={"Content-Type": "application/pdf"}, timeout=120)
+        assert r.status_code == 200
+        # No autorotate -> no orientation_deg key, image stays rotated.
+        assert "orientation_deg" not in r.json()["pages"][0]
+
+    def test_invalid_value_rejected(self, server_url, small_pdfs):
+        r = requests.post(
+            f"{server_url}/ocr/pdf?autorotate=maybe",
+            data=small_pdfs["simple_letter"].read_bytes(),
+            headers={"Content-Type": "application/pdf"}, timeout=30)
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] == "INVALID_PARAMETER"

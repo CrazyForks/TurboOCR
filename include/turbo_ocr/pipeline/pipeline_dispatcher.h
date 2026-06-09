@@ -107,7 +107,8 @@ private:
     int pool_size, const std::string &det_model, const std::string &rec_model,
     const std::string &rec_dict, const std::string &cls_model = "",
     const std::string &layout_model = "",
-    int pdf_only_batch = 0, int pdf_only_page_h = 0, int pdf_only_page_w = 0) {
+    int pdf_only_batch = 0, int pdf_only_page_h = 0, int pdf_only_page_w = 0,
+    const std::string &doc_ori_model = "") {
 
   if (pool_size <= 0) [[unlikely]]
     throw std::invalid_argument(
@@ -129,6 +130,11 @@ private:
             "[Dispatcher] Failed to load layout model for pipeline {} of {}",
             i, pool_size));
       }
+    }
+    if (!doc_ori_model.empty()) {
+      // Optional — a load failure soft-disables autorotate (logged inside),
+      // it must not take down the whole pipeline pool.
+      (void)pipeline->load_doc_ori_model(doc_ori_model);
     }
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));

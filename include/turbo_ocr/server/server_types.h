@@ -52,6 +52,10 @@ using ImageDecoder = std::function<cv::Mat(const unsigned char *data, size_t len
 /// Inference function: given cv::Mat + feature flags, run OCR pipeline.
 using InferFunc = std::function<InferResult(const cv::Mat &, const InferOptions &)>;
 
+/// Orientation detector: rendered page -> clockwise rotation deg (0/90/180/270).
+/// Empty/unset when the doc-orientation model isn't loaded (autorotate off).
+using OrientFunc = std::function<int(const cv::Mat &)>;
+
 /// Drogon callback alias.
 using DrogonCallback = std::function<void(const drogon::HttpResponsePtr &)>;
 

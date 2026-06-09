@@ -23,14 +23,18 @@ void register_pdf_route(server::WorkPool &pool,
                         bool layout_available,
                         int pdf_only_batch = 0,
                         int default_dpi = 100,
-                        int max_pdf_pages = 2000);
+                        int max_pdf_pages = 2000,
+                        bool doc_ori_available = false);
 
 /// Register /ocr/pdf — CPU path (sequential page OCR via InferFunc).
+/// `orient_fn` (optional) detects a page's clockwise rotation for autorotate;
+/// pass an empty function to disable (autorotate requests then 400).
 void register_pdf_route(server::WorkPool &pool,
                         const server::InferFunc &infer,
                         render::PdfRenderer &pdf_renderer,
                         pdf::PdfMode default_pdf_mode,
                         bool layout_available,
-                        int max_pdf_pages = 2000);
+                        int max_pdf_pages = 2000,
+                        server::OrientFunc orient_fn = {});
 
 } // namespace turbo_ocr::routes

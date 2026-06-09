@@ -26,7 +26,7 @@ const char *const kAllEnvVars[] = {
     "LOG_LEVEL", "LOG_FORMAT",
     "TURBO_OCR_PDF_ONLY", "TURBO_OCR_PDF_DPI",
     "TURBO_OCR_PDF_PAGE_H", "TURBO_OCR_PDF_PAGE_W", "TURBO_OCR_PDF_BATCH",
-    "MAX_BATCH_IMAGES", "MAX_PDF_PAGE_PIXELS_MP",
+    "MAX_BATCH_IMAGES", "MAX_PDF_PAGE_PIXELS_MP", "DOC_ORI_ONNX",
 };
 
 void reset_env() {

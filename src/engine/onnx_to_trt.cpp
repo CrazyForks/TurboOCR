@@ -342,6 +342,17 @@ static bool build_engine(const std::string &onnx_path,
         nvinfer1::Dims4{1, 1, 384, 384});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
         nvinfer1::Dims4{8, 1, 384, 384});
+  } else if (type == "doc_ori") {
+    // PP-LCNet_x1_0_doc_ori document-orientation classifier, 224x224. Opt at
+    // batch 1 (one page per autorotate detect); max 8 to match the model's
+    // own dynamic profile. Must match kDocOriSize in
+    // classification/doc_orientation_common.h.
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{1, 3, 224, 224});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{1, 3, 224, 224});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{8, 3, 224, 224});
   } else {
     // cls: PP-OCRv5 textline orientation classifier (PP-LCNet_x0_25), input
     // 80x160. Must match kClsImageH/kClsImageW in classification/paddle_cls.h.

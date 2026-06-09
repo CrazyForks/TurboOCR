@@ -194,6 +194,27 @@ bool OcrPipeline::load_layout_model(const std::string &layout_trt_path) {
   return true;
 }
 
+bool OcrPipeline::load_doc_ori_model(const std::string &doc_ori_trt_path) {
+  if (doc_ori_trt_path.empty()) return false;
+  auto doc_ori = std::make_unique<classification::DocOrientation>();
+  if (!doc_ori->load_model(doc_ori_trt_path)) {
+    std::cerr << std::format("[Pipeline] Failed to load doc-orientation model: {}",
+                             doc_ori_trt_path)
+              << '\n';
+    return false;
+  }
+  doc_ori->allocate_buffers();
+  doc_ori_ = std::move(doc_ori);
+  use_doc_ori_ = true;
+  std::cout << "[Pipeline] Document-orientation (autorotate) enabled" << '\n';
+  return true;
+}
+
+int OcrPipeline::detect_orientation(const cv::Mat &bgr, cudaStream_t stream) {
+  if (!use_doc_ori_) return 0;
+  return doc_ori_->detect(bgr, stream);
+}
+
 void OcrPipeline::enable_pdf_only_mode(int batch, int page_h, int page_w) {
   pdf_only_   = true;
   pdf_batch_  = batch;

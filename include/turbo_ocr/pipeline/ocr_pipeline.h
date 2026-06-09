@@ -4,6 +4,7 @@
 #include <utility>
 #include <vector>
 
+#include "turbo_ocr/classification/doc_orientation.h"
 #include "turbo_ocr/classification/paddle_cls.h"
 #include "turbo_ocr/common/timing.h"
 #include "turbo_ocr/common/types.h"
@@ -60,6 +61,18 @@ public:
   // the pipeline and its stages never read TURBO_OCR_PDF_* env directly,
   // so the engine profile and the runtime path can't disagree.
   void enable_pdf_only_mode(int batch, int page_h, int page_w);
+
+  // Load the document-orientation model (PP-LCNet_x1_0_doc_ori). Optional;
+  // when loaded, detect_orientation() powers /ocr/pdf?autorotate=1. Must be
+  // called after init(). Returns false on load failure (caller logs + treats
+  // autorotate as unavailable).
+  [[nodiscard]] bool load_doc_ori_model(const std::string &doc_ori_trt_path);
+  [[nodiscard]] bool has_doc_ori() const noexcept { return use_doc_ori_; }
+
+  // Detect a rendered page's clockwise rotation (0/90/180/270). Returns 0 when
+  // the model isn't loaded or confidence is low. Used by the autorotate path
+  // to de-rotate the page before OCR + image encode.
+  [[nodiscard]] int detect_orientation(const cv::Mat &bgr, cudaStream_t stream);
 
   // IOcrPipeline interface — delegates to stream-aware overloads with stream=0
   void warmup() override { warmup_gpu(0); }
@@ -138,9 +151,11 @@ private:
   std::unique_ptr<classification::PaddleCls> cls_;
   std::unique_ptr<recognition::PaddleRec> rec_;
   std::unique_ptr<layout::PaddleLayout> layout_;
+  std::unique_ptr<classification::DocOrientation> doc_ori_;
 
   bool use_cls_ = false;
   bool use_layout_ = false;
+  bool use_doc_ori_ = false;
 
   // PDF-only hybrid mode (see enable_pdf_only_mode). batch/page dims are
   // the static det engine's only accepted profile shape.

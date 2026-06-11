@@ -123,6 +123,11 @@ private:
   CudaPtr<int> d_ccl_num_boxes_;
   // Host-side result buffer for GPU CCL (pinned memory, RAII)
   CudaHostPtr<kernels::GpuDetBox> h_ccl_boxes_;
+  // Pinned destination for the bitmap download in run_gpu_ccl — a pageable
+  // cv::Mat there degrades the async copy to a ~47µs staged blocking copy
+  // per image.
+  CudaHostPtr<uint8_t> h_bitmap_;
+  size_t h_bitmap_pixels_ = 0;
 
   // Reusable contour/mask buffers (avoid per-call heap allocation)
   std::vector<cv::Point> shifted_buf_;

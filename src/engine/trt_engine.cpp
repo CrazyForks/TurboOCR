@@ -1,13 +1,134 @@
 #include "turbo_ocr/engine/trt_engine.h"
 #include "turbo_ocr/common/errors.h"
 
+#include <cstdlib>
 #include <format>
 #include <fstream>
+#include <mutex>
 #include <vector>
 
 using namespace turbo_ocr::engine;
 
 TrtEngine::TrtEngine(const std::string &model_path) : model_path_(model_path) {}
+
+TrtEngine::~TrtEngine() noexcept { destroy_graphs(); }
+
+bool TrtEngine::graphs_enabled() {
+  // Default OFF: on this GPU-compute-bound OCR stack a clean A/B showed baked
+  // graphs are neutral even at concurrency 1 (the eliminated launch overhead
+  // is lost under GPU-compute + sync time) and cost ~0.5 GiB/pipeline. Kept
+  // as an opt-in (TURBO_OCR_CUDA_GRAPHS=1) — they pay off only if the pipeline
+  // ever becomes launch-bound (e.g. after a compute cut that frees the GPU).
+  static const bool v = [] {
+    const char *env = std::getenv("TURBO_OCR_CUDA_GRAPHS");
+    return env && std::atoi(env) != 0;
+  }();
+  return v;
+}
+
+void TrtEngine::destroy_graphs() noexcept {
+  for (auto &g : baked_) {
+    if (g.exec)
+      cudaGraphExecDestroy(g.exec);
+    g.ctx.reset();
+    if (g.arena)
+      cudaFree(g.arena);
+  }
+  baked_.clear();
+}
+
+int TrtEngine::bake_graph(int profile_idx, const nvinfer1::Dims &dims,
+                          void *input, void *output, cudaStream_t stream) {
+  if (!engine_ || !graphs_enabled())
+    return -1;
+  // Pipelines warm up concurrently; captures are globally serialized so no
+  // other CUDA activity from this process interleaves with a recording.
+  static std::mutex bake_mu;
+  std::lock_guard<std::mutex> lock(bake_mu);
+
+  auto ctx = std::unique_ptr<nvinfer1::IExecutionContext>(
+      engine_->createExecutionContext(
+          nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
+  if (!ctx)
+    return -1;
+  if (profile_idx != 0) {
+    ctx->setOptimizationProfileAsync(profile_idx, stream);
+    cudaStreamSynchronize(stream);
+  }
+  ctx->setTensorAddress(input_name_.c_str(), input);
+  ctx->setTensorAddress(output_name_.c_str(), output);
+  if (!ctx->setInputShape(input_name_.c_str(), dims) ||
+      !ctx->allInputDimensionsSpecified())
+    return -1;
+
+  const int64_t arena_size =
+      engine_->getDeviceMemorySizeForProfileV2(profile_idx);
+  void *arena = nullptr;
+  if (arena_size <= 0 ||
+      cudaMalloc(&arena, static_cast<size_t>(arena_size)) != cudaSuccess) {
+    cudaGetLastError();
+    return -1;
+  }
+  ctx->setDeviceMemoryV2(arena, arena_size);
+
+  auto fail = [&] {
+    cudaGetLastError();
+    ctx.reset(); // before the arena it points into
+    cudaFree(arena);
+    return -1;
+  };
+
+  // Two real executions then a synced capture — the trtexec recipe. Myelin
+  // finalizes per-context device state during the first runs; capturing any
+  // earlier records a graph bound to unfinalized state.
+  for (int k = 0; k < 2; ++k)
+    if (!ctx->enqueueV3(stream))
+      return fail();
+  if (cudaStreamSynchronize(stream) != cudaSuccess)
+    return fail();
+
+  cudaGraph_t graph = nullptr;
+  if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) !=
+      cudaSuccess)
+    return fail();
+  const bool enq_ok = ctx->enqueueV3(stream);
+  const cudaError_t cap = cudaStreamEndCapture(stream, &graph);
+  if (!enq_ok || cap != cudaSuccess || !graph) {
+    if (graph)
+      cudaGraphDestroy(graph);
+    std::cerr << std::format(
+        "[TRT] graph capture failed for {} profile {} — plain enqueue\n",
+        model_path_, profile_idx);
+    return fail();
+  }
+  cudaGraphExec_t exec = nullptr;
+  if (cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
+    cudaGraphDestroy(graph);
+    return fail();
+  }
+  cudaGraphDestroy(graph);
+
+  // Smoke-replay once so a broken graph surfaces at warmup, not in traffic.
+  if (cudaGraphLaunch(exec, stream) != cudaSuccess ||
+      cudaStreamSynchronize(stream) != cudaSuccess) {
+    cudaGraphExecDestroy(exec);
+    return fail();
+  }
+
+  BakedGraph g;
+  g.exec = exec;
+  g.ctx = std::move(ctx);
+  g.arena = arena;
+  g.out_dims = g.ctx->getTensorShape(output_name_.c_str());
+  baked_.push_back(std::move(g));
+  return static_cast<int>(baked_.size()) - 1;
+}
+
+bool TrtEngine::launch_baked(int slot, cudaStream_t stream) {
+  return slot >= 0 && static_cast<size_t>(slot) < baked_.size() &&
+         cudaGraphLaunch(baked_[static_cast<size_t>(slot)].exec, stream) ==
+             cudaSuccess;
+}
 
 bool TrtEngine::load() {
   std::ifstream file(model_path_, std::ios::binary);

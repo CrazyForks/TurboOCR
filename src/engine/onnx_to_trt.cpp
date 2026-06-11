@@ -1,6 +1,8 @@
 #include "turbo_ocr/engine/onnx_to_trt.h"
 #include "turbo_ocr/common/cuda_check.h"
 #include "turbo_ocr/detection/det_config.h"
+#include "turbo_ocr/engine/rec_graph_profiles.h"
+#include "turbo_ocr/engine/trt_engine.h"
 #include "turbo_ocr/server/env_utils.h"
 
 #include <NvInfer.h>
@@ -133,6 +135,12 @@ std::string get_cached_engine_path(const std::string &onnx_path,
   // so each operator config gets its own engine (Triton/vLLM pattern).
   if (type == "det")
     key += ":dms" + std::to_string(read_det_max_side());
+  // rec gets extra static (batch,width) profiles + maxAuxStreams=0 ONLY when
+  // CUDA graphs are opted into. Default (graphs off) keeps the original
+  // single-profile cache key, so existing cached engines are reused as-is and
+  // no rebuild is triggered on upgrade.
+  if (type == "rec" && TrtEngine::graphs_enabled())
+    key += ":gp12aux0";
   // PDF-only static det engine: the cache must distinguish between
   // different fixed shapes / batches, so bake the page dims + batch into
   // the cache key — a DPI change rebuilds rather than reusing stale.
@@ -150,26 +158,44 @@ std::string get_cached_engine_path(const std::string &onnx_path,
   return cache_dir + "/" + type + "_" + std::to_string(hash) + ".trt";
 }
 
+// A QDQ-bearing ONNX (modelopt INT8/FP8 output) carries explicit Quantize/
+// Dequantize nodes whose zero-point dtypes pin the compute precision. TRT 10
+// honors light QDQ under a weakly-typed FP16 network, but heavier modelopt
+// exports (INT32 zero-points on weight reshapes, mixed FP8/INT8) hit
+// "DequantizeLayer can only run in INT8/FP8/FP4/INT4" under weak typing — the
+// modelopt-recommended fix is a STRONGLY-TYPED network, where every tensor's
+// type comes from the graph and the autotuner only picks tactics. Detected by
+// the quantized-variant filename convention used across the repo's scripts.
+[[nodiscard]] static bool is_quantized_onnx(const std::string &p) {
+  return p.find(".int8.") != std::string::npos ||
+         p.find("_int8") != std::string::npos ||
+         p.find("_fp8") != std::string::npos ||
+         p.find(".fp8.") != std::string::npos;
+}
+
 static bool build_engine(const std::string &onnx_path,
                           const std::string &trt_path,
                           const std::string &type) {
+  const bool strongly_typed = is_quantized_onnx(onnx_path);
   std::cout << "Building TRT engine: " << onnx_path << " -> " << trt_path;
   if (type == "det") std::cout << " (DET_MAX_SIDE=" << read_det_max_side() << ")";
+  if (strongly_typed) std::cout << " [strongly-typed QDQ]";
   std::cout << '\n';
 
   auto builder = std::unique_ptr<nvinfer1::IBuilder>(
       nvinfer1::createInferBuilder(s_logger));
   if (!builder) return false;
 
-  // Pass 0 — no NetworkDefinitionCreationFlag bits. In TRT 10 networks are
-  // always explicit batch (kEXPLICIT_BATCH is value 0, deprecated, ignored),
-  // and bit 0 now means kSTRONGLY_TYPED. The legacy `1U << kEXPLICIT_BATCH`
-  // expression therefore evaluated to 1 — silently selecting a strongly-
-  // typed network, which forbids setFlag(kFP16) below. TRT then silently
-  // returns a null serialized plan with no kERROR log, surfacing only as
-  // "Failed to build engine from <onnx_path>" on cold builds.
+  // Weakly-typed FP16 by default (bit 0 clear). Quantized QDQ ONNX needs a
+  // strongly-typed network instead (bit 0 = kSTRONGLY_TYPED): TRT then reads
+  // precision from the graph and kFP16 must NOT be set (it's rejected).
+  const uint32_t net_flags =
+      strongly_typed
+          ? (1U << static_cast<uint32_t>(
+                 nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED))
+          : 0U;
   auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(
-      builder->createNetworkV2(0U));
+      builder->createNetworkV2(net_flags));
   if (!network) return false;
 
   auto parser = std::unique_ptr<nvonnxparser::IParser>(
@@ -213,7 +239,9 @@ static bool build_engine(const std::string &onnx_path,
     workspace_bytes = 1ULL << 30;          // rec, cls, table_cls, table_cell_*
   }
   config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, workspace_bytes);
-  config->setFlag(nvinfer1::BuilderFlag::kFP16);
+  // Strongly-typed networks reject kFP16 — precision is fixed by the graph.
+  if (!strongly_typed)
+    config->setFlag(nvinfer1::BuilderFlag::kFP16);
   // TRT_OPT_LEVEL: 0..5, default 5. Lower trades runtime perf for build time.
   const int opt_level = read_trt_opt_level();
   config->setBuilderOptimizationLevel(opt_level);
@@ -221,6 +249,7 @@ static bool build_engine(const std::string &onnx_path,
 
   auto profile = builder->createOptimizationProfile();
   auto input = network->getInput(0);
+  bool profile_added_in_branch = false;
 
   if (type == "det") {
     // MAX tracks DET_MAX_SIDE (default 960). MIN is the floor (32, after
@@ -249,12 +278,30 @@ static bool build_engine(const std::string &onnx_path,
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
         nvinfer1::Dims4{B, 3, H, W});
   } else if (type == "rec") {
+    // Profile 0: dynamic profile, covers all shapes (the default serving path).
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
         nvinfer1::Dims4{1, 3, 48, 48});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
         nvinfer1::Dims4{32, 3, 48, 320});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
         nvinfer1::Dims4{32, 3, 48, 4000});
+    // Static (batch,width) profiles + maxAuxStreams=0 only when CUDA graphs
+    // are opted into — they exist solely to give the baked-graph path frozen,
+    // shape-specialized contexts. Keeping them out of the default build means
+    // the default rec engine (and its cache key) is unchanged from baseline.
+    if (TrtEngine::graphs_enabled()) {
+      config->addOptimizationProfile(profile);
+      for (const auto &gp : kRecGraphProfiles) {
+        auto *p = builder->createOptimizationProfile();
+        const nvinfer1::Dims4 d{gp.batch, 3, 48, gp.width};
+        p->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN, d);
+        p->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT, d);
+        p->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX, d);
+        config->addOptimizationProfile(p);
+      }
+      config->setMaxAuxStreams(0);
+      profile_added_in_branch = true;
+    }
   } else if (type == "layout") {
     // PP-DocLayoutV3 has 3 inputs: image [B,3,800,800], im_shape [B,2],
     // scale_factor [B,2]. paddle2onnx does not guarantee input ordering, so
@@ -342,6 +389,17 @@ static bool build_engine(const std::string &onnx_path,
         nvinfer1::Dims4{1, 1, 384, 384});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
         nvinfer1::Dims4{8, 1, 384, 384});
+  } else if (type == "doc_ori") {
+    // PP-LCNet_x1_0_doc_ori document-orientation classifier, 224x224. Opt at
+    // batch 1 (one page per autorotate detect); max 8 to match the model's
+    // own dynamic profile. Must match kDocOriSize in
+    // classification/doc_orientation_common.h.
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{1, 3, 224, 224});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{1, 3, 224, 224});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{8, 3, 224, 224});
   } else {
     // cls: PP-OCRv5 textline orientation classifier (PP-LCNet_x0_25), input
     // 80x160. Must match kClsImageH/kClsImageW in classification/paddle_cls.h.
@@ -352,7 +410,8 @@ static bool build_engine(const std::string &onnx_path,
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
         nvinfer1::Dims4{128, 3, 80, 160});
   }
-  config->addOptimizationProfile(profile);
+  if (!profile_added_in_branch)
+    config->addOptimizationProfile(profile);
 
   auto plan = std::unique_ptr<nvinfer1::IHostMemory>(
       builder->buildSerializedNetwork(*network, *config));

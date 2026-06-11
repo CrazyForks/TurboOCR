@@ -142,6 +142,28 @@ int main(int argc, char **argv) {
     TOCR_LOG_INFO("Layout detection disabled");
   }
 
+  // Load the document-orientation model into each pipeline (optional). Powers
+  // /ocr/pdf?autorotate=1. Absent model -> autorotate requests are rejected.
+  bool doc_ori_available = false;
+  if (!cfg.doc_ori_onnx.empty()) {
+    bool all_ok = true;
+    for (size_t i = 0; i < static_cast<size_t>(pool_size); ++i) {
+      auto handle = pool->acquire();
+      if (!handle->load_doc_ori_model(cfg.doc_ori_onnx)) { all_ok = false; break; }
+    }
+    doc_ori_available = all_ok;
+    TOCR_LOG_INFO(doc_ori_available
+                      ? "Doc-orientation (autorotate) enabled (CPU/ONNX Runtime)"
+                      : "Doc-orientation model not found; autorotate disabled");
+  }
+
+  turbo_ocr::server::OrientFunc orient_fn;
+  if (doc_ori_available)
+    orient_fn = [&pool](const cv::Mat &img) -> int {
+      auto handle = pool->acquire();
+      return handle->detect_orientation(img);
+    };
+
   turbo_ocr::server::InferFunc infer =
       [&pool](const cv::Mat &img,
               const turbo_ocr::server::InferOptions &opts)
@@ -282,7 +304,7 @@ int main(int argc, char **argv) {
   const turbo_ocr::pdf::PdfMode default_pdf_mode = cfg.default_pdf_mode;
 
   turbo_ocr::routes::register_pdf_route(work_pool, infer, pdf_renderer, default_pdf_mode, layout_available,
-                                        cfg.max_pdf_pages);
+                                        cfg.max_pdf_pages, orient_fn);
 
   // --- /ocr/batch endpoint (CPU version) ---
   const int max_batch_images = cfg.max_batch_images;

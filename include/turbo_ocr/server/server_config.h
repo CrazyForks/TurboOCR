@@ -75,6 +75,9 @@ struct ServerConfig {
   std::string cls_onnx;
   std::string layout_onnx = "models/layout/layout.onnx";
   std::optional<std::string> layout_trt;
+  // Document-orientation model (PP-LCNet_x1_0_doc_ori) for /ocr/pdf?autorotate=1.
+  // Optional — if the file is absent, autorotate requests are rejected.
+  std::string doc_ori_onnx = "models/doc_ori.onnx";
   RecPaths    rec_paths;
   std::string ocr_lang_value;
 
@@ -242,6 +245,7 @@ inline std::string ServerConfig::to_json() const {
   j += ",\"cls_onnx\":"          + esc(cls_onnx);
   j += ",\"layout_onnx\":"       + esc(layout_onnx);
   j += ",\"layout_trt\":"        + (layout_trt ? esc(*layout_trt) : std::string("null"));
+  j += ",\"doc_ori_onnx\":"      + esc(doc_ori_onnx);
   j += ",\"rec\":"               + esc(rec_paths.rec);
   j += ",\"rec_dict\":"          + esc(rec_paths.dict);
   j += ",\"ocr_lang\":"          + esc(ocr_lang_value);
@@ -318,6 +322,7 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
   c.det_onnx    = env_or(det_env, "models/det.onnx");
   c.cls_onnx    = env_or(cls_env, "models/cls.onnx");
   c.layout_onnx = env_or("LAYOUT_ONNX", "models/layout/layout.onnx");
+  c.doc_ori_onnx = env_or("DOC_ORI_ONNX", "models/doc_ori.onnx");
   if (env_present("LAYOUT_TRT"))
     c.layout_trt = env_or("LAYOUT_TRT", "");
   c.rec_paths      = resolve_rec_paths(rec_env);

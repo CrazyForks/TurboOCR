@@ -259,6 +259,7 @@ if(USE_CPU_ONLY)
         src/detection/cpu_paddle_det.cpp
         src/recognition/cpu_paddle_rec.cpp
         src/classification/cpu_paddle_cls.cpp
+        src/classification/cpu_doc_orientation.cpp
         src/pipeline/cpu_ocr_pipeline.cpp
         src/layout/cpu_paddle_layout.cpp
         src/render/pdf_renderer.cpp
@@ -367,6 +368,7 @@ else()
         src/detection/paddle_det.cpp
         src/recognition/paddle_rec.cpp
         src/classification/paddle_cls.cpp
+        src/classification/doc_orientation.cpp
         src/lang_cls/script_id.cpp
         src/layout/paddle_layout.cpp
         src/pipeline/ocr_pipeline.cpp

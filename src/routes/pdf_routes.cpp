@@ -19,6 +19,7 @@
 #include <drogon/utils/Utilities.h>
 #include <json/json.h>
 
+#include "turbo_ocr/classification/doc_orientation_common.h"
 #include "turbo_ocr/common/serialization.h"
 #include "turbo_ocr/layout/reading_order.h"
 #include "turbo_ocr/pdf/page_image_encoder.h"
@@ -70,6 +71,9 @@ struct PdfPageResultBase {
   int width = 0, height = 0, effective_dpi = 0;
   pdf::PdfMode resolved_mode = pdf::PdfMode::Ocr;
   std::string_view text_layer_quality = "absent";
+  // Detected page rotation (clockwise, 0/90/180/270) when autorotate=1; the
+  // page image + boxes were de-rotated to upright by this amount.
+  int orientation_deg = 0;
   // Optional: encoded page image bytes (set when ?images=inline).
   std::vector<uint8_t> encoded_image;
 };
@@ -348,7 +352,8 @@ std::string emit_pdf_response(std::vector<PageResult> &page_results,
                                int request_dpi,
                                bool want_blocks = false,
                                ImageMode image_mode = ImageMode::None,
-                               const pdf::EncodeOptions &encode_opts = {}) {
+                               const pdf::EncodeOptions &encode_opts = {},
+                               bool want_orientation = false) {
   size_t n_pages = page_results.size();
   size_t total_results = 0;
   size_t total_image_bytes = 0;
@@ -385,6 +390,12 @@ std::string emit_pdf_response(std::vector<PageResult> &page_results,
     json_str += "\",\"text_layer_quality\":\"";
     json_str += pg.text_layer_quality;
     json_str += '"';
+
+    // Detected page rotation (the image + boxes were de-rotated upright by it).
+    if (want_orientation) {
+      json_str += ",\"orientation_deg\":";
+      json_str += std::to_string(pg.orientation_deg);
+    }
 
     // Inline page image: base64 of the encoded bytes (simdutf, SIMD path).
     if (image_mode == ImageMode::Inline && !pg.encoded_image.empty()) {
@@ -429,6 +440,9 @@ struct PdfPageSink {
   // worker right after decode and stash the bytes in the slot.
   ImageMode image_mode = ImageMode::None;
   pdf::EncodeOptions encode_opts{};
+  // autorotate=1: detect each page's orientation and de-rotate the decoded
+  // image upright BEFORE OCR + encode, so image, boxes and text are all upright.
+  bool autorotate = false;
   // Rendered pages whose PPM could not be read back (tmpfs pressure,
   // truncated write). We rendered these ourselves, so a failure here is a
   // server-side error: any non-zero count turns the response into a 500
@@ -458,7 +472,8 @@ maybe_encode_page(const PdfPageSink &sink, const cv::Mat &img) {
 // replacement, write the slot under the sink lock.
 void store_ocr_page(PdfPageSink &sink, int page_idx,
                     pipeline::OcrPipelineResult out, int width, int height,
-                    std::vector<uint8_t> encoded_image = {}) {
+                    std::vector<uint8_t> encoded_image = {},
+                    int orientation_deg = 0) {
   for (auto &it : out.results) it.source = "ocr";
 
   const pdf::PdfMode page_mode = page_mode_of(sink, page_idx);
@@ -476,6 +491,7 @@ void store_ocr_page(PdfPageSink &sink, int page_idx,
   slot.height        = height;
   slot.effective_dpi = sink.dpi;
   slot.encoded_image = std::move(encoded_image);
+  slot.orientation_deg = orientation_deg;
   if (page_mode == pdf::PdfMode::Ocr)
     slot.resolved_mode = pdf::PdfMode::Ocr;
 }
@@ -488,7 +504,8 @@ void store_ocr_page(PdfPageSink &sink, int page_idx,
 void store_geometric_page(PdfPageSink &sink, int page_idx,
                           std::vector<layout::LayoutBox> layout,
                           int width, int height, bool want_reading_order,
-                          std::vector<uint8_t> encoded_image = {}) {
+                          std::vector<uint8_t> encoded_image = {},
+                          int orientation_deg = 0) {
   std::lock_guard<std::mutex> lock(sink.results_mutex);
   auto &slot = sink.page_results[page_idx];
   const float pt_to_px = static_cast<float>(sink.dpi) / 72.0f;
@@ -502,6 +519,7 @@ void store_geometric_page(PdfPageSink &sink, int page_idx,
   slot.height        = height;
   slot.effective_dpi = sink.dpi;
   slot.encoded_image = std::move(encoded_image);
+  slot.orientation_deg = orientation_deg;
   if (want_reading_order && !slot.layout.empty()) {
     turbo_ocr::assign_layout_ids(slot.results, slot.layout);
     slot.reading_order =
@@ -522,11 +540,13 @@ void ocr_single_page(pipeline::GpuPipelineEntry &e, PdfPageSink &sink,
     sink.decode_failures.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  auto encoded = maybe_encode_page(sink, img);
 
   if (page_mode_of(sink, page_idx) == pdf::PdfMode::Geometric) {
-    // Geometric pages can be rendered just for their image (?images=inline);
-    // only pay the layout inference when the client actually asked for it.
+    // Geometric pages come from a born-digital text layer (already upright);
+    // autorotate does not apply — its text boxes are in PDF pt-space, not the
+    // pixel frame, so rotating the image would desync them. Just encode + run
+    // layout-only when the client asked for it.
+    auto encoded = maybe_encode_page(sink, img);
     auto layout = layout_enabled
         ? e.pipeline->run_layout_only(img, e.stream).layout
         : std::vector<layout::LayoutBox>{};
@@ -534,10 +554,16 @@ void ocr_single_page(pipeline::GpuPipelineEntry &e, PdfPageSink &sink,
                          img.cols, img.rows, want_reading_order,
                          std::move(encoded));
   } else {
+    // OCR page: de-rotate upright FIRST (when autorotate=1) so det/rec, the
+    // returned boxes, and the encoded image are all in the same upright frame.
+    int orient = sink.autorotate
+        ? e.pipeline->detect_orientation(img, e.stream) : 0;
+    if (orient) classification::rotate_upright(img, orient);
+    auto encoded = maybe_encode_page(sink, img);
     auto out = e.pipeline->run_with_layout(img, e.stream, layout_enabled,
                                            want_reading_order);
     store_ocr_page(sink, page_idx, std::move(out), img.cols, img.rows,
-                   std::move(encoded));
+                   std::move(encoded), orient);
   }
 }
 
@@ -550,9 +576,11 @@ void ocr_page_chunk(pipeline::GpuPipelineEntry &e, PdfPageSink &sink,
                     const std::vector<int> &idxs,
                     const std::vector<std::string> &paths) {
   std::vector<cv::Mat> imgs;
-  std::vector<int> live;  // page index per successfully decoded image
+  std::vector<int> live;     // page index per successfully decoded image
+  std::vector<int> orients;  // detected rotation per live image (0 unless autorotate)
   imgs.reserve(paths.size());
   live.reserve(paths.size());
+  orients.reserve(paths.size());
   for (size_t j = 0; j < paths.size(); ++j) {
     cv::Mat img = render::PdfRenderer::decode_ppm(paths[j]);
     if (img.empty()) {
@@ -561,8 +589,14 @@ void ocr_page_chunk(pipeline::GpuPipelineEntry &e, PdfPageSink &sink,
       sink.decode_failures.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
+    // De-rotate upright before batching so det/rec + the encoded image are
+    // all in the upright frame (per-page detect; batched det follows).
+    int orient = sink.autorotate
+        ? e.pipeline->detect_orientation(img, e.stream) : 0;
+    if (orient) classification::rotate_upright(img, orient);
     imgs.push_back(std::move(img));
     live.push_back(idxs[j]);
+    orients.push_back(orient);
   }
   if (imgs.empty()) return;
 
@@ -572,7 +606,7 @@ void ocr_page_chunk(pipeline::GpuPipelineEntry &e, PdfPageSink &sink,
   for (size_t j = 0; j < outs.size(); ++j)
     store_ocr_page(sink, live[j], std::move(outs[j]),
                    imgs[j].cols, imgs[j].rows,
-                   maybe_encode_page(sink, imgs[j]));
+                   maybe_encode_page(sink, imgs[j]), orients[j]);
 }
 
 // GPU streamed render: per rendered page, either accumulate into a pdf_only
@@ -710,7 +744,9 @@ int run_streamed_render_cpu(
     const std::vector<uint8_t> &need_render,
     int &decode_failures,
     ImageMode image_mode = ImageMode::None,
-    const pdf::EncodeOptions &encode_opts = {}) {
+    const pdf::EncodeOptions &encode_opts = {},
+    bool autorotate = false,
+    const server::OrientFunc &orient_fn = {}) {
   auto stream_handle = pdf_renderer.render_streamed(pdf_data, pdf_len_local, dpi,
       [&](int page_idx, std::string ppm_path) noexcept {
        try {
@@ -731,11 +767,6 @@ int run_streamed_render_cpu(
           page_results.resize(page_idx + 1);
         auto &pg = page_results[static_cast<size_t>(page_idx)];
 
-        // Page-image export (?images=inline): encode right after decode —
-        // JPEG via libjpeg-turbo on this build (no GPU), PNG/WebP via OpenCV.
-        if (image_mode == ImageMode::Inline)
-          pg.encoded_image = pdf::encode_page_image(img, encode_opts);
-
         turbo_ocr::server::InferOptions inf_opts;
         inf_opts.want_layout = want_layout;
         inf_opts.want_reading_order = want_reading_order;
@@ -745,6 +776,20 @@ int run_streamed_render_cpu(
         // already set per page.
         if (mode == pdf::PdfMode::Ocr)
           pg.resolved_mode = pdf::PdfMode::Ocr;
+
+        // OCR pages: de-rotate upright (autorotate=1) BEFORE encode + infer so
+        // image, boxes and text share one frame. Geometric pages are
+        // born-digital/upright with pt-space text — skip them.
+        if (pg.resolved_mode != pdf::PdfMode::Geometric && autorotate && orient_fn) {
+          int orient = orient_fn(img);
+          if (orient) classification::rotate_upright(img, orient);
+          pg.orientation_deg = orient;
+        }
+
+        // Page-image export (?images=inline): encode after any rotation —
+        // JPEG via libjpeg-turbo on this build (no GPU), PNG/WebP via OpenCV.
+        if (image_mode == ImageMode::Inline)
+          pg.encoded_image = pdf::encode_page_image(img, encode_opts);
 
         if (pg.resolved_mode == pdf::PdfMode::Geometric) {
           // Text already filled from layer in pt-space; only run
@@ -810,12 +855,13 @@ void register_pdf_route(server::WorkPool &pool,
                         bool layout_available,
                         int pdf_only_batch,
                         int default_dpi,
-                        int max_pdf_pages) {
+                        int max_pdf_pages,
+                        bool doc_ori_available) {
 
   drogon::app().registerHandler(
       "/ocr/pdf",
       [&pool, &dispatcher, &pdf_renderer, default_pdf_mode, layout_available,
-       pdf_only_batch, default_dpi, max_pdf_pages](
+       pdf_only_batch, default_dpi, max_pdf_pages, doc_ori_available](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
@@ -862,6 +908,22 @@ void register_pdf_route(server::WorkPool &pool,
       return;
     }
 
+    // autorotate=1: de-rotate each OCR'd page upright using the doc-orientation
+    // model. Rejected when the model isn't loaded (parity with LAYOUT_DISABLED).
+    bool autorotate = false;
+    if (auto err = server::parse_bool_query(req, "autorotate", &autorotate);
+        !err.empty()) {
+      callback(server::error_response(drogon::k400BadRequest,
+                                       "INVALID_PARAMETER", err));
+      return;
+    }
+    if (autorotate && !doc_ori_available) {
+      callback(server::error_response(drogon::k400BadRequest, "AUTOROTATE_DISABLED",
+          "autorotate=1 requires the doc-orientation model (models/doc_ori.onnx); "
+          "it was not found at startup"));
+      return;
+    }
+
     // For raw body case, pdf_ptr points into req->body() — copy into pdf_buf
     if (pdf_buf->empty())
       pdf_buf->assign(pdf_ptr, pdf_len);
@@ -870,7 +932,7 @@ void register_pdf_route(server::WorkPool &pool,
         [pdf_buf, req, &dispatcher, &pdf_renderer,
          layout_enabled, want_reading_order, want_blocks,
          dpi, req_mode, pdf_only_batch, image_mode,
-         encode_opts, max_pdf_pages](server::DrogonCallback &cb) {
+         encode_opts, max_pdf_pages, autorotate](server::DrogonCallback &cb) {
      // Wrap the whole body: post-render work (emit_pdf_response's multi-GB
      // reserve under images=inline, page_results.resize) can throw bad_alloc,
      // which the WorkPool worker would otherwise swallow — leaving the client
@@ -919,7 +981,8 @@ void register_pdf_route(server::WorkPool &pool,
       // the PPM tmpdir the tasks read). Reverse-destruction then joins the
       // futures before any of these go away.
       PdfPageSink sink{results_mutex, page_results, pdf_doc.get(),
-                       page_text_cache, dpi, image_mode, encode_opts};
+                       page_text_cache, dpi, image_mode, encode_opts,
+                       autorotate};
       std::vector<int> dropped_pages;  // pages that couldn't be queued -> 503
       render::PdfRenderer::StreamHandle stream_handle;
 
@@ -993,7 +1056,8 @@ void register_pdf_route(server::WorkPool &pool,
           trimmed.push_back(std::move(page_results[i]));
       }
       cb(server::json_response(emit_pdf_response(trimmed, dpi, want_blocks,
-                                                  image_mode, encode_opts)));
+                                                  image_mode, encode_opts,
+                                                  autorotate)));
      });
     });
   }, {drogon::Post});
@@ -1006,12 +1070,14 @@ void register_pdf_route(server::WorkPool &pool,
                         render::PdfRenderer &pdf_renderer,
                         pdf::PdfMode default_pdf_mode,
                         bool layout_available,
-                        int max_pdf_pages) {
+                        int max_pdf_pages,
+                        server::OrientFunc orient_fn) {
+  const bool doc_ori_available = static_cast<bool>(orient_fn);
 
   drogon::app().registerHandler(
       "/ocr/pdf",
       [&pool, &infer, &pdf_renderer, default_pdf_mode, layout_available,
-       max_pdf_pages](
+       max_pdf_pages, orient_fn, doc_ori_available](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
@@ -1055,12 +1121,27 @@ void register_pdf_route(server::WorkPool &pool,
       return;
     }
 
+    bool autorotate = false;
+    if (auto err = server::parse_bool_query(req, "autorotate", &autorotate);
+        !err.empty()) {
+      callback(server::error_response(drogon::k400BadRequest,
+                                       "INVALID_PARAMETER", err));
+      return;
+    }
+    if (autorotate && !doc_ori_available) {
+      callback(server::error_response(drogon::k400BadRequest, "AUTOROTATE_DISABLED",
+          "autorotate=1 requires the doc-orientation model (models/doc_ori.onnx); "
+          "it was not found at startup"));
+      return;
+    }
+
     auto pdf_buf = std::make_shared<std::string>(pdf_ptr, pdf_len);
 
     server::submit_work(pool, std::move(callback),
         [pdf_buf, &infer, &pdf_renderer, want_layout,
          want_reading_order, want_blocks, dpi,
-         req_mode, image_mode, encode_opts, max_pdf_pages](server::DrogonCallback &cb) {
+         req_mode, image_mode, encode_opts, max_pdf_pages,
+         autorotate, orient_fn](server::DrogonCallback &cb) {
      // See GPU route: wrap the body so a post-render bad_alloc returns 500
      // instead of being swallowed by the WorkPool (client hang).
      server::run_with_error_handling(cb, "/ocr/pdf", [&] {
@@ -1113,7 +1194,7 @@ void register_pdf_route(server::WorkPool &pool,
               pdf_data, pdf_len_local, dpi, want_layout,
               want_reading_order, mode,
               page_results, need_render, decode_failures,
-              image_mode, encode_opts);
+              image_mode, encode_opts, autorotate, orient_fn);
           if (static_cast<int>(page_results.size()) < num_pages)
             page_results.resize(num_pages);
         }
@@ -1141,7 +1222,8 @@ void register_pdf_route(server::WorkPool &pool,
       }
 
       cb(server::json_response(emit_pdf_response(page_results, dpi, want_blocks,
-                                                  image_mode, encode_opts)));
+                                                  image_mode, encode_opts,
+                                                  autorotate)));
      });
     });
   }, {drogon::Post});

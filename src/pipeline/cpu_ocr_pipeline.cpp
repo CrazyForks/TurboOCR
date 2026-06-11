@@ -116,6 +116,22 @@ bool CpuOcrPipeline::load_layout_model(const std::string &onnx_path) {
   return true;
 }
 
+bool CpuOcrPipeline::load_doc_ori_model(const std::string &onnx_path) {
+  if (onnx_path.empty()) return false;
+  doc_ori_ = std::make_unique<classification::CpuDocOrientation>();
+  if (!doc_ori_->load_model(onnx_path)) {
+    doc_ori_.reset();
+    return false;
+  }
+  use_doc_ori_ = true;
+  return true;
+}
+
+int CpuOcrPipeline::detect_orientation(const cv::Mat &bgr) {
+  if (!use_doc_ori_) return 0;
+  return doc_ori_->detect(bgr);
+}
+
 OcrPipelineResult CpuOcrPipeline::run_with_layout(const cv::Mat &img,
                                                     bool want_layout,
                                                     bool want_reading_order) {

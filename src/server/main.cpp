@@ -77,6 +77,10 @@ int main(int argc, char **argv) {
   g_shutdown_grace_seconds.store(cfg.shutdown_grace_seconds,
                                   std::memory_order_release);
 
+  // Parallelism lives at the request level (work-pool threads); OpenCV's
+  // per-op thread pool on top of that just oversubscribes cores under load.
+  cv::setNumThreads(0);
+
   const auto &rec_paths = cfg.rec_paths;
   if (!cfg.ocr_lang_value.empty())
     TOCR_LOG_INFO("Language selected via OCR_LANG",
@@ -167,7 +171,12 @@ int main(int argc, char **argv) {
   }
   turbo_ocr::pdf::ensure_pdfium_initialized();
 
-  // Pipeline pool
+  // Pipeline pool. Throughput is GPU-compute-bound on this stack: a clean
+  // pool sweep (RTX 5090, FUNSD) plateaus by ~5 pipelines (5→278, 8→263,
+  // 10→258 img/s) because the det/rec kernels already saturate the GPU and
+  // extra pipelines only add scheduling/cache pressure. So the ladder caps at
+  // 5 deliberately — raising it costs VRAM for negative throughput. Explicit
+  // --pool-size overrides.
   int pool_size = 4;
   if (cfg.pipeline_pool_size) {
     pool_size = *cfg.pipeline_pool_size;
@@ -183,11 +192,25 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Document-orientation engine (optional) — powers /ocr/pdf?autorotate=1.
+  // Soft-disable if the model is absent: ensure_trt_engine returns "" and
+  // autorotate requests are then rejected with AUTOROTATE_DISABLED.
+  std::string doc_ori_model =
+      turbo_ocr::engine::ensure_trt_engine(cfg.doc_ori_onnx, "doc_ori");
+  if (doc_ori_model.empty())
+    TOCR_LOG_WARN("Doc-orientation model (doc_ori.onnx) not found; autorotate disabled");
+  else
+    TOCR_LOG_INFO("Doc-orientation (autorotate) enabled");
+
   auto dispatcher = turbo_ocr::pipeline::make_pipeline_dispatcher(
       pool_size, det_model, rec_model, rec_dict, cls_model, layout_model,
       cfg.pdf_only ? cfg.pdf_batch  : 0,
       cfg.pdf_only ? cfg.pdf_page_h : 0,
-      cfg.pdf_only ? cfg.pdf_page_w : 0);
+      cfg.pdf_only ? cfg.pdf_page_w : 0,
+      doc_ori_model);
+  // Some pipelines may have failed to init (logged); key downstream sizing
+  // off the count actually built.
+  pool_size = static_cast<int>(dispatcher->worker_count());
 
   // PDF renderer
   const int pdf_daemons = cfg.pdf_daemons;
@@ -302,7 +325,8 @@ int main(int argc, char **argv) {
   turbo_ocr::routes::register_pdf_route(work_pool, *dispatcher, pdf_renderer, default_pdf_mode, layout_available,
                                         cfg.pdf_only ? cfg.pdf_batch : 0,
                                         cfg.pdf_only ? cfg.pdf_dpi : 100,
-                                        cfg.max_pdf_pages);
+                                        cfg.max_pdf_pages,
+                                        /*doc_ori_available=*/!doc_ori_model.empty());
 
   // gRPC
   auto grpc_handle = turbo_ocr::server::start_grpc_server(

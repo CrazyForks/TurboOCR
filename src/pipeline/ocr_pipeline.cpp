@@ -275,6 +275,10 @@ void OcrPipeline::warmup_gpu(cudaStream_t stream) {
     cudaStreamSynchronize(stream);
   }
 
+  // Record the per-(batch,width)-profile CUDA graphs before the bucket warm
+  // loop below, so the loop exercises the graph-replay path end to end.
+  rec_->bake_graphs(stream);
+
   // Warm all 5 rec width buckets to eliminate TRT JIT latency on first use.
   // The initial run() above only hits one bucket; each unseen bucket pays ~5-50ms
   // on first inference. We call rec_->run() directly with fake boxes sized to

@@ -103,6 +103,33 @@ private:
 /// (static batched det at {batch, 3, page_h, page_w}; values from the
 /// validated ServerConfig) before warmup, so the static-engine warmup path
 /// is taken instead of the dynamic-shape one.
+// Build + warm exactly one pipeline (det/rec/cls + optional layout/doc_ori +
+// pdf_only). Returns nullptr on a non-fatal init failure (logged).
+[[nodiscard]] inline std::unique_ptr<GpuPipelineEntry> build_one_pipeline(
+    int idx, const std::string &det_model, const std::string &rec_model,
+    const std::string &rec_dict, const std::string &cls_model,
+    const std::string &layout_model, int pdf_only_batch, int pdf_only_page_h,
+    int pdf_only_page_w, const std::string &doc_ori_model) {
+  auto pipeline = std::make_unique<OcrPipeline>();
+  if (!pipeline->init(det_model, rec_model, rec_dict, cls_model)) {
+    std::cerr << std::format("[Dispatcher] Failed to init GPU pipeline {}\n", idx);
+    return nullptr;
+  }
+  if (pdf_only_batch > 0)
+    pipeline->enable_pdf_only_mode(pdf_only_batch, pdf_only_page_h,
+                                   pdf_only_page_w);
+  if (!layout_model.empty() && !pipeline->load_layout_model(layout_model))
+    throw turbo_ocr::ModelLoadError(std::format(
+        "[Dispatcher] Failed to load layout model for pipeline {}", idx));
+  if (!doc_ori_model.empty())
+    (void)pipeline->load_doc_ori_model(doc_ori_model); // soft-disable on fail
+  cudaStream_t stream;
+  CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  auto entry = std::make_unique<GpuPipelineEntry>(std::move(pipeline), stream);
+  entry->pipeline->warmup_gpu(entry->stream); // grows buffers + bakes graphs
+  return entry;
+}
+
 [[nodiscard]] inline std::unique_ptr<PipelineDispatcher> make_pipeline_dispatcher(
     int pool_size, const std::string &det_model, const std::string &rec_model,
     const std::string &rec_dict, const std::string &cls_model = "",
@@ -116,41 +143,19 @@ private:
 
   std::vector<std::unique_ptr<GpuPipelineEntry>> entries;
   for (int i = 0; i < pool_size; ++i) {
-    auto pipeline = std::make_unique<OcrPipeline>();
-    if (!pipeline->init(det_model, rec_model, rec_dict, cls_model)) {
-      std::cerr << std::format("[Dispatcher] Failed to init GPU pipeline {} of {}", i, pool_size) << '\n';
-      continue;
-    }
-    if (pdf_only_batch > 0)
-      pipeline->enable_pdf_only_mode(pdf_only_batch, pdf_only_page_h,
-                                     pdf_only_page_w);
-    if (!layout_model.empty()) {
-      if (!pipeline->load_layout_model(layout_model)) {
-        throw turbo_ocr::ModelLoadError(std::format(
-            "[Dispatcher] Failed to load layout model for pipeline {} of {}",
-            i, pool_size));
-      }
-    }
-    if (!doc_ori_model.empty()) {
-      // Optional — a load failure soft-disables autorotate (logged inside),
-      // it must not take down the whole pipeline pool.
-      (void)pipeline->load_doc_ori_model(doc_ori_model);
-    }
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    entries.push_back(std::make_unique<GpuPipelineEntry>(std::move(pipeline), stream));
+    if (auto e = build_one_pipeline(i, det_model, rec_model, rec_dict,
+                                    cls_model, layout_model, pdf_only_batch,
+                                    pdf_only_page_h, pdf_only_page_w,
+                                    doc_ori_model))
+      entries.push_back(std::move(e));
   }
 
   if (entries.empty()) [[unlikely]]
-    throw turbo_ocr::ModelLoadError(
-        std::format("[Dispatcher] All {} GPU pipelines failed to initialize", pool_size));
+    throw turbo_ocr::ModelLoadError(std::format(
+        "[Dispatcher] All {} GPU pipelines failed to initialize", pool_size));
 
-  std::cout << std::format("Warming up {} pipelines...", entries.size()) << '\n';
-  for (auto &e : entries) {
-    e->pipeline->warmup_gpu(e->stream);
-  }
-  std::cout << "Pipeline warmup complete." << '\n';
-
+  std::cout << std::format("Pipeline warmup complete ({} pipelines).\n",
+                           entries.size());
   return std::make_unique<PipelineDispatcher>(std::move(entries));
 }
 

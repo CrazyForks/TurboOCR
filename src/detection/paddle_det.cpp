@@ -87,6 +87,8 @@ bool PaddleDet::init_buffers() {
     // Pinned host memory for result transfer
     h_ccl_boxes_ = CudaHostPtr<turbo_ocr::kernels::GpuDetBox>(
         turbo_ocr::kernels::kMaxGpuComponents);
+    h_bitmap_ = CudaHostPtr<uint8_t>(max_pixels);
+    h_bitmap_pixels_ = max_pixels;
 
     // JFA (Jump Flooding) per-component label expansion
     d_jfa_labels_ = CudaPtr<uint32_t>(max_pixels);
@@ -123,7 +125,12 @@ PaddleDet::run_gpu_ccl(int resize_h, int resize_w,
 
   // Download ONLY the bitmap (not pred_map -- GPU CCL already computed scores).
   // We need the bitmap for per-ROI findContours to get accurate polygon contours.
-  cv::Mat bitmap(resize_h, resize_w, CV_8UC1);
+  const size_t bitmap_pixels = static_cast<size_t>(resize_h) * resize_w;
+  if (bitmap_pixels > h_bitmap_pixels_) [[unlikely]] {
+    h_bitmap_ = CudaHostPtr<uint8_t>(bitmap_pixels);
+    h_bitmap_pixels_ = bitmap_pixels;
+  }
+  cv::Mat bitmap(resize_h, resize_w, CV_8UC1, h_bitmap_.get());
   CUDA_CHECK(cudaMemcpyAsync(bitmap.data, cur_bitmap_, resize_w * resize_h,
                               cudaMemcpyDeviceToHost, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));

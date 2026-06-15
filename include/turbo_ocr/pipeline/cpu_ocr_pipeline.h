@@ -3,6 +3,7 @@
 #include <memory>
 #include <vector>
 
+#include "turbo_ocr/classification/cpu_doc_orientation.h"
 #include "turbo_ocr/classification/cpu_paddle_cls.h"
 #include "turbo_ocr/common/types.h"
 #include "turbo_ocr/detection/cpu_paddle_det.h"
@@ -24,6 +25,12 @@ public:
 
   [[nodiscard]] bool load_layout_model(const std::string &onnx_path);
 
+  // Load the document-orientation model (ONNX). Optional; powers autorotate.
+  [[nodiscard]] bool load_doc_ori_model(const std::string &onnx_path);
+  [[nodiscard]] bool has_doc_ori() const noexcept { return use_doc_ori_; }
+  // Page's detected clockwise rotation (0/90/180/270), or 0 if unavailable.
+  [[nodiscard]] int detect_orientation(const cv::Mat &bgr);
+
   void warmup() override;
 
   [[nodiscard]] std::vector<OCRResultItem> run(const cv::Mat &img) override;
@@ -41,8 +48,10 @@ private:
   std::unique_ptr<classification::CpuPaddleCls> cls_;
   std::unique_ptr<recognition::CpuPaddleRec> rec_;
   std::unique_ptr<layout::CpuPaddleLayout> layout_;
+  std::unique_ptr<classification::CpuDocOrientation> doc_ori_;
 
   bool use_cls_ = false;
+  bool use_doc_ori_ = false;
 };
 
 } // namespace turbo_ocr::pipeline

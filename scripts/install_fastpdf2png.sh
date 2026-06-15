@@ -6,9 +6,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
 BIN_DIR="$ROOT/bin"
-REPO="https://github.com/nataell95/fastpdf2png.git"
+REPO="https://github.com/aiptimizer/fastpdf2png.git"
 # Pinned commit on main. To refresh, run:
-#   git ls-remote https://github.com/nataell95/fastpdf2png.git refs/heads/main
+#   git ls-remote https://github.com/aiptimizer/fastpdf2png.git refs/heads/main
 # and update FASTPDF2PNG_COMMIT below to the resulting 40-char SHA.
 FASTPDF2PNG_COMMIT="9f82350f7d6e1d0f6320abfb298865e7d544a286"
 TMP_DIR="/tmp/fastpdf2png_build_$$"

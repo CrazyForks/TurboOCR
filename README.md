@@ -252,6 +252,25 @@ Per-page fields:
 >
 > **Deployment recommendation:** If your service accepts PDFs from untrusted sources, do **not** set `ENABLE_PDF_MODE` to `geometric` or `auto` globally. Keep the default `ocr` and only use text-layer modes for trusted internal workflows.
 
+### Page Images & Auto-Rotation
+
+`/ocr/pdf?images=inline` returns each rendered page as a base64 image in the
+JSON response (`image_b64` + `image_content_type`). Per-request controls:
+`format=png|jpeg|webp` (default `png`), `quality=1-100`, `lossless=0/1`,
+`png_compression=0-9`, `max_side=N` (fit-within resize). JPEG is GPU-encoded
+via nvJPEG (see `TURBO_PDF_IMAGE_ENCODER`).
+
+Add `&autorotate=1` to de-rotate scanned/rotated pages upright. The
+doc-orientation model (PP-LCNet_x1_0_doc_ori, 0/90/180/270) detects each OCR
+page's rotation and the page is turned upright **before** detection — so the
+returned image, the boxes, and the recognized text all come back in one
+upright frame. Each page reports the detected clockwise rotation as
+`orientation_deg`. PDF `/Rotate`-flagged pages already render upright (handled
+by the rasterizer) and aren't touched; born-digital text-layer (`geometric`)
+pages are skipped (they're upright by construction). Requires the
+doc-orientation model — absent it, `autorotate=1` returns `400
+AUTOROTATE_DISABLED` (see `DOC_ORI_ONNX`).
+
 ### Layout Detection
 
 All endpoints accept `?layout=1` to detect document regions using [PP-DocLayoutV3](https://huggingface.co/PaddlePaddle/PP-DocLayoutV3) (25 classes):
@@ -371,9 +390,14 @@ Reproduce: `python tests/benchmark/comparison/bench_turbo_ocr.py` (requires runn
 | `TURBO_OCR_HOST` | `0.0.0.0` | Bind address for HTTP and gRPC listeners. Default binds every IPv4 interface; use `127.0.0.1` for loopback only, `::` for all interfaces incl. IPv6, or a specific interface IP. Equivalent CLI flag: `--host`. |
 | `PORT` / `GRPC_PORT` | `8080` / `50051` | Server ports. The binary listens on `PORT=8080` by default; the Docker image runs nginx in front of it on port `8000`, so external clients use `8000` and `PORT` only matters for direct/native runs. |
 | `PDF_DAEMONS` / `PDF_WORKERS` | `16` / `4` | PDF render parallelism |
+| `TURBO_PDF_IMAGE_ENCODER` | `gpu` | Encoder for inline JPEG page images on `/ocr/pdf?images=inline&format=jpeg`. `gpu` uses nvJPEG (entropy coding on the GPU, freeing the CPU core); `cpu` uses libjpeg-turbo. GPU build only — inert on the CPU-only build. Falls back to CPU automatically if nvJPEG init fails. |
+| `TURBO_PPM_SWAP` | `simd` | RGB→BGR conversion for rendered PDF pages. `simd` uses OpenCV's vectorized `cvtColor`; `scalar` forces the plain byte loop. CPU-only path — no GPU required. |
+| `DOC_ORI_ONNX` | `models/doc_ori.onnx` | Document-orientation model (PP-LCNet_x1_0_doc_ori) for `/ocr/pdf?autorotate=1`. Optional — if the file is absent, autorotate requests return `400 AUTOROTATE_DISABLED` and everything else is unaffected. Fetch/convert it with `python scripts/export_doc_ori.py`. |
 | `GRPC_BATCH_WORKERS` | `8` | Parallel workers in gRPC `RecognizeBatch` for fan-out across pipeline pool |
 | `HTTP_THREADS` | `pool * 32` | Work pool threads for blocking inference |
-| `MAX_PDF_PAGES` | `2000` | Maximum pages per PDF request |
+| `MAX_PDF_PAGES` | `2000` | Maximum pages per PDF request. Honored by HTTP `/ocr/pdf` and gRPC `RecognizePDF`; also settable via `--max-pdf-pages`. Over the limit → `400 PDF_TOO_LARGE`. |
+| `MAX_BATCH_IMAGES` | `1024` | Maximum images per `/ocr/batch` (HTTP + gRPC `RecognizeBatch`) request. Over the limit → `400 BATCH_TOO_LARGE`, rejected before any per-slot allocation (an unbounded array is otherwise an OOM lever when the service is exposed). Also `--max-batch-images`. |
+| `MAX_PDF_PAGE_PIXELS_MP` | `40` | Max rendered megapixels per PDF page (width×height after mediabox×dpi). Caps the rasterized buffer and any inline page image — a decompression-bomb guard independent of the per-side 16384px cap. Range 1–268; an over-cap page is dropped (reported as a page decode failure). |
 | `SHUTDOWN_GRACE_SECONDS` | `30` | Seconds to wait for inflight requests to drain on SIGTERM/SIGINT before tearing down. Set to stay below your orchestrator's SIGKILL grace (K8s default 30s). |
 | `GRPC_CQS` | `10` | Number of gRPC completion queues. Higher values trade memory for connection-handling parallelism on high-fanout deployments. |
 | `GRPC_RESPONSE_MODE` | `json_bytes` | gRPC response format: `json_bytes` (default — full JSON in `json_response` field) or `structured` (typed protobuf fields). |

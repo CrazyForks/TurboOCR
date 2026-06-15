@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <stdexcept>
 #include <vector>
@@ -100,6 +101,21 @@ public:
       if (!cv_.wait_for(lock, timeout_, [this] { return !pool_.empty(); }))
         throw turbo_ocr::PoolExhaustedError();
     }
+    auto *p = pool_.front();
+    pool_.pop();
+    return ScopedHandle(p, this);
+  }
+
+  /// Bounded acquire for readiness/health probes: returns nullopt instead of
+  /// throwing when no pipeline frees within `wait`. The pool's own timeout_
+  /// may be infinite (CPU pool), so acquire() can never time out — a probe
+  /// must use this so it can report NOT-ready rather than block a handler
+  /// thread indefinitely under saturation.
+  [[nodiscard]] std::optional<ScopedHandle>
+  try_acquire_for(std::chrono::milliseconds wait) {
+    std::unique_lock lock(mutex_);
+    if (!cv_.wait_for(lock, wait, [this] { return !pool_.empty(); }))
+      return std::nullopt;
     auto *p = pool_.front();
     pool_.pop();
     return ScopedHandle(p, this);

@@ -35,6 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nginx \
     gosu \
     libwebp-dev \
+    libturbojpeg0-dev \
     libgrpc++-dev \
     libc-ares-dev \
     libprotobuf-dev \

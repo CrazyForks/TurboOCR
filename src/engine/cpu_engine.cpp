@@ -1,9 +1,13 @@
 #include "turbo_ocr/engine/cpu_engine.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <iostream>
 #include <numeric>
+#include <stdexcept>
+#include <string>
+#include <thread>
 
 // CoreML support on macOS (Apple Neural Engine + GPU acceleration)
 #ifdef __APPLE__
@@ -12,7 +16,53 @@
 
 using namespace turbo_ocr::engine;
 
+Ort::Env &CpuEngine::process_env() {
+  // ORT keeps one Env per process and fixes its threadpool config at first
+  // creation. We therefore create exactly one Env here, lazily, and decide
+  // global-vs-per-session threadpools up front from ORT_SHARED_POOL. (An
+  // eagerly constructed plain per-engine Env would win the singleton, and a
+  // later DisablePerSessionThreads() session would then abort with "env must be
+  // created with CreateEnvWithGlobalThreadPools".)
+  static Ort::Env env = [] {
+    bool shared = false;
+    if (const char *e = std::getenv("ORT_SHARED_POOL"))
+      shared = (std::strcmp(e, "1") == 0);
+    if (!shared)
+      return Ort::Env(ORT_LOGGING_LEVEL_WARNING, "CpuEngine");
+
+    // Shared global intra-op threadpool sized to ORT_GLOBAL_THREADS (default
+    // hardware_concurrency). Avoids the oversubscription of N sessions × M
+    // concurrent engines each spinning up their own pool on a fixed core count.
+    int n = static_cast<int>(std::thread::hardware_concurrency());
+    if (const char *e = std::getenv("ORT_GLOBAL_THREADS")) {
+      int v = std::atoi(e);
+      if (v > 0)
+        n = v;
+    }
+    if (n <= 0)
+      n = 1;
+    Ort::ThreadingOptions topt;
+    topt.SetGlobalIntraOpNumThreads(n);
+    topt.SetGlobalInterOpNumThreads(1);
+    topt.SetGlobalDenormalAsZero();
+    std::cout << std::format("[CpuEngine] Shared ORT threadpool: {} threads", n)
+              << '\n';
+    return Ort::Env(topt, ORT_LOGGING_LEVEL_WARNING, "CpuEngine");
+  }();
+  return env;
+}
+
 CpuEngine::CpuEngine(const std::string &model_path) : model_path_(model_path) {
+  if (const char *env = std::getenv("ORT_EP"))
+    ort_ep_ = env;
+
+  if (const char *env = std::getenv("ORT_SHARED_POOL"))
+    use_shared_pool_ = (std::strcmp(env, "1") == 0);
+  // XNNPACK runs ops on its own intra-op threadpool; the shared global pool /
+  // DisablePerSessionThreads path conflicts with it, so force it off for xnnpack.
+  if (ort_ep_ == "xnnpack")
+    use_shared_pool_ = false;
+
   // CPU optimizations — balance threads per inference vs concurrency
   if (const char *env = std::getenv("ORT_NUM_THREADS"))
     session_options_.SetIntraOpNumThreads(std::atoi(env));
@@ -23,6 +73,15 @@ CpuEngine::CpuEngine(const std::string &model_path) : model_path_(model_path) {
       GraphOptimizationLevel::ORT_ENABLE_ALL);
   session_options_.EnableCpuMemArena();
   session_options_.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+
+  // Flush denormal activations to zero — correctness-neutral, avoids the
+  // microcode penalty if any near-zero values appear mid-graph.
+  session_options_.AddConfigEntry("session.set_denormal_as_zero", "1");
+
+  // Draw threads from the shared global pool instead of a per-session one.
+  // Requires an Env built with global threadpools (see process_env()).
+  if (use_shared_pool_)
+    session_options_.DisablePerSessionThreads();
 
   // On macOS: use CoreML for Neural Engine + GPU acceleration
   // Supported ops run on ANE/GPU, unsupported fall back to CPU automatically
@@ -45,11 +104,62 @@ CpuEngine::CpuEngine(const std::string &model_path) : model_path_(model_path) {
 #endif
 }
 
+void CpuEngine::apply_execution_provider() {
+  // Applied to every model (det/rec/cls). Unset/"cpu" keeps the default MLAS CPU
+  // EP; for other EPs unsupported ops still fall back to the CPU EP. All calls
+  // route through the OrtApi (GetApi()) so they link regardless of which
+  // providers a given onnxruntime build ships; an unavailable provider throws
+  // here and is turned into a clean load() failure by the caller.
+  if (ort_ep_.empty() || ort_ep_ == "cpu")
+    return;
+
+  if (ort_ep_ == "xnnpack") {
+    // XNNPACK manages its own threads; size from ORT_NUM_THREADS or all cores.
+    int n = static_cast<int>(std::thread::hardware_concurrency());
+    if (const char *env = std::getenv("ORT_NUM_THREADS")) {
+      int v = std::atoi(env);
+      if (v > 0)
+        n = v;
+    }
+    if (n <= 0)
+      n = 1;
+    session_options_.AppendExecutionProvider(
+        "XNNPACK", {{"intra_op_num_threads", std::to_string(n)}});
+    std::cout << std::format("[CpuEngine] EP=XNNPACK (intra_op_num_threads={})", n)
+              << '\n';
+  } else if (ort_ep_ == "dnnl") {
+    // OrtDnnlProviderOptions is opaque in this build, so build it through the
+    // API (defaults include use_arena=1) rather than the legacy free function,
+    // which isn't an exported symbol here.
+    OrtDnnlProviderOptions *dnnl_opts = nullptr;
+    Ort::ThrowOnError(Ort::GetApi().CreateDnnlProviderOptions(&dnnl_opts));
+    try {
+      session_options_.AppendExecutionProvider_Dnnl(*dnnl_opts);
+    } catch (...) {
+      Ort::GetApi().ReleaseDnnlProviderOptions(dnnl_opts);
+      throw;
+    }
+    Ort::GetApi().ReleaseDnnlProviderOptions(dnnl_opts);
+    std::cout << "[CpuEngine] EP=oneDNN\n";
+  } else {
+    throw std::runtime_error(
+        std::format("[CpuEngine] Unknown ORT_EP='{}'", ort_ep_));
+  }
+}
+
 bool CpuEngine::load() {
   try {
-    session_ =
-        std::make_unique<Ort::Session>(env_, model_path_.c_str(), session_options_);
+    apply_execution_provider();
+    session_ = std::make_unique<Ort::Session>(
+        process_env(), model_path_.c_str(), session_options_);
   } catch (const Ort::Exception &e) {
+    std::cerr << std::format("[CpuEngine] Failed to load ONNX model: {} - {}", model_path_, e.what()) << '\n';
+    if (!ort_ep_.empty() && ort_ep_ != "cpu")
+      std::cerr << std::format("[CpuEngine] ORT_EP='{}' likely unavailable in this "
+                               "onnxruntime build (provider not compiled in / "
+                               "provider shared library missing)", ort_ep_) << '\n';
+    return false;
+  } catch (const std::exception &e) {
     std::cerr << std::format("[CpuEngine] Failed to load ONNX model: {} - {}", model_path_, e.what()) << '\n';
     return false;
   }
@@ -100,6 +210,47 @@ CpuEngine::infer(const float *input_data,
   result.data.assign(output_data, output_data + output_count);
 
   return result;
+}
+
+CpuEngine::InferResult
+CpuEngine::infer_batch(const float *input_data,
+                       const std::vector<int64_t> &input_shape) {
+  // ORT runs an N-row {B,3,H,W} input in a single Run; the output is the full
+  // {B,seq,classes} tensor. Mechanically identical to infer().
+  return infer(input_data, input_shape);
+}
+
+CpuEngine::InferView
+CpuEngine::infer_batch_view(const float *input_data,
+                           const std::vector<int64_t> &input_shape) {
+  InferView view;
+  if (!session_)
+    return view;
+
+  int64_t input_count =
+      std::accumulate(input_shape.begin(), input_shape.end(), int64_t{1},
+                      std::multiplies<int64_t>());
+
+  static const auto memory_info =
+      Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+  Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+      memory_info, const_cast<float *>(input_data), input_count,
+      input_shape.data(), input_shape.size());
+
+  const char *input_names[] = {input_name_.c_str()};
+  const char *output_names[] = {output_name_.c_str()};
+
+  auto output_tensors = session_->Run(Ort::RunOptions{nullptr}, input_names,
+                                       &input_tensor, 1, output_names, 1);
+
+  // Retain the OrtValue in the engine so its buffer stays alive; the returned
+  // view points directly into it (no copy out).
+  last_output_ = std::move(output_tensors.front());
+  auto type_info = last_output_.GetTensorTypeAndShapeInfo();
+  view.shape = type_info.GetShape();
+  view.data = last_output_.GetTensorData<float>();
+  return view;
 }
 
 void CpuEngine::probe_output_dims(const std::vector<int64_t> &input_shape,

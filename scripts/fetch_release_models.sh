@@ -14,6 +14,7 @@
 #     rec/arabic/{rec.onnx, dict.txt}
 #     rec/korean/{rec.onnx, dict.txt}
 #     rec/thai/{rec.onnx, dict.txt}
+#     doc_ori.onnx                              # autorotate (variant release)
 
 set -euo pipefail
 
@@ -72,6 +73,21 @@ for lang in "${LANGS[@]}"; do
     fetch_verified "dict-${lang}.txt" "$OUT/rec/${lang}/dict.txt"
   fi
 done
+
+# PP-LCNet_x1_0_doc_ori (~6.5 MB) — autorotate (?autorotate=1). Lives on the
+# pdf-page-images variant models release, not the base bundle; sha pinned here
+# so the asset can't change under us. Recipe: scripts/export_doc_ori.py.
+DOC_ORI_RELEASE_URL="${DOC_ORI_RELEASE_URL:-https://github.com/aiptimizer/TurboOCR/releases/download/models-v2.4.0-pdf-page-images}"
+DOC_ORI_SHA256="96e898f047a0e460ba0652e9afb8c874e53872821cfd7a3fec53a5ab62df92f0"
+echo "  doc_ori.onnx -> $OUT/doc_ori.onnx"
+wget --tries=3 --timeout=60 --retry-connrefused -nv \
+  "${DOC_ORI_RELEASE_URL}/doc_ori.onnx" -O "$OUT/doc_ori.onnx.part"
+if [[ "$(sha256sum "$OUT/doc_ori.onnx.part" | awk '{print $1}')" != "$DOC_ORI_SHA256" ]]; then
+  echo "    ERROR: sha256 mismatch for doc_ori.onnx" >&2
+  rm -f "$OUT/doc_ori.onnx.part"
+  exit 1
+fi
+mv "$OUT/doc_ori.onnx.part" "$OUT/doc_ori.onnx"
 
 rm -f "$SUMS_FILE"  # not shipped in image
 echo ""

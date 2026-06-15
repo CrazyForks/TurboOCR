@@ -52,6 +52,10 @@ using ImageDecoder = std::function<cv::Mat(const unsigned char *data, size_t len
 /// Inference function: given cv::Mat + feature flags, run OCR pipeline.
 using InferFunc = std::function<InferResult(const cv::Mat &, const InferOptions &)>;
 
+/// Orientation detector: rendered page -> clockwise rotation deg (0/90/180/270).
+/// Empty/unset when the doc-orientation model isn't loaded (autorotate off).
+using OrientFunc = std::function<int(const cv::Mat &)>;
+
 /// Drogon callback alias.
 using DrogonCallback = std::function<void(const drogon::HttpResponsePtr &)>;
 
@@ -137,6 +141,8 @@ void run_with_error_handling(DrogonCallback &cb, const char *route, F &&fn) {
     fn();
   } catch (const turbo_ocr::PoolExhaustedError &e) {
     cb(error_response(drogon::k503ServiceUnavailable, "SERVER_BUSY", e.what()));
+  } catch (const turbo_ocr::ImageTooLargeError &e) {
+    cb(error_response(drogon::k400BadRequest, "DIMENSIONS_TOO_LARGE", e.what()));
   } catch (const turbo_ocr::ImageDecodeError &e) {
     cb(error_response(drogon::k400BadRequest, "IMAGE_DECODE_FAILED", e.what()));
   } catch (const std::exception &e) {
@@ -245,27 +251,6 @@ inline void register_observability_middleware() {
   return opencv_decode();
 }
 
-[[nodiscard]] inline std::string parse_layout_query(const drogon::HttpRequestPtr &req,
-                                                     bool layout_available,
-                                                     bool *out) {
-  *out = false;
-  auto v = req->getParameter("layout");
-  if (v.empty()) return {};
-  std::string s(v);
-  for (char &c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  bool on;
-  if (s == "1" || s == "true" || s == "on" || s == "yes")       on = true;
-  else if (s == "0" || s == "false" || s == "off" || s == "no") on = false;
-  else return std::format("Invalid layout param: '{}' (expected 0|1)", s);
-  if (on && !layout_available) {
-    return std::string("Layout requested but the layout model is not loaded. "
-                       "Either models/layout/layout.onnx is missing from the "
-                       "image, or the server was started with DISABLE_LAYOUT=1.");
-  }
-  *out = on;
-  return {};
-}
-
 // Parse a generic boolean query param ("1"/"true"/"on"/"yes" etc.).
 // Returns empty string on success and writes to *out; otherwise returns an
 // error message. When the parameter is absent, *out is set to false and an
@@ -298,9 +283,19 @@ parse_query_options(const drogon::HttpRequestPtr &req,
                     bool layout_available,
                     InferOptions *out) {
   *out = {};
-  if (auto err = parse_layout_query(req, layout_available, &out->want_layout);
+  if (auto err = parse_bool_query(req, "layout", &out->want_layout);
       !err.empty())
     return {err, "INVALID_PARAMETER"};
+  if (out->want_layout && !layout_available) {
+    // One stable code for one condition: every "layout feature
+    // unavailable" rejection (layout=1, reading_order=1, as_blocks=1)
+    // returns LAYOUT_DISABLED — the code docs/api/http.md documents.
+    // Malformed values stay INVALID_PARAMETER.
+    return {"Layout requested but the layout model is not loaded. "
+            "Either models/layout/layout.onnx is missing from the "
+            "image, or the server was started with DISABLE_LAYOUT=1.",
+            "LAYOUT_DISABLED"};
+  }
 
   if (auto err = parse_bool_query(req, "reading_order",
                                    &out->want_reading_order);

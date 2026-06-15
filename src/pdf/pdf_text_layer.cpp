@@ -1,6 +1,9 @@
 #include "turbo_ocr/pdf/pdf_text_layer.h"
 
+#include "turbo_ocr/common/box.h"
+
 #include <algorithm>
+#include <climits>
 #include <cstring>
 #include <iostream>
 #include <mutex>
@@ -236,6 +239,15 @@ struct PdfDocument::Impl {
 PdfDocument::PdfDocument(const uint8_t *data, size_t len)
     : impl_(std::make_unique<Impl>()) {
   ensure_pdfium_initialized();
+  // FPDF_LoadMemDocument takes an int length; a >2 GiB body (possible when
+  // MAX_BODY_MB is raised above 2048) would wrap negative and fail-open the
+  // page-count guard. Refuse up front instead. PDFs that large are not a
+  // real workload for in-process text-layer extraction.
+  if (len > static_cast<size_t>(INT_MAX)) {
+    std::cerr << "[pdf_text] PDF body " << len
+              << " bytes exceeds 2 GiB FPDF limit; rejecting\n";
+    return;  // doc_ stays null -> ok() == false
+  }
   // PDFium is not thread-safe: hold the library-wide lock around any
   // FPDF_* call (load, close, page ops, text ops).
   std::lock_guard<std::mutex> gl(pdfium_lock());
@@ -493,6 +505,24 @@ SanityVerdict passes_sanity_check(const std::string &text,
   }
 
   return {true, "trusted"};
+}
+
+void verify_results_with_text_layer(std::vector<OCRResultItem> &results,
+                                    const PdfDocument &doc, int page_index,
+                                    int dpi) {
+  const float px_to_pt = 72.0f / static_cast<float>(dpi);
+  for (auto &item : results) {
+    auto [ix0, iy0, ix1, iy1] = turbo_ocr::aabb(item.box);
+    float x0 = ix0 * px_to_pt, y0 = iy0 * px_to_pt;
+    float x1 = ix1 * px_to_pt, y1 = iy1 * px_to_pt;
+    std::string native = doc.text_in_rect_pt(page_index, x0, y0, x1, y1);
+    auto verdict = passes_sanity_check(native, x1 - x0, y1 - y0);
+    if (verdict.accept) {
+      item.text = std::move(native);
+      item.source = "pdf";
+      item.confidence = 1.0f;
+    }
+  }
 }
 
 } // namespace turbo_ocr::pdf

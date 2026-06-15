@@ -1,12 +1,15 @@
 #include "turbo_ocr/render/pdf_renderer.h"
 #include "turbo_ocr/common/errors.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <string>
 #include <format>
 #include <memory>
 #include <mutex>
@@ -22,6 +25,34 @@
 #include <unistd.h>
 
 using namespace turbo_ocr::render;
+
+// PPM RGB→BGR swap implementation selector (TURBO_PPM_SWAP=scalar forces the
+// old byte loop; validated to {simd, scalar} at startup by ServerConfig).
+// Default uses OpenCV's SIMD cvtColor, markedly faster on a single core.
+// CPU-only path — no GPU required.
+static bool ppm_swap_use_simd() {
+  static const bool simd = [] {
+    const char *e = std::getenv("TURBO_PPM_SWAP");
+    return !(e && std::strcmp(e, "scalar") == 0);
+  }();
+  return simd;
+}
+
+// Max rendered pixels per page (width*height). The per-side 16384 cap below
+// still bounds a single dimension, but a 16384x16384 page is ~268MP → ~768MB
+// raster + a same-size encoded image held in the response: this area cap
+// rejects such pages (decode_ppm returns empty → the route reports a decode
+// failure). Reads MAX_PDF_PAGE_PIXELS_MP (megapixels); ServerConfig validates
+// it to [1,268] at startup. Default 40 MP (e.g. 5000x8000 at ~600 DPI A4).
+static int64_t ppm_max_pixels() {
+  static const int64_t px = [] {
+    const char *e = std::getenv("MAX_PDF_PAGE_PIXELS_MP");
+    int mp = 40;
+    if (e) { try { mp = std::clamp(std::stoi(e), 1, 268); } catch (...) {} }
+    return static_cast<int64_t>(mp) * 1000000;
+  }();
+  return px;
+}
 
 static std::string find_binary() {
   // Explicit override — used by tests and by deployments that put the binary
@@ -158,6 +189,7 @@ cv::Mat PdfRenderer::decode_ppm(const std::string &path) {
   int w = 0, h = 0, maxval = 0;
   if (!next_int(w) || !next_int(h) || !next_int(maxval)) return {};
   if (w <= 0 || h <= 0 || w > 16384 || h > 16384 || maxval != 255) return {};
+  if (static_cast<int64_t>(w) * h > ppm_max_pixels()) return {};  // area bomb guard
   // After maxval there's exactly one whitespace byte before the payload.
   if (p >= end) return {};
   ++p;
@@ -173,17 +205,27 @@ cv::Mat PdfRenderer::decode_ppm(const std::string &path) {
     return bgr;
   }
 
-  // Color: single-pass RGB→BGR copy, one write-back over the pixels.
+  // Color: RGB (PPM) → BGR. OpenCV's cvtColor is a SIMD-vectorized channel
+  // swap — meaningfully faster than a scalar byte loop on the single core that
+  // bottlenecks PDF page-image throughput. The scalar loop is kept as a
+  // fallback selectable with TURBO_PPM_SWAP=scalar.
   cv::Mat bgr(h, w, CV_8UC3);
-  const unsigned char *src = p;
-  unsigned char *dst = bgr.data;
-  const size_t n_px = static_cast<size_t>(w) * h;
-  for (size_t i = 0; i < n_px; ++i) {
-    dst[0] = src[2];
-    dst[1] = src[1];
-    dst[2] = src[0];
-    src += 3;
-    dst += 3;
+  if (ppm_swap_use_simd()) {
+    // Header over the mmap'd RGB payload — no copy; cvtColor reads it and
+    // writes the owned `bgr`, both completing before the munmap at return.
+    cv::Mat rgb(h, w, CV_8UC3, const_cast<unsigned char *>(p));
+    cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+  } else {
+    const unsigned char *src = p;
+    unsigned char *dst = bgr.data;
+    const size_t n_px = static_cast<size_t>(w) * h;
+    for (size_t i = 0; i < n_px; ++i) {
+      dst[0] = src[2];
+      dst[1] = src[1];
+      dst[2] = src[0];
+      src += 3;
+      dst += 3;
+    }
   }
   return bgr;
 }

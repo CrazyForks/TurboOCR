@@ -51,16 +51,15 @@ std::vector<LayoutBox> CpuPaddleLayout::run(const cv::Mat &img,
   cv::resize(img, resized, cv::Size(kInputSize, kInputSize));
 
   std::vector<float> input_chw(3 * kInputSize * kInputSize);
-  for (int y = 0; y < kInputSize; ++y) {
-    for (int x = 0; x < kInputSize; ++x) {
-      auto pixel = resized.at<cv::Vec3b>(y, x);
-      int idx = y * kInputSize + x;
-      int plane = kInputSize * kInputSize;
-      input_chw[0 * plane + idx] = pixel[0] / 255.0f; // B
-      input_chw[1 * plane + idx] = pixel[1] / 255.0f; // G
-      input_chw[2 * plane + idx] = pixel[2] / 255.0f; // R
-    }
-  }
+  constexpr int plane = kInputSize * kInputSize;
+  cv::Mat bgr[3];
+  cv::split(resized, bgr);
+  cv::Mat p_b(kInputSize, kInputSize, CV_32F, input_chw.data());
+  cv::Mat p_g(kInputSize, kInputSize, CV_32F, input_chw.data() + plane);
+  cv::Mat p_r(kInputSize, kInputSize, CV_32F, input_chw.data() + 2 * plane);
+  bgr[0].convertTo(p_b, CV_32F, 1.0 / 255.0); // B
+  bgr[1].convertTo(p_g, CV_32F, 1.0 / 255.0); // G
+  bgr[2].convertTo(p_r, CV_32F, 1.0 / 255.0); // R
 
   // 2. Build inputs: im_shape=[800,800], scale_factor=[800/h, 800/w]
   std::array<float, 2> im_shape = {

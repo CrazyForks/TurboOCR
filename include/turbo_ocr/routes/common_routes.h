@@ -9,7 +9,14 @@ namespace turbo_ocr::routes {
 /// image_routes, so register_common_routes is only used by cpu_main.
 /// readiness_check: optional callable that returns true if the server is ready.
 /// Used by /health/ready to verify GPU/pipeline is responsive.
-void register_health_route(std::function<bool()> readiness_check = nullptr);
+/// `pool`: when non-null, the readiness check is offloaded to the WorkPool
+/// so it never blocks a Drogon event-loop thread — a blocked probe stalls
+/// that IO thread and, under load, can trip the k8s readiness timeout and
+/// evict a healthy-but-busy pod. Both the GPU check (a real inference on a
+/// cache miss) and the CPU check (a blocking pool->acquire()) are heavy
+/// enough to require this, so callers should always pass their pool.
+void register_health_route(std::function<bool()> readiness_check = nullptr,
+                           server::WorkPool *pool = nullptr);
 
 void register_ocr_base64_route(server::WorkPool &pool,
                                 const server::InferFunc &infer,

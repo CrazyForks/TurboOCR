@@ -77,6 +77,10 @@ int main(int argc, char **argv) {
   g_shutdown_grace_seconds.store(cfg.shutdown_grace_seconds,
                                   std::memory_order_release);
 
+  // Parallelism lives at the request level (work-pool threads); OpenCV's
+  // per-op thread pool on top of that just oversubscribes cores under load.
+  cv::setNumThreads(0);
+
   const auto &rec_paths = cfg.rec_paths;
   if (!cfg.ocr_lang_value.empty())
     TOCR_LOG_INFO("Language selected via OCR_LANG",
@@ -102,16 +106,36 @@ int main(int argc, char **argv) {
   };
   require_model(cfg.det_onnx, "DET");
   require_model(rec_paths.rec, "REC");
-  require_model(cfg.cls_onnx, "CLS");
+  if (!cfg.pdf_only)
+    require_model(cfg.cls_onnx, "CLS");
 
   // Auto-build TRT engines from ONNX (cached by TRT version + model hash)
   // Sweep orphan .trt.tmp.* files left by previous crashed processes; safe
   // because in-progress builds by sibling replicas are protected by the
   // 60-second min-age window inside the sweeper.
   turbo_ocr::engine::sweep_orphan_engine_temps();
-  auto det_model = turbo_ocr::engine::ensure_trt_engine(cfg.det_onnx, "det");
+  // PDF-only hybrid mode: build DET with a STATIC shape (min==opt==max at
+  // {pdf_batch, 3, pdf_page_h, pdf_page_w}) so TRT specializes tactics for
+  // the one shape every rendered page has. The "det_pdf_static" type makes
+  // onnx_to_trt emit that profile and bake the dims into the cache key.
+  // REC stays the DYNAMIC 5-bucket engine: benchmarks showed a single-width
+  // static rec squishes wide text lines and drops recall to 70-80% on
+  // multi-column/dense pages (vs 98% dynamic) for only ~10-20% speed.
+  // CLS is skipped entirely (rendered PDF pages are upright by
+  // construction), saving its build + per-request pass.
+  const char *det_type = cfg.pdf_only ? "det_pdf_static" : "det";
+  auto det_model = turbo_ocr::engine::ensure_trt_engine(cfg.det_onnx, det_type);
   auto rec_model = turbo_ocr::engine::ensure_trt_engine(rec_paths.rec, "rec");
-  auto cls_model = turbo_ocr::engine::ensure_trt_engine(cfg.cls_onnx, "cls");
+  std::string cls_model;
+  if (!cfg.pdf_only) {
+    cls_model = turbo_ocr::engine::ensure_trt_engine(cfg.cls_onnx, "cls");
+  } else {
+    TOCR_LOG_INFO("PDF-only hybrid: static batched det + dynamic 5-bucket rec, cls skipped",
+                  "dpi",       cfg.pdf_dpi,
+                  "page_h",    cfg.pdf_page_h,
+                  "page_w",    cfg.pdf_page_w,
+                  "batch",     cfg.pdf_batch);
+  }
   if (cfg.disable_angle_cls) {
     cls_model.clear();
     TOCR_LOG_INFO("Angle classification disabled via DISABLE_ANGLE_CLS=1");
@@ -147,7 +171,12 @@ int main(int argc, char **argv) {
   }
   turbo_ocr::pdf::ensure_pdfium_initialized();
 
-  // Pipeline pool
+  // Pipeline pool. Throughput is GPU-compute-bound on this stack: a clean
+  // pool sweep (RTX 5090, FUNSD) plateaus by ~5 pipelines (5→278, 8→263,
+  // 10→258 img/s) because the det/rec kernels already saturate the GPU and
+  // extra pipelines only add scheduling/cache pressure. So the ladder caps at
+  // 5 deliberately — raising it costs VRAM for negative throughput. Explicit
+  // --pool-size overrides.
   int pool_size = 4;
   if (cfg.pipeline_pool_size) {
     pool_size = *cfg.pipeline_pool_size;
@@ -163,8 +192,25 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Document-orientation engine (optional) — powers /ocr/pdf?autorotate=1.
+  // Soft-disable if the model is absent: ensure_trt_engine returns "" and
+  // autorotate requests are then rejected with AUTOROTATE_DISABLED.
+  std::string doc_ori_model =
+      turbo_ocr::engine::ensure_trt_engine(cfg.doc_ori_onnx, "doc_ori");
+  if (doc_ori_model.empty())
+    TOCR_LOG_WARN("Doc-orientation model (doc_ori.onnx) not found; autorotate disabled");
+  else
+    TOCR_LOG_INFO("Doc-orientation (autorotate) enabled");
+
   auto dispatcher = turbo_ocr::pipeline::make_pipeline_dispatcher(
-      pool_size, det_model, rec_model, rec_dict, cls_model, layout_model);
+      pool_size, det_model, rec_model, rec_dict, cls_model, layout_model,
+      cfg.pdf_only ? cfg.pdf_batch  : 0,
+      cfg.pdf_only ? cfg.pdf_page_h : 0,
+      cfg.pdf_only ? cfg.pdf_page_w : 0,
+      doc_ori_model);
+  // Some pipelines may have failed to init (logged); key downstream sizing
+  // off the count actually built.
+  pool_size = static_cast<int>(dispatcher->worker_count());
 
   // PDF renderer
   const int pdf_daemons = cfg.pdf_daemons;
@@ -272,10 +318,15 @@ int main(int argc, char **argv) {
     probe->last_check_ms.store(now_ms, std::memory_order_release);
     return ok;
   };
-  turbo_ocr::routes::register_health_route(readiness);
+  turbo_ocr::routes::register_health_route(readiness, &work_pool);
   turbo_ocr::routes::register_ocr_base64_route(work_pool, infer, decode, layout_available);
-  turbo_ocr::routes::register_image_routes(work_pool, *dispatcher, decode, nvjpeg_available, layout_available);
-  turbo_ocr::routes::register_pdf_route(work_pool, *dispatcher, pdf_renderer, default_pdf_mode, layout_available);
+  turbo_ocr::routes::register_image_routes(work_pool, *dispatcher, decode, nvjpeg_available, layout_available,
+                                           cfg.max_batch_images);
+  turbo_ocr::routes::register_pdf_route(work_pool, *dispatcher, pdf_renderer, default_pdf_mode, layout_available,
+                                        cfg.pdf_only ? cfg.pdf_batch : 0,
+                                        cfg.pdf_only ? cfg.pdf_dpi : 100,
+                                        cfg.max_pdf_pages,
+                                        /*doc_ori_available=*/!doc_ori_model.empty());
 
   // gRPC
   auto grpc_handle = turbo_ocr::server::start_grpc_server(

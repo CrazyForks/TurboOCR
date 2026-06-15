@@ -2,6 +2,8 @@
 
 #include "turbo_ocr/common/types.h"
 #include "turbo_ocr/layout/layout_types.h"
+#include "turbo_ocr/pipeline/pipeline_result.h"
+#include "turbo_ocr/router/router_types.h"
 #include <climits>
 #include <cstdio>
 #include <string>
@@ -136,6 +138,74 @@ inline void append_reading_order_array(std::string &j,
   for (size_t i = 0; i < order.size(); ++i) {
     if (i > 0) j += ',';
     j += std::to_string(order[i]);
+  }
+  j += ']';
+}
+
+// Full JSON-string escape. Tables emit HTML (quotes, ampersands) and
+// formulas emit LaTeX (backslashes, braces) — both need every escape
+// the OCR text branch uses. Caller writes the surrounding quotes.
+inline void append_escaped_string(std::string &j, const std::string &s) {
+  for (char c : s) {
+    auto uc = static_cast<unsigned char>(c);
+    switch (c) {
+      case '"':  j += "\\\""; break;
+      case '\\': j += "\\\\"; break;
+      case '\b': j += "\\b";  break;
+      case '\f': j += "\\f";  break;
+      case '\n': j += "\\n";  break;
+      case '\r': j += "\\r";  break;
+      case '\t': j += "\\t";  break;
+      default:
+        if (uc < 0x20) {
+          char buf[7];
+          snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(uc));
+          j += buf;
+        } else {
+          j += c;
+        }
+    }
+  }
+}
+
+inline void append_tables_array(std::string &j,
+                                 const std::vector<router::TableResult> &tables) {
+  j += "\"tables\":[";
+  for (size_t i = 0; i < tables.size(); ++i) {
+    if (i > 0) j += ',';
+    const auto &t = tables[i];
+    j += "{\"layout_id\":";
+    j += std::to_string(t.layout_id);
+    j += ",\"html\":\"";
+    append_escaped_string(j, t.html);
+    j += "\",\"confidence\":";
+    char conf_str[16];
+    snprintf(conf_str, sizeof(conf_str), "%.5g", t.score);
+    j += conf_str;
+    j += ",\"bounding_box\":";
+    append_box(j, t.box);
+    j += '}';
+  }
+  j += ']';
+}
+
+inline void append_formulas_array(std::string &j,
+                                   const std::vector<router::FormulaResult> &formulas) {
+  j += "\"formulas\":[";
+  for (size_t i = 0; i < formulas.size(); ++i) {
+    if (i > 0) j += ',';
+    const auto &f = formulas[i];
+    j += "{\"layout_id\":";
+    j += std::to_string(f.layout_id);
+    j += ",\"latex\":\"";
+    append_escaped_string(j, f.latex);
+    j += "\",\"confidence\":";
+    char conf_str[16];
+    snprintf(conf_str, sizeof(conf_str), "%.5g", f.score);
+    j += conf_str;
+    j += ",\"bounding_box\":";
+    append_box(j, f.box);
+    j += '}';
   }
   j += ']';
 }
@@ -486,6 +556,47 @@ emit_results_json(std::vector<OCRResultItem> &results,
   return want_blocks
              ? results_with_blocks(results, layout, reading_order)
              : results_with_reading_order(results, layout, reading_order);
+}
+
+// OcrPipelineResult emitter. Conditionally appends `tables` and `formulas`
+// when populated by the CUA router stages. Text-only pages where the
+// router never fired produce a response byte-identical to
+// emit_results_json above — both vectors are empty and their keys are
+// omitted entirely. Reuses the same `assign_layout_ids` mutation so the
+// `id`/`layout_id` fields are consistent with the legacy emitters.
+[[nodiscard]] inline std::string
+emit_pipeline_result_json(pipeline::OcrPipelineResult &out,
+                          bool want_blocks) {
+  assign_layout_ids(out.results, out.layout);
+  std::string j;
+  j.reserve(out.results.size() * 220 +
+            out.layout.size() * 200 +
+            out.tables.size() * 256 +
+            out.formulas.size() * 192);
+  j += '{';
+  detail::append_results_array(j, out.results);
+  if (!out.layout.empty()) {
+    j += ',';
+    detail::append_layout_array(j, out.layout);
+  }
+  if (!out.reading_order.empty()) {
+    j += ',';
+    detail::append_reading_order_array(j, out.reading_order);
+  }
+  if (want_blocks && !out.reading_order.empty() && !out.layout.empty()) {
+    j += ',';
+    detail::append_blocks_array(j, out.results, out.layout, out.reading_order);
+  }
+  if (!out.tables.empty()) {
+    j += ',';
+    detail::append_tables_array(j, out.tables);
+  }
+  if (!out.formulas.empty()) {
+    j += ',';
+    detail::append_formulas_array(j, out.formulas);
+  }
+  j += '}';
+  return j;
 }
 
 } // namespace turbo_ocr

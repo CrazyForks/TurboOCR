@@ -34,7 +34,11 @@ if [ "$ACTUAL_SHA" != "$FASTPDF2PNG_COMMIT" ]; then
   exit 1
 fi
 
-# Pre-seed PDFium from the vendored copy if we have one, so the build doesn't
+# Make sure third_party/pdfium matches the build arch (no-op on x86_64; fetches
+# the arm64 PDFium on aarch64) before we seed it into the fastpdf2png build.
+bash "$SCRIPT_DIR/install_pdfium.sh"
+
+# Pre-seed PDFium from the (now arch-correct) vendored copy so the build doesn't
 # need network access to github.com/bblanchon/pdfium-binaries (which has been
 # rate-limit-flaky from inside Docker builds).
 VENDORED_PDFIUM="$ROOT/third_party/pdfium"

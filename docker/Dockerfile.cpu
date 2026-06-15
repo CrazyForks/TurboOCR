@@ -22,6 +22,12 @@
 #     https://registry-1.docker.io/v2/library/ubuntu/manifests/24.04 | grep -i docker-content-digest
 FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
 
+# Target architecture, set automatically by `docker buildx` (amd64 | arm64).
+# ubuntu:24.04 is multi-arch; the ONNX Runtime + PDFium steps below pick the
+# matching builds. Build aarch64 with:
+#   docker buildx build --platform linux/arm64 -f docker/Dockerfile.cpu -t turbo-ocr-cpu .
+ARG TARGETARCH
+
 # Avoid interactive prompts during apt install
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -69,14 +75,21 @@ RUN cd /tmp && \
 #   curl -sL https://github.com/microsoft/onnxruntime/releases/download/v<NEW>/onnxruntime-linux-x64-<NEW>.tgz | sha256sum
 ARG ORT_VERSION=1.22.0
 ARG ORT_SHA256=8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3
+# The aarch64 tarball has a different hash; pass --build-arg ORT_SHA256_ARM64=...
+# to verify it (empty = download without checksum).
+ARG ORT_SHA256_ARM64=
 RUN cd /tmp && \
-    wget -q "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" -O onnxruntime-linux-x64-${ORT_VERSION}.tgz && \
-    echo "${ORT_SHA256}  onnxruntime-linux-x64-${ORT_VERSION}.tgz" | sha256sum -c - && \
-    tar xzf onnxruntime-linux-x64-${ORT_VERSION}.tgz && \
-    cp -r onnxruntime-linux-x64-${ORT_VERSION}/include/* /usr/local/include/ && \
-    cp onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so* /usr/local/lib/ && \
+    case "${TARGETARCH:-amd64}" in \
+      arm64) ORT_ARCH=aarch64; ORT_SHA=${ORT_SHA256_ARM64} ;; \
+      *)     ORT_ARCH=x64;     ORT_SHA=${ORT_SHA256} ;; \
+    esac && \
+    wget -q "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}.tgz" -O ort.tgz && \
+    if [ -n "${ORT_SHA}" ]; then echo "${ORT_SHA}  ort.tgz" | sha256sum -c -; else echo "WARN: no SHA256 pinned for ${ORT_ARCH} ONNX Runtime; skipping checksum"; fi && \
+    tar xzf ort.tgz && \
+    cp -r onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}/include/* /usr/local/include/ && \
+    cp onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}/lib/libonnxruntime.so* /usr/local/lib/ && \
     ldconfig && \
-    rm -rf /tmp/onnxruntime*
+    rm -rf /tmp/onnxruntime* /tmp/ort.tgz
 
 WORKDIR /app
 
@@ -90,13 +103,15 @@ COPY tools/ tools/
 COPY third_party/ third_party/
 COPY tests/ tests/
 COPY scripts/install_fastpdf2png.sh scripts/install_fastpdf2png.sh
+COPY scripts/install_pdfium.sh scripts/install_pdfium.sh
 
 # Install PDFium (vendored) and fastpdf2png for PDF rendering. install_fastpdf2png.sh
 # pre-seeds its PDFium from third_party/ so the build doesn't need network access
 # for PDFium; if the install fails, fail the Docker build — the PDF-renderer
 # liveness probe would only surface this at container start, which is much worse.
-RUN cp third_party/pdfium/lib/libpdfium.so /usr/lib/ && ldconfig && \
-    bash scripts/install_fastpdf2png.sh && \
+RUN TARGETARCH=${TARGETARCH} bash scripts/install_pdfium.sh && \
+    cp third_party/pdfium/lib/libpdfium.so /usr/lib/ && ldconfig && \
+    TARGETARCH=${TARGETARCH} bash scripts/install_fastpdf2png.sh && \
     { cp bin/libpdfium.so /usr/lib/ 2>/dev/null || true; } && \
     ldconfig
 

@@ -3,14 +3,21 @@
 #include <cstdlib>
 #include <format>
 #include <fstream>
-#include <immintrin.h>
 #include <iostream>
 #include <string>
 #include <utility>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define TURBO_CTC_HAVE_AVX2 1
+#else
+#define TURBO_CTC_HAVE_AVX2 0
+#endif
+
 namespace turbo_ocr::recognition {
 
 namespace {
+#if TURBO_CTC_HAVE_AVX2
 // AVX2 argmax over a contiguous row of floats. Matches the scalar reference
 // exactly, INCLUDING tie-breaking (lowest index wins on equal values): the
 // per-lane compare uses strict >, so a lane keeps its lowest index on ties,
@@ -56,6 +63,7 @@ inline bool simd_ctc_enabled() {
   }();
   return e;
 }
+#endif // TURBO_CTC_HAVE_AVX2
 } // namespace
 
 std::pair<std::string, float>
@@ -92,18 +100,21 @@ ctc_greedy_decode_raw(const float *logits, int seq_len, int num_classes,
   int count = 0;
   int last_index = -1;
 
+#if TURBO_CTC_HAVE_AVX2
   const bool use_simd = simd_ctc_enabled();
+#endif
   for (int i = 0; i < seq_len; i++) {
     const float *row = logits + i * num_classes;
-    int index;
-    float max_val;
+    int index = 0;
+    float max_val = row[0];
+#if TURBO_CTC_HAVE_AVX2
     if (use_simd) {
       auto [mv, mi] = argmax_avx2(row, num_classes);
       max_val = mv;
       index = mi;
-    } else {
-      index = 0;
-      max_val = row[0];
+    } else
+#endif
+    {
       for (int j = 1; j < num_classes; j++) {
         if (row[j] > max_val) {
           max_val = row[j];

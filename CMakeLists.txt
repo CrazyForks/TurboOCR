@@ -47,6 +47,27 @@ else()
   set(TURBO_OCR_CXX_FLAGS -O3 -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 endif()
 
+# --- Target architecture detection (x86_64 / aarch64) ----------------------
+# The binaries vendored in third_party/ (ONNX Runtime, PDFium) and bin/
+# (fastpdf2png) are x86_64. On aarch64 the build fetches the matching
+# ONNX Runtime release and PDFium build instead of linking the x86 copies.
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _turbo_proc)
+if(_turbo_proc MATCHES "aarch64|arm64")
+  set(TURBO_ARCH "aarch64")
+  set(TURBO_ORT_URL_ARCH "aarch64")
+else()
+  set(TURBO_ARCH "x64")
+  set(TURBO_ORT_URL_ARCH "x64")
+endif()
+message(STATUS "Turbo OCR target arch: ${CMAKE_SYSTEM_PROCESSOR} -> ${TURBO_ARCH}")
+
+# PDFium location. x86_64 uses the vendored copy; aarch64 expects an arm64
+# PDFium unpacked to third_party/pdfium by scripts/install_pdfium.sh (which
+# pulls pdfium-linux-arm64 from bblanchon/pdfium-binaries). Both layouts are
+# {include/, lib/libpdfium.so}, so only the root differs.
+set(TURBO_PDFIUM_DIR "${CMAKE_SOURCE_DIR}/third_party/pdfium"
+    CACHE PATH "Root of the PDFium SDK (include/ + lib/)")
+
 # Profile-Guided Optimization. Two-pass build on the SAME build dir:
 #   1. cmake -DPGO_MODE=generate && build  →  run a representative workload
 #   2. cmake -DPGO_MODE=use      && build  →  recompiles using the *.gcda profile
@@ -196,20 +217,45 @@ if(USE_CPU_ONLY)
     # Prefer system-installed ORT (Dockerfile installs to /usr/local/lib).
     # If not found, FetchContent downloads the same pinned tarball as
     # docker/Dockerfile.cpu so native CPU builds stay reproducible.
+    # The vendored third_party/onnxruntime is x86_64. On x86_64 it is preferred;
+    # on aarch64 it is the wrong arch, so trust only /usr/local (Docker installs
+    # the right arch there) or a fresh arch-matched fetch.
+    if(TURBO_ARCH STREQUAL "x64")
+        set(_ort_tp_lib ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/lib)
+        set(_ort_tp_inc ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/include)
+    else()
+        set(_ort_tp_lib "")
+        set(_ort_tp_inc "")
+    endif()
     find_library(ONNXRUNTIME_LIB onnxruntime
-        HINTS /usr/local/lib ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/lib)
+        HINTS /usr/local/lib ${_ort_tp_lib})
     find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
-        HINTS /usr/local/include ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/include)
+        HINTS /usr/local/include ${_ort_tp_inc})
     if(NOT ONNXRUNTIME_LIB OR NOT ONNXRUNTIME_INCLUDE_DIR)
         include(FetchContent)
         set(ORT_VERSION "1.22.0" CACHE STRING "ONNX Runtime version to fetch")
-        set(ORT_SHA256 "8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3")
-        message(STATUS "ONNX Runtime not found; fetching v${ORT_VERSION}")
-        FetchContent_Declare(onnxruntime_prebuilt
-            URL      https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz
-            URL_HASH SHA256=${ORT_SHA256}
-            SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/onnxruntime
-        )
+        # SHA256 of onnxruntime-linux-<arch>-${ORT_VERSION}.tgz. The x64 hash is
+        # pinned; the aarch64 tarball has a different hash per release, so pass
+        # -DORT_SHA256=... in the aarch64 build/CI (empty = fetch without check).
+        if(TURBO_ARCH STREQUAL "x64")
+            set(ORT_SHA256 "8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3"
+                CACHE STRING "ONNX Runtime tarball SHA256")
+        else()
+            set(ORT_SHA256 "" CACHE STRING "ONNX Runtime aarch64 tarball SHA256 (set in CI)")
+        endif()
+        set(_ort_url "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${TURBO_ORT_URL_ARCH}-${ORT_VERSION}.tgz")
+        message(STATUS "ONNX Runtime not found; fetching v${ORT_VERSION} (${TURBO_ORT_URL_ARCH})")
+        if(ORT_SHA256 STREQUAL "")
+            message(WARNING "ORT_SHA256 unset for ${TURBO_ARCH}; fetching ONNX Runtime without hash verification")
+            FetchContent_Declare(onnxruntime_prebuilt
+                URL "${_ort_url}"
+                SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/onnxruntime)
+        else()
+            FetchContent_Declare(onnxruntime_prebuilt
+                URL "${_ort_url}"
+                URL_HASH SHA256=${ORT_SHA256}
+                SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/onnxruntime)
+        endif()
         FetchContent_MakeAvailable(onnxruntime_prebuilt)
         find_library(ONNXRUNTIME_LIB onnxruntime
             HINTS ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/lib REQUIRED)
@@ -269,11 +315,11 @@ if(USE_CPU_ONLY)
     # libjpeg-turbo: fast JPEG encode for inline page-image export.
     find_library(TURBOJPEG_LIB turbojpeg REQUIRED)
     target_include_directories(turbo_ocr_cpu PUBLIC
-        ${CMAKE_SOURCE_DIR}/third_party/pdfium/include
+        ${TURBO_PDFIUM_DIR}/include
         ${ONNXRUNTIME_INCLUDE_DIR}
     )
     target_link_libraries(turbo_ocr_cpu PUBLIC turbo_ocr_common ${ONNXRUNTIME_LIB}
-        ${CMAKE_SOURCE_DIR}/third_party/pdfium/lib/libpdfium.so pthread
+        ${TURBO_PDFIUM_DIR}/lib/libpdfium.so pthread
         ${TURBOJPEG_LIB})
     target_compile_options(turbo_ocr_cpu PRIVATE ${TURBO_OCR_CXX_FLAGS})
     target_compile_definitions(turbo_ocr_cpu PUBLIC USE_CPU_ONLY)
@@ -401,7 +447,7 @@ else()
         ${CUDAToolkit_INCLUDE_DIRS}
         ${TENSORRT_DIR}/include
         ${PROTO_GEN_DIR}
-        ${CMAKE_SOURCE_DIR}/third_party/pdfium/include
+        ${TURBO_PDFIUM_DIR}/include
     )
     target_link_directories(turbo_ocr_gpu PUBLIC ${TENSORRT_DIR}/lib)
     # Link libpdfium.so directly for in-process text-layer extraction.
@@ -420,7 +466,7 @@ else()
         nvonnxparser
         nvjpeg
         cudart
-        ${CMAKE_SOURCE_DIR}/third_party/pdfium/lib/libpdfium.so
+        ${TURBO_PDFIUM_DIR}/lib/libpdfium.so
         ${TURBOJPEG_LIB}
     )
     target_compile_options(turbo_ocr_gpu PRIVATE ${TURBO_OCR_CXX_FLAGS})

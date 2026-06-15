@@ -13,14 +13,12 @@
 # Image size: ~500MB (vs ~10GB for GPU image)
 # ============================================================
 
-# Base image pinned by multi-arch manifest digest. To refresh:
-#   docker manifest inspect ubuntu:24.04
-# or for the index digest:
-#   TOKEN=$(curl -s 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/ubuntu:pull' | jq -r .token)
-#   curl -sI -H "Authorization: Bearer $TOKEN" \
-#     -H "Accept: application/vnd.oci.image.index.v1+json" \
-#     https://registry-1.docker.io/v2/library/ubuntu/manifests/24.04 | grep -i docker-content-digest
-FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
+# Base image pinned by the MULTI-ARCH INDEX digest (NOT a single-arch manifest)
+# so `docker buildx --platform linux/arm64` resolves the arm64 variant. Pinning
+# an amd64 manifest digest here silently forces amd64 on arm64 builds. Refresh:
+#   docker pull ubuntu:24.04 && docker inspect ubuntu:24.04 --format '{{index .RepoDigests 0}}'
+# (the digest printed by `docker pull` is the index digest).
+FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54
 
 # Target architecture, set automatically by `docker buildx` (amd64 | arm64).
 # ubuntu:24.04 is multi-arch; the ONNX Runtime + PDFium steps below pick the

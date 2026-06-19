@@ -27,9 +27,15 @@ bool det_fused_pre() {
 }
 } // namespace
 
-bool CpuPaddleDet::load_model(const std::string &model_path) {
-  // Same DET_MAX_SIDE source as the GPU detector + the TRT engine builder.
-  kMaxSideLen = read_det_max_side();
+bool CpuPaddleDet::load_model(const std::string &model_path,
+                             const DetResizeParams &resize, const DbParams &db) {
+  // Same per-model resize + DB-param source as the GPU detector + the TRT
+  // builder; env overrides (read_det_resize/read_db_params) win over the base.
+  resize_ = read_det_resize(resize);
+  const DbParams eff_db = read_db_params(db);
+  db_thresh_ = eff_db.thresh;
+  box_thresh_ = eff_db.box_thresh;
+  unclip_ratio_ = eff_db.unclip_ratio;
   engine_ = std::make_unique<CpuEngine>(model_path);
   return engine_->load();
 }
@@ -37,13 +43,7 @@ bool CpuPaddleDet::load_model(const std::string &model_path) {
 std::vector<Box> CpuPaddleDet::run(const cv::Mat &img) {
   int h = img.rows;
   int w = img.cols;
-  float ratio = 1.0f;
-  if (std::max(h, w) > kMaxSideLen) {
-    ratio = (h > w) ? static_cast<float>(kMaxSideLen) / h
-                    : static_cast<float>(kMaxSideLen) / w;
-  }
-  int resize_h = std::max(static_cast<int>(round(h * ratio / 32.0) * 32), 32);
-  int resize_w = std::max(static_cast<int>(round(w * ratio / 32.0) * 32), 32);
+  auto [resize_h, resize_w] = compute_det_resize(h, w, resize_);
 
   const int plane_size = resize_h * resize_w;
   input_data_buf_.resize(3 * plane_size);
@@ -102,11 +102,11 @@ std::vector<Box> CpuPaddleDet::run(const cv::Mat &img) {
 
   // Threshold to bitmap. compare(CMP_GT) yields a CV_8U 0/255 mask in one SIMD
   // pass -- identical predicate to THRESH_BINARY, no float temp / extra convert.
-  cv::compare(pred_map, kDetDbThresh, bitmap_, cv::CMP_GT);
+  cv::compare(pred_map, db_thresh_, bitmap_, cv::CMP_GT);
 
   // Find contours and extract boxes
   return extract_boxes_from_bitmap(
       pred_map, bitmap_, h, w, resize_h, resize_w,
-      kDetDbBoxThresh, kDetDbUnclipRatio, kMinBoxSide, kMinUnclippedSide,
+      box_thresh_, unclip_ratio_, kMinBoxSide, kMinUnclippedSide,
       shifted_buf_, mask_buf_, contours_buf_, hierarchy_buf_);
 }

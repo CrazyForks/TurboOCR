@@ -77,9 +77,10 @@ int main(int argc, char **argv) {
                                   std::memory_order_release);
 
   const auto &rec_paths = cfg.rec_paths;
-  if (!cfg.ocr_lang_value.empty())
-    TOCR_LOG_INFO("Language selected via OCR_LANG",
-                  "lang",  std::string_view(cfg.ocr_lang_value),
+  if (!cfg.selected_model_name.empty())
+    TOCR_LOG_INFO("OCR model selected",
+                  "model", std::string_view(cfg.selected_model_name),
+                  "det",   std::string_view(cfg.det_onnx),
                   "rec",   std::string_view(rec_paths.rec),
                   "dict",  std::string_view(rec_paths.dict));
   auto det_model = cfg.det_onnx;
@@ -121,7 +122,7 @@ int main(int argc, char **argv) {
 
   TOCR_LOG_INFO("CPU pipeline pool size", "pool_size", pool_size);
   auto pool = turbo_ocr::pipeline::make_cpu_pipeline_pool(
-      pool_size, det_model, rec_model, rec_dict, cls_model);
+      pool_size, det_model, rec_model, rec_dict, cls_model, cfg.det_cfg);
 
   // Load layout model into each pipeline if enabled
   if (!layout_disabled && !layout_model.empty()) {

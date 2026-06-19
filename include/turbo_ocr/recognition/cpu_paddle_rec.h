@@ -49,6 +49,9 @@ private:
 
   static constexpr int kMaxRecWidth = 4000;
 
+  // Probed after load via probe_output_dims. The initializers are placeholders
+  // only: actual_num_classes_ must stay >= the widest tier (medium/small CTC
+  // width 18,710) until the probe overwrites it with the true width.
   int actual_seq_len_ = 600;
   int actual_num_classes_ = 20000;
 

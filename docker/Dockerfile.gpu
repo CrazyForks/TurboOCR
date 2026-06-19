@@ -123,23 +123,22 @@ EXPOSE 8000 50051
 
 # Create the ocr user + redirect /app/models/rec into the persisted cache
 # volume BEFORE fetching models, so fetch_release_models.sh writes each
-# non-latin bundle straight into the volume path. The layout:
-#   /app/models/{det,cls,rec,keys.txt}           -- latin default (flat)
-#   /app/models/rec/<lang>/{rec.onnx, dict.txt}  -- every other language,
-#       via the symlink, into /home/ocr/.cache/turbo-ocr/models/rec/<lang>/.
+# retained-script bundle straight into the volume path. The layout:
+#   /app/models/{det,rec,cls}.onnx + keys.txt    -- v6 default tier (flat)
+#   /app/models/rec/<script>/{rec.onnx, dict.txt}  -- retained PP-OCRv5
+#       recognizers, via the symlink, into
+#       /home/ocr/.cache/turbo-ocr/models/rec/<script>/.
 # Named-volume mounting the cache dir persists both TRT engines and the
-# language bundles from a single -v flag.
+# script bundles from a single -v flag.
 RUN useradd -m -s /bin/bash ocr \
     && chmod +x /app/scripts/entrypoint.sh \
     && mkdir -p /home/ocr/.cache/turbo-ocr/models/rec /app/models \
     && ln -s /home/ocr/.cache/turbo-ocr/models/rec /app/models/rec
 
-# Fetch every supported PP-OCRv5 bundle from the pinned GitHub Release, with
-# SHA256 verification. The symlink above means /app/models/rec/<lang>/ writes
-# land in the cache dir; anything the image user's named volume seeds from
-# the image will include the baked bundles.
-ARG OCR_INCLUDE_SERVER=1
-ENV OCR_INCLUDE_SERVER=${OCR_INCLUDE_SERVER}
+# Fetch the PP-OCRv6 tiers + retained PP-OCRv5 script bundles from the pinned
+# GitHub Release, with SHA256 verification. The symlink above means
+# /app/models/rec/<script>/ writes land in the cache dir, so a named volume
+# seeded from the image includes the baked bundles.
 RUN bash scripts/fetch_release_models.sh \
     && chown -R ocr:ocr /app /home/ocr/.cache
 

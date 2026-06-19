@@ -69,8 +69,18 @@ CpuEngine::CpuEngine(const std::string &model_path) : model_path_(model_path) {
   else
     session_options_.SetIntraOpNumThreads(4);
   session_options_.SetInterOpNumThreads(1);
-  session_options_.SetGraphOptimizationLevel(
-      GraphOptimizationLevel::ORT_ENABLE_ALL);
+  // v6 rec FP16 produces wrong output under ORT_ENABLE_ALL on ORT 1.26
+  // (SimplifiedLayerNormFusion); cap rec at EXTENDED. ORT_REC_OPT_CAP=0 lets a
+  // fixed ORT restore ALL without a recompile. GPU/TRT path is unaffected.
+  bool rec_opt_cap = true;
+  if (const char* env = std::getenv("ORT_REC_OPT_CAP")) rec_opt_cap = (std::strcmp(env, "0") != 0);
+  // Classify by filename prefix, not a whole-path substring: a path like
+  // /correct/det.onnx or /models/recent/det.onnx must NOT be mistaken for rec.
+  const std::string base = model_path_.substr(model_path_.find_last_of('/') + 1);
+  const bool is_rec = base.rfind("rec", 0) == 0;
+  session_options_.SetGraphOptimizationLevel((rec_opt_cap && is_rec)
+                                                 ? GraphOptimizationLevel::ORT_ENABLE_EXTENDED
+                                                 : GraphOptimizationLevel::ORT_ENABLE_ALL);
   session_options_.EnableCpuMemArena();
   session_options_.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
 

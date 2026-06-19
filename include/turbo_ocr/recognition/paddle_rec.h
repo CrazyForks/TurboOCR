@@ -70,7 +70,10 @@ private:
   std::vector<BakedSlot> baked_slots_;
   bool graphs_baked_ = false;
 
-  // Actual model dims (probed after load)
+  // Actual model dims (probed after load via probe_output_dims). The
+  // initializers are placeholders only: actual_num_classes_ must stay >= the
+  // widest tier (medium/small CTC width 18,710) so the over-dim skip guard in
+  // run() never fires before the probe overwrites it with the true width.
   int actual_seq_len_ = 600;
   int actual_num_classes_ = 20000;
 

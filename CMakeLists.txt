@@ -106,7 +106,7 @@ option(USE_CPU_ONLY "Build CPU-only mode with ONNX Runtime" OFF)
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 # Native builds have nothing in models/ (repo excludes the binaries), so
-# fetch the PP-OCRv5 bundle from the pinned GitHub Release after build.
+# fetch the PP-OCRv6 bundle from the pinned GitHub Release after build.
 # Off-by-default for Docker, where fetch_release_models.sh runs as its own
 # RUN layer; the container Dockerfiles set -DFETCH_MODELS=OFF explicitly.
 option(FETCH_MODELS "After build, fetch OCR model bundles into ./models/" ON)
@@ -201,6 +201,7 @@ add_executable(turbo_ocr_tests
     tests/cpp/test_logger_ratelimit.cpp
     tests/cpp/test_server_config.cpp
     tests/cpp/test_docassembly.cpp
+    tests/cpp/test_dict_resolution.cpp
     src/render/pdf_renderer.cpp
     third_party/catch2/catch_amalgamated.cpp
 )
@@ -593,16 +594,22 @@ install(DIRECTORY models/ DESTINATION share/turbo-ocr/models OPTIONAL)
 install(DIRECTORY scripts/ DESTINATION share/turbo-ocr/scripts USE_SOURCE_PERMISSIONS)
 
 # --- Fetch OCR model bundles for native builds ----------------------------
-# Uses det.onnx as a sentinel — ninja/make skip the step once it exists.
-# Docker builds explicitly pass -DFETCH_MODELS=OFF because the Dockerfile
-# runs fetch_release_models.sh as its own cacheable RUN layer.
+# Uses a v6-specific stamp as the sentinel — NOT models/det.onnx, which a v5
+# checkout already has, so keying on it would skip the fetch and the new v6
+# tier siblings (det_small/det_tiny/rec_small/rec_tiny/keys_tiny) would never
+# be pulled (first boot of OCR_MODEL=small/tiny then fails). The stamp is
+# created only after a successful fetch, and the fetch re-runs whenever the
+# script (which pins the release tag) changes. Docker builds pass
+# -DFETCH_MODELS=OFF and run fetch_release_models.sh as their own RUN layer.
 if(FETCH_MODELS)
-    set(MODELS_SENTINEL "${CMAKE_SOURCE_DIR}/models/det.onnx")
+    set(MODELS_SENTINEL "${CMAKE_SOURCE_DIR}/models/.v6_stamp")
     add_custom_command(
         OUTPUT ${MODELS_SENTINEL}
         COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/fetch_release_models.sh
+        COMMAND ${CMAKE_COMMAND} -E touch ${MODELS_SENTINEL}
+        DEPENDS ${CMAKE_SOURCE_DIR}/scripts/fetch_release_models.sh
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        COMMENT "Fetching PP-OCRv5 models from pinned GitHub Release"
+        COMMENT "Fetching PP-OCRv6 models from pinned GitHub Release"
         VERBATIM
     )
     add_custom_target(fetch_models ALL DEPENDS ${MODELS_SENTINEL})

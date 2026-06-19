@@ -3,17 +3,15 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <string>
 
 #include <cuda_runtime.h>
 
 #include "turbo_ocr/common/cuda_check.h"
 #include "turbo_ocr/kernels/kernels.h"
+#include "turbo_ocr/layout/layout_postfilter.h"
 
 namespace turbo_ocr::layout {
-
-// Defined below collect(); shared by collect() and collect_batch().
-static std::vector<LayoutBox>
-postfilter_layout_boxes(std::vector<LayoutBox> out, int orig_h, int orig_w);
 
 PaddleLayout::~PaddleLayout() noexcept {
   if (d2h_event_)
@@ -220,106 +218,6 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
   }
 
   return postfilter_layout_boxes(std::move(out), orig_h, orig_w);
-}
-
-// Shared post-decode cleanup for both the single-image and batched paths:
-// score sort, layout NMS, containment dedup, oversized-"image" filter.
-// Both collect() and collect_batch() feed the router (table/formula crops
-// are dispatched per surviving box), so skipping any of this on one path
-// would mean duplicate downstream inference and divergent client output.
-static std::vector<LayoutBox>
-postfilter_layout_boxes(std::vector<LayoutBox> out, int orig_h, int orig_w) {
-  // Layout NMS (matches PaddleX layout_nms=True):
-  //   same-class IoU > 0.6  → suppress the lower-scoring box
-  //   cross-class IoU > 0.98 → suppress the lower-scoring box
-  std::sort(out.begin(), out.end(),
-            [](const LayoutBox &a, const LayoutBox &b) {
-              return a.score > b.score;
-            });
-
-  auto box_coords = [](const LayoutBox &lb) {
-    return std::tuple{lb.box[0][0], lb.box[0][1], lb.box[2][0], lb.box[2][1]};
-  };
-
-  auto compute_iou = [&](const LayoutBox &a, const LayoutBox &b) -> float {
-    auto [ax0, ay0, ax1, ay1] = box_coords(a);
-    auto [bx0, by0, bx1, by1] = box_coords(b);
-    int ix0 = std::max(ax0, bx0), iy0 = std::max(ay0, by0);
-    int ix1 = std::min(ax1, bx1), iy1 = std::min(ay1, by1);
-    float inter = std::max(0, ix1 - ix0) * std::max(0, iy1 - iy0);
-    float area_a = (ax1 - ax0) * (ay1 - ay0);
-    float area_b = (bx1 - bx0) * (by1 - by0);
-    float union_area = area_a + area_b - inter;
-    return union_area > 0 ? inter / union_area : 0.0f;
-  };
-
-  // Containment: if >90% of box b's area is inside box a, b is contained.
-  auto is_contained = [&](const LayoutBox &a, const LayoutBox &b) -> bool {
-    auto [ax0, ay0, ax1, ay1] = box_coords(a);
-    auto [bx0, by0, bx1, by1] = box_coords(b);
-    int ix0 = std::max(ax0, bx0), iy0 = std::max(ay0, by0);
-    int ix1 = std::min(ax1, bx1), iy1 = std::min(ay1, by1);
-    float inter = std::max(0, ix1 - ix0) * std::max(0, iy1 - iy0);
-    float area_b = (bx1 - bx0) * (by1 - by0);
-    return area_b > 0 && (inter / area_b) >= 0.8f;
-  };
-
-  constexpr float kIoUSame = 0.6f;
-  constexpr float kIoUDiff = 0.98f;
-
-  std::vector<LayoutBox> nms_out;
-  nms_out.reserve(out.size());
-  std::vector<bool> suppressed(out.size(), false);
-  for (size_t i = 0; i < out.size(); ++i) {
-    if (suppressed[i]) continue;
-    nms_out.push_back(out[i]);
-    for (size_t j = i + 1; j < out.size(); ++j) {
-      if (suppressed[j]) continue;
-      float iou = compute_iou(out[i], out[j]);
-      float thresh = (out[i].class_id == out[j].class_id) ? kIoUSame : kIoUDiff;
-      if (iou >= thresh) { suppressed[j] = true; continue; }
-      // Same-class containment: if j is ≥90% inside i, suppress j.
-      if (out[i].class_id == out[j].class_id && is_contained(out[i], out[j]))
-        suppressed[j] = true;
-    }
-  }
-
-  // Post-NMS containment cleanup: if box A is ≥90% inside box B (any class),
-  // drop A — it's a duplicate subset. Handles both same-class (e.g. nested
-  // tables) and cross-class (e.g. text lines inside a table region).
-  {
-    std::vector<bool> drop(nms_out.size(), false);
-    for (size_t i = 0; i < nms_out.size(); ++i) {
-      if (drop[i]) continue;
-      for (size_t j = i + 1; j < nms_out.size(); ++j) {
-        if (drop[j]) continue;
-        if (is_contained(nms_out[j], nms_out[i])) {
-          drop[i] = true; break;
-        }
-        if (is_contained(nms_out[i], nms_out[j])) {
-          drop[j] = true;
-        }
-      }
-    }
-    std::vector<LayoutBox> cleaned;
-    cleaned.reserve(nms_out.size());
-    for (size_t i = 0; i < nms_out.size(); ++i)
-      if (!drop[i]) cleaned.push_back(std::move(nms_out[i]));
-    nms_out = std::move(cleaned);
-  }
-
-  // Filter "image" detections that cover >82% (portrait) or >93% (landscape) of the page.
-  const float img_area = static_cast<float>(orig_w) * orig_h;
-  const float area_thresh = (orig_h > orig_w) ? 0.82f : 0.93f;
-  constexpr int kImageClassId = 14; // "image" in kLayoutLabels
-  std::erase_if(nms_out, [&](const LayoutBox &lb) {
-    if (lb.class_id != kImageClassId) return false;
-    float box_area = static_cast<float>(lb.box[2][0] - lb.box[0][0]) *
-                     (lb.box[2][1] - lb.box[0][1]);
-    return box_area > area_thresh * img_area;
-  });
-
-  return nms_out;
 }
 
 // ============================================================================

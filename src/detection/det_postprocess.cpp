@@ -63,7 +63,7 @@ std::vector<cv::Point> unclip(const std::vector<cv::Point> &polygon,
     subj.push_back(ClipperLib::IntPoint(pt.x, pt.y));
 
   ClipperLib::ClipperOffset co;
-  co.AddPath(subj, ClipperLib::jtSquare, ClipperLib::etClosedPolygon);
+  co.AddPath(subj, ClipperLib::jtRound, ClipperLib::etClosedPolygon);
 
   ClipperLib::Paths solution;
   co.Execute(solution, distance);
@@ -133,11 +133,13 @@ std::vector<Box> extract_boxes_from_bitmap(
   cv::findContours(bitmap, contours_buf, hierarchy_buf, cv::RETR_LIST,
                    cv::CHAIN_APPROX_SIMPLE);
 
-  static constexpr int kMaxCandidates = 1000;
+  // DB candidate budget. Must equal kernels::kMaxGpuComponents (the GPU CCL
+  // path's component cap) so CPU and GPU detectors truncate identically.
+  static constexpr int kMaxCandidates = 3000;
   int num_contours = std::min(static_cast<int>(contours_buf.size()), kMaxCandidates);
   if (static_cast<int>(contours_buf.size()) > kMaxCandidates) {
-    std::cerr << "[Det] WARNING: truncated to 1000 contours (found "
-              << contours_buf.size() << ")\n";
+    std::cerr << "[Det] WARNING: truncated to " << kMaxCandidates
+              << " contours (found " << contours_buf.size() << ")\n";
   }
 
   for (int i = 0; i < num_contours; i++) {

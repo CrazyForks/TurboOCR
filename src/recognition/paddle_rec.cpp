@@ -83,7 +83,19 @@ bool PaddleRec::probe_and_init() {
 }
 
 bool PaddleRec::load_dict(const std::string &dict_path) {
-  return load_label_dict(dict_path, label_list_);
+  if (!load_label_dict(dict_path, label_list_))
+    return false;
+  // load_model probed the engine before load_dict (ocr_pipeline.cpp), so
+  // actual_num_classes_ holds the real output width here, not the placeholder.
+  // A dict whose [blank]+chars+space count differs from it silently maps every
+  // class to the wrong glyph — fail loud at boot instead.
+  const int probed_width = actual_num_classes_;
+  if (static_cast<int>(label_list_.size()) != probed_width)
+    throw turbo_ocr::ModelLoadError(std::format(
+        "Recognition dict/model mismatch: {} produced {} classes but model "
+        "output width is {} (expected blank+chars+space == width)",
+        dict_path, label_list_.size(), probed_width));
+  return true;
 }
 
 void PaddleRec::allocate_buffers() {

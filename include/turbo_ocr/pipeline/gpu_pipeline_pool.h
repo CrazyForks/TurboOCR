@@ -68,7 +68,9 @@ using GpuPipelinePool = PipelinePool<GpuPipelineEntry>;
 [[nodiscard]] inline std::unique_ptr<GpuPipelinePool> make_gpu_pipeline_pool(
     int pool_size, const std::string &det_model, const std::string &rec_model,
     const std::string &rec_dict, const std::string &cls_model = "",
-    const std::string &layout_model = "") {
+    const std::string &layout_model = "",
+    const DetInferConfig &det_cfg = {turbo_ocr::detection::kDetResizeDefault,
+                                     turbo_ocr::detection::kDbDefaults}) {
 
   if (pool_size <= 0) [[unlikely]]
     throw std::invalid_argument(
@@ -77,7 +79,7 @@ using GpuPipelinePool = PipelinePool<GpuPipelineEntry>;
   std::vector<std::unique_ptr<GpuPipelineEntry>> entries;
   for (int i = 0; i < pool_size; ++i) {
     auto pipeline = std::make_unique<OcrPipeline>();
-    if (!pipeline->init(det_model, rec_model, rec_dict, cls_model)) {
+    if (!pipeline->init(det_model, rec_model, rec_dict, cls_model, det_cfg)) {
       std::cerr << std::format("[Pool] Failed to init GPU pipeline {} of {}", i, pool_size) << '\n';
       continue;
     }

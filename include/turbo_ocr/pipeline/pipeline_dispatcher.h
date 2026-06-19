@@ -109,9 +109,10 @@ private:
     int idx, const std::string &det_model, const std::string &rec_model,
     const std::string &rec_dict, const std::string &cls_model,
     const std::string &layout_model, int pdf_only_batch, int pdf_only_page_h,
-    int pdf_only_page_w, const std::string &doc_ori_model) {
+    int pdf_only_page_w, const std::string &doc_ori_model,
+    const DetInferConfig &det_cfg) {
   auto pipeline = std::make_unique<OcrPipeline>();
-  if (!pipeline->init(det_model, rec_model, rec_dict, cls_model)) {
+  if (!pipeline->init(det_model, rec_model, rec_dict, cls_model, det_cfg)) {
     std::cerr << std::format("[Dispatcher] Failed to init GPU pipeline {}\n", idx);
     return nullptr;
   }
@@ -135,7 +136,9 @@ private:
     const std::string &rec_dict, const std::string &cls_model = "",
     const std::string &layout_model = "",
     int pdf_only_batch = 0, int pdf_only_page_h = 0, int pdf_only_page_w = 0,
-    const std::string &doc_ori_model = "") {
+    const std::string &doc_ori_model = "",
+    const DetInferConfig &det_cfg = {turbo_ocr::detection::kDetResizeDefault,
+                                     turbo_ocr::detection::kDbDefaults}) {
 
   if (pool_size <= 0) [[unlikely]]
     throw std::invalid_argument(
@@ -146,7 +149,7 @@ private:
     if (auto e = build_one_pipeline(i, det_model, rec_model, rec_dict,
                                     cls_model, layout_model, pdf_only_batch,
                                     pdf_only_page_h, pdf_only_page_w,
-                                    doc_ori_model))
+                                    doc_ori_model, det_cfg))
       entries.push_back(std::move(e));
   }
 

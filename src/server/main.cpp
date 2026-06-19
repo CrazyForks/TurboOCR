@@ -82,9 +82,10 @@ int main(int argc, char **argv) {
   cv::setNumThreads(0);
 
   const auto &rec_paths = cfg.rec_paths;
-  if (!cfg.ocr_lang_value.empty())
-    TOCR_LOG_INFO("Language selected via OCR_LANG",
-                  "lang",  std::string_view(cfg.ocr_lang_value),
+  if (!cfg.selected_model_name.empty())
+    TOCR_LOG_INFO("OCR model selected",
+                  "model", std::string_view(cfg.selected_model_name),
+                  "det",   std::string_view(cfg.det_onnx),
                   "rec",   std::string_view(rec_paths.rec),
                   "dict",  std::string_view(rec_paths.dict));
   auto rec_dict = rec_paths.dict;
@@ -207,7 +208,7 @@ int main(int argc, char **argv) {
       cfg.pdf_only ? cfg.pdf_batch  : 0,
       cfg.pdf_only ? cfg.pdf_page_h : 0,
       cfg.pdf_only ? cfg.pdf_page_w : 0,
-      doc_ori_model);
+      doc_ori_model, cfg.det_cfg);
   // Some pipelines may have failed to init (logged); key downstream sizing
   // off the count actually built.
   pool_size = static_cast<int>(dispatcher->worker_count());

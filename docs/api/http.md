@@ -296,6 +296,54 @@ embedded text is trustworthy.
     `MAX_PDF_PAGES` defaults to `2000`. Exceeding returns
     `400 PDF_TOO_LARGE` with the limit echoed back in the message.
 
+### Inline page-image export
+
+`?images=inline` adds each rendered page back to the response as a
+base64-encoded image, alongside the OCR result for that page. Two extra
+fields appear per page: `image_b64` (the encoded bytes) and
+`image_content_type` (the matching MIME type, e.g. `image/png`).
+
+Encoding is controlled by these query parameters (parsed by
+`parse_image_query_params()` in `src/routes/pdf_routes.cpp:93`):
+
+| Param | Default | Effect |
+|---|---|---|
+| `format` | `png` | Output codec: `png`, `jpeg`, or `webp`. JPEG is GPU-encoded via nvJPEG (see `TURBO_PDF_IMAGE_ENCODER`). |
+| `quality` | — | Lossy quality `1`–`100` (JPEG/WebP). Setting it implies `lossless=0` unless `lossless` is given explicitly. |
+| `lossless` | `1` | WebP lossless mode. Ignored for JPEG. |
+| `png_compression` | — | PNG zlib level `0`–`9` (higher = smaller, slower). |
+| `max_side` | `0` | Downscale so the larger page dimension is at most `N` pixels before encoding. `0` keeps full resolution. |
+
+Out-of-range values return `400 INVALID_PARAMETER` (e.g.
+`quality must be 1-100`, `png_compression must be 0-9`,
+`max_side must be >= 0`).
+
+```bash
+curl -X POST 'http://localhost:8000/ocr/pdf?images=inline&format=jpeg&quality=80&max_side=2048' \
+     --data-binary @doc.pdf -H 'Content-Type: application/pdf'
+```
+
+### Auto-rotation
+
+`?autorotate=1` corrects scanned or rotated pages before detection. The
+`PP-LCNet_x1_0_doc_ori` model classifies each page's rotation
+(`0` / `90` / `180` / `270`) and the page is turned upright **first**, so
+the returned image, boxes, and text all come back in a single upright
+frame. Each affected page reports the detected clockwise rotation in an
+`orientation_deg` field. Pages handled purely from the PDF text layer
+(`geometric`) and pages with a native `/Rotate` flag are skipped.
+
+!!! warning "AUTOROTATE_DISABLED"
+    `autorotate=1` requires the doc-orientation model
+    (`models/doc_ori.onnx`, pointed to by `DOC_ORI_ONNX`). Against a
+    server started without it, the request returns
+    `400 AUTOROTATE_DISABLED` — mirroring the `LAYOUT_DISABLED` contract.
+
+```bash
+curl -X POST 'http://localhost:8000/ocr/pdf?autorotate=1&images=inline' \
+     --data-binary @scan.pdf -H 'Content-Type: application/pdf'
+```
+
 ### Request
 
 === "bash"
@@ -353,11 +401,15 @@ embedded text is trustworthy.
 `source` is `"ocr"` (omitted) for pixel-derived text or `"pdf"` for
 text-layer (or `auto_verified`-promoted) entries. `text_layer_quality` is
 one of `"absent"`, `"rejected"`, `"trusted"` (see
-`text_layer_quality_for()` in `src/routes/pdf_routes.cpp:86`).
+`text_layer_quality_for()` in `src/routes/pdf_routes.cpp:86`). With
+`images=inline` each page additionally carries `image_b64` +
+`image_content_type`; with `autorotate=1` each de-rotated page carries
+`orientation_deg`.
 
 Error codes: `MISSING_PDF`, `MISSING_FILE`, `INVALID_MULTIPART`,
 `BASE64_DECODE_FAILED`, `EMPTY_BODY`, `EMPTY_PDF`, `INVALID_DPI`,
-`PDF_TOO_LARGE`, `PDF_RENDER_FAILED`.
+`INVALID_PARAMETER`, `PDF_TOO_LARGE`, `PDF_RENDER_FAILED`,
+`AUTOROTATE_DISABLED`.
 
 ---
 

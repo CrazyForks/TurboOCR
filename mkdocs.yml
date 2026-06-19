@@ -105,6 +105,7 @@ nav:
       - CUDA Streams: architecture/cuda-streams.md
       - Router: architecture/router.md
   - Models:
+      - Selection: models/selection.md
       - Detection: models/detection.md
       - Classification: models/classification.md
       - Layout: models/layout.md
@@ -113,14 +114,17 @@ nav:
       - Formula: models/formula.md
       - Interactions: models/interactions.md
   - Benchmarks:
+      - Engine comparison: benchmarks/comparison.md
       - OmniDocBench: benchmarks/omnidocbench.md
       - Latency: benchmarks/latency.md
   - API:
       - HTTP: api/http.md
       - gRPC: api/grpc.md
+      - Monitoring: api/monitoring.md
   - Build:
       - Native: build/native.md
       - Docker: build/docker.md
+      - Configuration: build/config.md
       - Models: build/models.md
   - Dev:
       - Testing: dev/testing.md

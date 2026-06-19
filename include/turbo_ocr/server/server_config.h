@@ -79,11 +79,26 @@ struct ServerConfig {
   // Optional — if the file is absent, autorotate requests are rejected.
   std::string doc_ori_onnx = "models/doc_ori.onnx";
   RecPaths    rec_paths;
+  // Registry name of the selected OCR model (OCR_MODEL / OCR_LANG alias /
+  // default "tiny"). Always set to the resolved registry entry; an explicit
+  // REC override replaces the path but not the name. `ocr_lang_value` is the
+  // deprecated alias kept for back-compat logging and the "ocr_lang" JSON
+  // field; it mirrors selected_model_name.
+  std::string selected_model_name;
   std::string ocr_lang_value;
+  // Per-model detection inference config (resize policy + DB params) for the
+  // selected model. Threaded into each detector at construction; env per-field
+  // overrides are applied there (read_det_resize/read_db_params) so env wins.
+  DetInferConfig det_cfg;
 
   // ---- TensorRT / decode tuning (consumed by engine + decode subsystems;
   //      strict-validated here so malformed input fails fast at boot) ----
-  int         det_max_side    = 960;   // DET_MAX_SIDE [32, 4096]
+  // Effective engine optimization-profile MAX side, resolved by from_env the
+  // same way the detector + TRT builder do: the selected model's max_side_limit
+  // (1280) with DET_LIMIT_*/DET_MAX_SIDE_LIMIT folded in, DET_MAX_SIDE winning,
+  // /32-ceiled and clamped. The 1280 placeholder is never read — from_env
+  // always recomputes it before validation. DET_MAX_SIDE [32, 4096].
+  int det_max_side = 1280;
   int         trt_opt_level   = 5;     // TRT_OPT_LEVEL [0, 5]
   std::string trt_engine_cache;        // TRT_ENGINE_CACHE (empty = "~/.cache/turbo-ocr")
   int         max_image_dim   = 16384; // MAX_IMAGE_DIM [64, 65535]
@@ -248,6 +263,7 @@ inline std::string ServerConfig::to_json() const {
   j += ",\"doc_ori_onnx\":"      + esc(doc_ori_onnx);
   j += ",\"rec\":"               + esc(rec_paths.rec);
   j += ",\"rec_dict\":"          + esc(rec_paths.dict);
+  j += ",\"ocr_model\":" + esc(selected_model_name);
   j += ",\"ocr_lang\":"          + esc(ocr_lang_value);
   j += ",\"disable_angle_cls\":" + std::string(disable_angle_cls ? "true" : "false");
   j += ",\"layout_disabled\":"   + std::string(layout_disabled ? "true" : "false");
@@ -257,7 +273,19 @@ inline std::string ServerConfig::to_json() const {
   j += ",\"pdf_page_w\":"        + std::to_string(pdf_page_w);
   j += ",\"pdf_batch\":"         + std::to_string(pdf_batch);
   j += ",\"default_pdf_mode\":"  + esc(pdf::mode_name(default_pdf_mode));
+  // Report the EFFECTIVE det config (per-model base + DET_* env overrides) so
+  // the post-mortem matches what the detector actually runs. det_max_side was
+  // already resolved this way in from_env. (GPU_BOX_THRESH/GPU_UNCLIP_SCALE are
+  // a further GPU-only layer applied in paddle_det.cpp and not surfaced here.)
+  const auto eff_resize = detection::read_det_resize(det_cfg.resize);
+  const auto eff_db = detection::read_db_params(det_cfg.db);
   j += ",\"det_max_side\":"      + std::to_string(det_max_side);
+  j += ",\"det_limit_type\":" + esc(eff_resize.limit_type);
+  j += ",\"det_limit_side_len\":" + std::to_string(eff_resize.limit_side_len);
+  j += ",\"det_max_side_limit\":" + std::to_string(eff_resize.max_side_limit);
+  j += ",\"det_db_thresh\":" + std::to_string(eff_db.thresh);
+  j += ",\"det_box_thresh\":" + std::to_string(eff_db.box_thresh);
+  j += ",\"det_unclip_ratio\":" + std::to_string(eff_db.unclip_ratio);
   j += ",\"trt_opt_level\":"     + std::to_string(trt_opt_level);
   j += ",\"trt_engine_cache\":"  + esc(trt_engine_cache);
   j += ",\"max_image_dim\":"     + std::to_string(max_image_dim);
@@ -319,18 +347,33 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
         ? GrpcResponseMode::structured : GrpcResponseMode::json_bytes;
   }
 
-  c.det_onnx    = env_or(det_env, "models/det.onnx");
   c.cls_onnx    = env_or(cls_env, "models/cls.onnx");
   c.layout_onnx = env_or("LAYOUT_ONNX", "models/layout/layout.onnx");
   c.doc_ori_onnx = env_or("DOC_ORI_ONNX", "models/doc_ori.onnx");
   if (env_present("LAYOUT_TRT"))
     c.layout_trt = env_or("LAYOUT_TRT", "");
-  c.rec_paths      = resolve_rec_paths(rec_env);
-  c.ocr_lang_value = ocr_lang();
+  // Resolve det/rec/dict from the model registry in one pass: explicit
+  // DET_ONNX/REC_ONNX/REC_DICT overrides win per-stage, else OCR_MODEL, else
+  // the deprecated OCR_LANG alias (warns), else default "tiny". Unknown
+  // OCR_MODEL is fatal (pushed into c.errors).
+  {
+    ResolvedModel m = resolve_model(rec_env, det_env, "REC_DICT", &c.errors, &c.warnings);
+    c.det_onnx = std::move(m.det);
+    c.rec_paths = RecPaths{.rec = std::move(m.rec), .dict = std::move(m.dict)};
+    c.det_cfg = m.det_cfg;
+    c.selected_model_name = m.name;
+    c.ocr_lang_value = std::move(m.name);
+  }
 
   // ---- TensorRT / decode / logging knobs (validated here, consumed by
   //      other subsystems via the same env vars they always read) ----
-  c.det_max_side       = env_int_strict("DET_MAX_SIDE",  960,   32, 4096,  c.errors);
+  // Strict-validate DET_MAX_SIDE so a malformed string fails fast, then report
+  // the effective engine-profile MAX exactly as the detector + engine builder
+  // compute it: effective_det_max_side(read_det_resize(cfg.resize)) — the
+  // model's max_side_limit (1280) with DET_LIMIT_*/DET_MAX_SIDE_LIMIT overrides
+  // folded in, then DET_MAX_SIDE winning, clamped to [32, 4096].
+  (void)env_int_strict("DET_MAX_SIDE", 1280, 32, 4096, c.errors);
+  c.det_max_side = detection::effective_det_max_side(detection::read_det_resize(c.det_cfg.resize));
   c.trt_opt_level      = env_int_strict("TRT_OPT_LEVEL", 5,     0,  5,     c.errors);
   c.trt_engine_cache   = env_or("TRT_ENGINE_CACHE", "");
   c.max_image_dim      = env_int_strict("MAX_IMAGE_DIM", 16384, 64, 65535, c.errors);
@@ -342,6 +385,10 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
       {"debug", "info", "warn", "error"}, c.errors);
   c.log_format = env_choice_strict("LOG_FORMAT", "json",
       {"json", "text"}, c.errors);
+  // Consumed by the layout module (layout_postfilter.h); validated here so a
+  // typo fails startup instead of silently falling back to the default.
+  (void)env_choice_strict("LAYOUT_MERGE_MODE", "large",
+      {"large", "small", "union"}, c.errors);
 
   c.disable_angle_cls = env_bool_strict("DISABLE_ANGLE_CLS", false, c.errors);
   c.layout_disabled   = env_bool_strict("DISABLE_LAYOUT",    false, c.errors);

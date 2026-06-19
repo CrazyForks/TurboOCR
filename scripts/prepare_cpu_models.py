@@ -47,9 +47,16 @@ def main():
 
     models_dir = args.models_dir
 
+    # Representative input shapes for onnxsim's constant folding. With
+    # dynamic_input_shape=True the H/W axes stay dynamic, so these are only the
+    # shapes folding is evaluated at; det H/W must stay /32-divisible.
     models = {
-        "det.onnx": {"x": [1, 3, 960, 960]},
+        "det.onnx": {"x": [1, 3, 736, 1280]},
+        "det_small.onnx": {"x": [1, 3, 736, 1280]},
+        "det_tiny.onnx": {"x": [1, 3, 736, 1280]},
         "rec.onnx": {"x": [1, 3, 48, 320]},
+        "rec_small.onnx": {"x": [1, 3, 48, 320]},
+        "rec_tiny.onnx": {"x": [1, 3, 48, 320]},
         "cls.onnx": {"x": [1, 3, 80, 160]},
     }
 

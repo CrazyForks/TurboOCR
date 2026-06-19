@@ -29,8 +29,25 @@ namespace fs = std::filesystem;
 
 namespace turbo_ocr::engine {
 
-using turbo_ocr::detection::read_det_max_side;
+using turbo_ocr::detection::read_det_resize;
+using turbo_ocr::detection::effective_det_max_side;
 using turbo_ocr::detection::kDetMaxSideMin;
+
+// Effective det profile MAX for the engine being built. The builder is
+// process-level (no per-model ServerConfig handle), so it resolves the resize
+// policy the same way the detector ctor does — read_det_resize() applies the
+// per-model default base (kDetResizeDefault, max_side_limit=1280) and any
+// DET_* env overrides, then effective_det_max_side() folds in DET_MAX_SIDE
+// and clamps. The detector (paddle_det.cpp / cpu_paddle_det.cpp) sizes its
+// pinned input buffers from effective_det_max_side(read_det_resize(cfg.resize));
+// because every catalog row uses kDetResizeDefault as its base, the two
+// agree field-for-field, so engine profile MAX == runtime buffer MAX. They can
+// only diverge if a future model ships a non-default max_side_limit AND no
+// DET_MAX_SIDE/DET_MAX_SIDE_LIMIT env is set — when that happens, set the
+// matching DET_MAX_SIDE_LIMIT env so both sides see it.
+[[nodiscard]] static int read_det_effective_max_side() {
+  return effective_det_max_side(read_det_resize());
+}
 
 // TensorRT builder optimization level: 0..5 (TRT 10 range). Higher = better
 // kernel selection at the cost of build time. Default 5 — same as before
@@ -120,9 +137,13 @@ std::string get_cached_engine_path(const std::string &onnx_path,
   // Bump kProfileVersion when optimization profiles change for det/rec/cls.
   // Adding a NEW model type (e.g. "layout") does NOT require a bump because
   // the cache key includes `type` — new types live in their own hash space.
-  // 2026-04-26: bumped because the det profile MAX now tracks DET_MAX_SIDE
-  // instead of being hardcoded at 960.
-  static constexpr int kProfileVersion = 20260426;
+  // 2026-04-26: bumped because the det profile MAX now tracks DET_MAX_SIDE.
+  // 2026-06-15: v5->v6 det/rec swap — v5 engines are not reusable; bump
+  // invalidates them belt-and-suspenders over the path+size+mtime key.
+  // The det profile MAX follows the per-model effective max-side (default
+  // 1280); the `:dms` suffix below separates engines built at different
+  // effective max-sides by hash, so a max-side change needs no bump.
+  static constexpr int kProfileVersion = 20260615;
 
   auto key = "v" + std::to_string(kProfileVersion) + ":" + type + ":" +
       onnx_path + ":" + std::to_string(onnx_size) + ":" +
@@ -131,10 +152,12 @@ std::string get_cached_engine_path(const std::string &onnx_path,
       std::to_string(gpu_major) + "." + std::to_string(gpu_minor) +
       ":drv" + std::to_string(cuda_driver) +
       ":rt" + std::to_string(cuda_runtime);
-  // For det, the MAX dim of the optimization profile depends on DET_MAX_SIDE,
-  // so each operator config gets its own engine (Triton/vLLM pattern).
+  // For det, the MAX dim of the optimization profile is the effective det
+  // max-side (per-model max_side_limit, overridden by DET_MAX_SIDE), so each
+  // operator config gets its own engine (Triton/vLLM pattern). A different
+  // effective max => a different profile => a different cache key.
   if (type == "det")
-    key += ":dms" + std::to_string(read_det_max_side());
+    key += ":dms" + std::to_string(read_det_effective_max_side());
   // rec gets extra static (batch,width) profiles + maxAuxStreams=0 ONLY when
   // CUDA graphs are opted into. Default (graphs off) keeps the original
   // single-profile cache key, so existing cached engines are reused as-is and
@@ -177,8 +200,16 @@ static bool build_engine(const std::string &onnx_path,
                           const std::string &trt_path,
                           const std::string &type) {
   const bool strongly_typed = is_quantized_onnx(onnx_path);
+  // det/rec are FP16-only by invariant; a quantized-named file reaching here
+  // (e.g. a misnamed `det.int8.onnx`) would silently build INT8 via the
+  // strongly-typed path. Fail loud instead.
+  if (strongly_typed && (type == "det" || type == "rec")) {
+    std::cerr << "[TRT] Refusing strongly-typed (quantized) build for FP16-only "
+              << type << " model: " << onnx_path << '\n';
+    return false;
+  }
   std::cout << "Building TRT engine: " << onnx_path << " -> " << trt_path;
-  if (type == "det") std::cout << " (DET_MAX_SIDE=" << read_det_max_side() << ")";
+  if (type == "det") std::cout << " (det_max_side=" << read_det_effective_max_side() << ")";
   if (strongly_typed) std::cout << " [strongly-typed QDQ]";
   std::cout << '\n';
 
@@ -200,9 +231,17 @@ static bool build_engine(const std::string &onnx_path,
 
   auto parser = std::unique_ptr<nvonnxparser::IParser>(
       nvonnxparser::createParser(*network, s_logger));
-  if (!parser || !parser->parseFromFile(onnx_path.c_str(),
-      static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
+  if (!parser) return false;
+  if (!parser->parseFromFile(onnx_path.c_str(),
+      static_cast<int>(nvinfer1::ILogger::Severity::kWARNING))) {
+    // v6 introduces RepLKFPN/LightSVTR ops; the parser builds clean today, but
+    // surface every error so a future op regression is diagnosable rather than
+    // a bare "Failed to build engine".
+    for (int i = 0; i < parser->getNbErrors(); ++i)
+      std::cerr << "[TRT] ONNX parse error in " << onnx_path << ": "
+                << parser->getError(i)->desc() << '\n';
     return false;
+  }
 
   auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(
       builder->createBuilderConfig());
@@ -216,9 +255,11 @@ static bool build_engine(const std::string &onnx_path,
   if (type == "layout") {
     workspace_bytes = 4ULL << 30;          // 4 GiB
   } else if (type == "det") {
-    // (det_max/960)² × 1 GiB, capped at 4 GiB. At default 960 → 1 GiB
-    // (unchanged). At 2048 → ~4 GiB. At 4096 → 4 GiB (cap).
-    int det_max = read_det_max_side();
+    // (det_max/960)² × 1 GiB, capped at 4 GiB. 960 is the historical baseline
+    // for the scale ratio: at 2048 → ~4 GiB, at 4096 → 4 GiB (cap). det_max is
+    // the effective profile MAX, so workspace scales with the same value the
+    // profile MAX uses below.
+    int det_max = read_det_effective_max_side();
     double scale = (static_cast<double>(det_max) / 960.0) *
                    (static_cast<double>(det_max) / 960.0);
     size_t scaled = static_cast<size_t>((1ULL << 30) * scale);
@@ -235,8 +276,13 @@ static bool build_engine(const std::string &onnx_path,
     size_t scaled = static_cast<size_t>((1ULL << 30) * scale);
     workspace_bytes = std::min(scaled, size_t(4ULL << 30));
     if (workspace_bytes < (1ULL << 30)) workspace_bytes = 1ULL << 30;
+  } else if (type == "rec") {
+    // v6 rec (EncoderWithLightSVTR) fuses the whole graph into one large
+    // attention ForeignNode; 1 GiB starves the tactic search on the medium
+    // tier ("could not find any implementation"). 4 GiB matches layout.
+    workspace_bytes = 4ULL << 30;          // 4 GiB
   } else {
-    workspace_bytes = 1ULL << 30;          // rec, cls, table_cls, table_cell_*
+    workspace_bytes = 1ULL << 30;          // cls, table_cls, table_cell_*
   }
   config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, workspace_bytes);
   // Strongly-typed networks reject kFP16 — precision is fixed by the graph.
@@ -252,10 +298,13 @@ static bool build_engine(const std::string &onnx_path,
   bool profile_added_in_branch = false;
 
   if (type == "det") {
-    // MAX tracks DET_MAX_SIDE (default 960). MIN is the floor (32, after
-    // round-down-to-32). OPT is the sweet-spot for typical inputs, capped
-    // by MAX so a small DET_MAX_SIDE doesn't violate MIN<=OPT<=MAX.
-    int det_max = read_det_max_side();
+    // MAX is the effective det max-side (per-model max_side_limit, default
+    // 1280, overridden by DET_MAX_SIDE) — it must be >= the largest resize
+    // output the detector can feed in, else TRT rejects native-resolution
+    // inputs at execute time. MIN is the floor (32). OPT is the sweet-spot for
+    // typical inputs, capped by MAX so a small effective max doesn't violate
+    // MIN<=OPT<=MAX.
+    int det_max = read_det_effective_max_side();
     int det_opt = std::min(640, det_max);
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
         nvinfer1::Dims4{1, 3, kDetMaxSideMin, kDetMaxSideMin});
@@ -501,7 +550,7 @@ std::string ensure_trt_engine(const std::string &onnx_path,
 
   if (fs::exists(trt_path)) {
     std::cout << "Using cached engine: " << trt_path;
-    if (type == "det") std::cout << " (DET_MAX_SIDE=" << read_det_max_side() << ")";
+    if (type == "det") std::cout << " (det_max_side=" << read_det_effective_max_side() << ")";
     std::cout << '\n';
     return trt_path;
   }

@@ -21,7 +21,10 @@ public:
   ~CpuOcrPipeline() noexcept override = default;
 
   [[nodiscard]] bool init(const std::string &det_model, const std::string &rec_model,
-                          const std::string &rec_dict, const std::string &cls_model = "") override;
+                          const std::string &rec_dict, const std::string &cls_model = "",
+                          const DetInferConfig &det_cfg =
+                              {turbo_ocr::detection::kDetResizeDefault,
+                               turbo_ocr::detection::kDbDefaults}) override;
 
   [[nodiscard]] bool load_layout_model(const std::string &onnx_path);
 

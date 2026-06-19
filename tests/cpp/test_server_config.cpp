@@ -11,22 +11,58 @@ namespace {
 
 // Every env var ServerConfig::from_env touches — wiped between cases so each
 // test starts from a known baseline.
-const char *const kAllEnvVars[] = {
-    "TURBO_OCR_HOST", "PORT", "GRPC_PORT",
-    "MAX_BODY_MB", "MAX_BODY_MEMORY_MB",
-    "PIPELINE_POOL_SIZE", "HTTP_THREADS",
-    "PDF_DAEMONS", "PDF_WORKERS", "SHUTDOWN_GRACE_SECONDS",
-    "GRPC_CQS", "GRPC_BATCH_WORKERS", "MAX_PDF_PAGES", "GRPC_RESPONSE_MODE",
-    "DET_ONNX", "DET_MODEL", "CLS_ONNX", "CLS_MODEL",
-    "LAYOUT_ONNX", "LAYOUT_TRT",
-    "REC_ONNX", "REC_MODEL", "REC_DICT", "OCR_LANG",
-    "DISABLE_ANGLE_CLS", "DISABLE_LAYOUT", "ENABLE_LAYOUT",
+const char* const kAllEnvVars[] = {
+    "TURBO_OCR_HOST",
+    "PORT",
+    "GRPC_PORT",
+    "MAX_BODY_MB",
+    "MAX_BODY_MEMORY_MB",
+    "PIPELINE_POOL_SIZE",
+    "HTTP_THREADS",
+    "PDF_DAEMONS",
+    "PDF_WORKERS",
+    "SHUTDOWN_GRACE_SECONDS",
+    "GRPC_CQS",
+    "GRPC_BATCH_WORKERS",
+    "MAX_PDF_PAGES",
+    "GRPC_RESPONSE_MODE",
+    "DET_ONNX",
+    "DET_MODEL",
+    "CLS_ONNX",
+    "CLS_MODEL",
+    "LAYOUT_ONNX",
+    "LAYOUT_TRT",
+    "REC_ONNX",
+    "REC_MODEL",
+    "REC_DICT",
+    "OCR_LANG",
+    "OCR_MODEL",
+    "TURBO_OCR_REC_ALLOW_TINY",
+    "DISABLE_ANGLE_CLS",
+    "DISABLE_LAYOUT",
+    "LAYOUT_MERGE_MODE",
+    "ENABLE_LAYOUT",
     "ENABLE_PDF_MODE",
-    "DET_MAX_SIDE", "TRT_OPT_LEVEL", "TRT_ENGINE_CACHE", "MAX_IMAGE_DIM",
-    "LOG_LEVEL", "LOG_FORMAT",
-    "TURBO_OCR_PDF_ONLY", "TURBO_OCR_PDF_DPI",
-    "TURBO_OCR_PDF_PAGE_H", "TURBO_OCR_PDF_PAGE_W", "TURBO_OCR_PDF_BATCH",
-    "MAX_BATCH_IMAGES", "MAX_PDF_PAGE_PIXELS_MP", "DOC_ORI_ONNX",
+    "DET_MAX_SIDE",
+    "DET_MAX_SIDE_LIMIT",
+    "DET_LIMIT_TYPE",
+    "DET_LIMIT_SIDE_LEN",
+    "DET_DB_THRESH",
+    "DET_BOX_THRESH",
+    "DET_UNCLIP",
+    "TRT_OPT_LEVEL",
+    "TRT_ENGINE_CACHE",
+    "MAX_IMAGE_DIM",
+    "LOG_LEVEL",
+    "LOG_FORMAT",
+    "TURBO_OCR_PDF_ONLY",
+    "TURBO_OCR_PDF_DPI",
+    "TURBO_OCR_PDF_PAGE_H",
+    "TURBO_OCR_PDF_PAGE_W",
+    "TURBO_OCR_PDF_BATCH",
+    "MAX_BATCH_IMAGES",
+    "MAX_PDF_PAGE_PIXELS_MP",
+    "DOC_ORI_ONNX",
 };
 
 void reset_env() {
@@ -54,7 +90,9 @@ TEST_CASE("from_env defaults are sane (GPU)", "[server_config]") {
   CHECK(c.grpc_cqs == 10);
   CHECK(c.grpc_batch_workers == 8);
   CHECK(c.max_pdf_pages == 2000);
-  CHECK(c.det_onnx == "models/det.onnx");
+  // Default model is "tiny" (the throughput tier), whose per-tier detector is
+  // det_tiny.onnx (not the shared det.onnx, which backs only the V5Lang rows).
+  CHECK(c.det_onnx == "models/det_tiny.onnx");
   CHECK(c.cls_onnx == "models/cls.onnx");
   CHECK_FALSE(c.disable_angle_cls);
   CHECK_FALSE(c.layout_disabled);
@@ -217,6 +255,17 @@ TEST_CASE("GRPC_RESPONSE_MODE validates", "[server_config]") {
   REQUIRE_FALSE(bad.errors.empty());
 }
 
+TEST_CASE("LAYOUT_MERGE_MODE validates", "[server_config]") {
+  for (const char *ok : {"large", "small", "union"}) {
+    reset_env();
+    ::setenv("LAYOUT_MERGE_MODE", ok, 1);
+    CHECK(ServerConfig::from_env().errors.empty());
+  }
+  reset_env();
+  ::setenv("LAYOUT_MERGE_MODE", "largee", 1);  // typo must be fatal, not silent
+  REQUIRE_FALSE(ServerConfig::from_env().errors.empty());
+}
+
 TEST_CASE("cross-field: PORT == GRPC_PORT is fatal", "[server_config]") {
   reset_env();
   ::setenv("PORT",      "9000", 1);
@@ -252,7 +301,11 @@ TEST_CASE("cross-field: MAX_BODY_MEMORY_MB > MAX_BODY_MB clamps + warns",
 TEST_CASE("from_env strict-validates engine/decode/logging knobs", "[server_config]") {
   reset_env();
   auto def = ServerConfig::from_env();
-  CHECK(def.det_max_side == 960);
+  // Effective det max-side comes from the selected model's per-model
+  // max_side_limit when DET_MAX_SIDE is unset. Every v6 tier caps at 1280 (the
+  // official PaddleOCR 4000 OOMs the pooled pre-allocation — det_config.h), so
+  // the default is 1280, not 4000; the env knob still wins when set (below).
+  CHECK(def.det_max_side == 1280);
   CHECK(def.trt_opt_level == 5);
   CHECK(def.max_image_dim == 16384);
   CHECK(def.log_level == "info");

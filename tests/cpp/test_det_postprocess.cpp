@@ -1,11 +1,17 @@
 #include <catch_amalgamated.hpp>
-
-#include "turbo_ocr/detection/det_postprocess.h"
+#include <cstdlib>
 #include <opencv2/imgproc.hpp>
+
+#include "turbo_ocr/detection/det_config.h"
+#include "turbo_ocr/detection/det_postprocess.h"
 
 using turbo_ocr::Box;
 using turbo_ocr::detection::box_score_fast;
+using turbo_ocr::detection::compute_det_resize;
+using turbo_ocr::detection::effective_det_max_side;
 using turbo_ocr::detection::get_mini_boxes;
+using turbo_ocr::detection::kDetResizeDefault;
+using turbo_ocr::detection::read_det_resize;
 using turbo_ocr::detection::unclip;
 
 TEST_CASE("get_mini_boxes returns ordered corners", "[det_postprocess]") {
@@ -89,4 +95,39 @@ TEST_CASE("box_score_fast returns zero for out-of-bounds contour", "[det_postpro
   float score = box_score_fast(pred_map, contour, shifted_buf, mask_buf);
 
   CHECK(score == Catch::Approx(0.0f).margin(0.01f));
+}
+
+// Regression: DET_MAX_SIDE must clamp BOTH the engine-profile/buffer size
+// (effective_det_max_side) AND the runtime resize cap (read_det_resize) so the
+// resize output can never exceed the allocated buffer. A DET_MAX_SIDE below the
+// model's max_side_limit used to size buffers at the smaller value while the
+// resize still emitted up to max_side_limit px -> device overrun.
+TEST_CASE("DET_MAX_SIDE shrinks both the buffer and the resize cap together", "[det_config]") {
+  ::unsetenv("DET_MAX_SIDE");
+  ::unsetenv("DET_MAX_SIDE_LIMIT");
+  ::unsetenv("DET_LIMIT_TYPE");
+  ::unsetenv("DET_LIMIT_SIDE_LEN");
+
+  SECTION("shrink below max_side_limit") {
+    ::setenv("DET_MAX_SIDE", "640", 1);
+    auto p = read_det_resize();
+    const int buf = effective_det_max_side(p);
+    CHECK(p.max_side_limit == 640);  // resize cap shrank to 640
+    CHECK(buf == 640);               // buffer/profile sized to 640
+    // A large input must resize to <= the buffer side on every axis.
+    auto [rh, rw] = compute_det_resize(4000, 3000, p);
+    CHECK(std::max(rh, rw) <= buf);
+    ::unsetenv("DET_MAX_SIDE");
+  }
+
+  SECTION("enlarge above max_side_limit leaves the resize cap untouched") {
+    ::setenv("DET_MAX_SIDE", "2048", 1);
+    auto p = read_det_resize();
+    const int buf = effective_det_max_side(p);
+    CHECK(p.max_side_limit == kDetResizeDefault.max_side_limit);  // unchanged (1280)
+    CHECK(buf == 2048);  // buffer grows; resize stays <= 1280 < buf
+    auto [rh, rw] = compute_det_resize(4000, 3000, p);
+    CHECK(std::max(rh, rw) <= buf);
+    ::unsetenv("DET_MAX_SIDE");
+  }
 }

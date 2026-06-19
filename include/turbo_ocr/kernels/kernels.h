@@ -104,8 +104,9 @@ struct GpuDetBox {
   int pixel_count;            // number of foreground pixels in component
 };
 
-// Maximum number of components we track on GPU
-static constexpr int kMaxGpuComponents = 2048;
+// Maximum number of components we track on GPU. Sized to the PP-OCRv6 DB
+// candidate budget (3000) so dense multi-column pages are not truncated.
+static constexpr int kMaxGpuComponents = 3000;
 
 // Run full GPU CCL pipeline: label components, extract bboxes, compute scores.
 // Returns number of valid boxes written to h_boxes (host memory).

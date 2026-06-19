@@ -29,7 +29,10 @@ public:
 
   [[nodiscard]] bool init(const std::string &det_model, const std::string &rec_model,
                           const std::string &rec_dict,
-                          const std::string &cls_model = "") override;
+                          const std::string &cls_model = "",
+                          const DetInferConfig &det_cfg =
+                              {turbo_ocr::detection::kDetResizeDefault,
+                               turbo_ocr::detection::kDbDefaults}) override;
 
   // Optionally load a PP-DocLayoutV3 model. Must be called after init().
   // Call once per pipeline. After a successful call, run_with_layout(...)

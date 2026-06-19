@@ -17,17 +17,20 @@ using turbo_ocr::engine::TrtEngine;
 
 namespace turbo_ocr::detection {
 
-bool PaddleDet::load_model(const std::string &model_path) {
+bool PaddleDet::load_model(const std::string& model_path, const DetResizeParams& resize,
+                           const DbParams& db) {
   engine_ = std::make_unique<TrtEngine>(model_path);
   if (!engine_->load())
     return false;
-  return init_buffers();
+  return init_buffers(resize, db);
 }
 
-bool PaddleDet::init_buffers() {
-  // Single source of truth for DET_MAX_SIDE: detection/det_config.h. The
-  // engine builder reads the same value so the TRT profile MAX matches.
-  kMaxSideLen_ = turbo_ocr::detection::read_det_max_side();
+bool PaddleDet::init_buffers(const DetResizeParams& resize, const DbParams& db) {
+  // Per-model resize policy with env overrides layered on (env wins). The
+  // engine builder must size its TRT profile MAX off the same effective
+  // max-side or the runtime and engine silently disagree.
+  resize_ = read_det_resize(resize);
+  kMaxSideLen_ = effective_det_max_side(resize_);
 
   size_t max_pixels = static_cast<size_t>(kMaxSideLen_) * kMaxSideLen_;
   input_size_ = max_pixels * 3 * sizeof(float);
@@ -63,6 +66,14 @@ bool PaddleDet::init_buffers() {
 
   // Bind I/O pointers once for single-image path (never change)
   engine_->bind_io(d_input_.get(), d_output_.get());
+
+  // DB params: this model's base + env overrides (read_db_params), same
+  // det_config.h source as the CPU detector. GPU_BOX_THRESH / GPU_UNCLIP_SCALE
+  // remain as overrides layered on top.
+  const DbParams eff_db = read_db_params(db);
+  db_thresh_ = eff_db.thresh;
+  box_thresh_ = eff_db.box_thresh;
+  unclip_ratio_ = eff_db.unclip_ratio;
 
   // GPU CCL mode: 0=CPU contours, 1=GPU CCL+per-ROI findContours (default),
   // 2=all-GPU JFA per-component Euclidean unclip
@@ -192,7 +203,7 @@ PaddleDet::run_gpu_ccl(int resize_h, int resize_w,
     if (ssid < kMinBoxSide)
       continue;
 
-    auto unclipped = unclip(ccl_contour_buf_, kDetDbUnclipRatio * unclip_scale_);
+    auto unclipped = unclip(ccl_contour_buf_, unclip_ratio_ * unclip_scale_);
     if (unclipped.size() < 3)
       continue;
 
@@ -258,8 +269,7 @@ PaddleDet::run_gpu_ccl_fast(int resize_h, int resize_w,
   // Step 2: Per-component expand distance from CCL bboxes (Clipper-equivalent
   // area*ratio/perim). Indexed by PRE-filter compact_id.
   turbo_ocr::kernels::cuda_compute_expand_per_comp(
-      d_ccl_bboxes_.get(), num_slots,
-      kDetDbUnclipRatio * unclip_scale_, /*min*/ 2.0f, /*max*/ 24.0f,
+      d_ccl_bboxes_.get(), num_slots, unclip_ratio_ * unclip_scale_, /*min*/ 2.0f, /*max*/ 24.0f,
       box_thresh_, d_expand_per_comp_.get(), stream);
 
   // Step 3: JFA + per-component label expansion (variable cutoff per component)
@@ -320,11 +330,10 @@ PaddleDet::run_cpu_contours(int resize_h, int resize_w,
 
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  return extract_boxes_from_bitmap(
-      pred_map, bitmap, orig_h, orig_w, resize_h, resize_w,
-      box_thresh_, kDetDbUnclipRatio * unclip_scale_,
-      kMinBoxSide, kMinUnclippedSide,
-      shifted_buf_, mask_buf_, contours_buf_, hierarchy_buf_);
+  return extract_boxes_from_bitmap(pred_map, bitmap, orig_h, orig_w, resize_h, resize_w,
+                                   box_thresh_, unclip_ratio_ * unclip_scale_, kMinBoxSide,
+                                   kMinUnclippedSide, shifted_buf_, mask_buf_, contours_buf_,
+                                   hierarchy_buf_);
 }
 
 std::vector<Box>
@@ -338,15 +347,7 @@ PaddleDet::run(const GpuImage &gpu_img, int orig_h, int orig_w,
   if (pdf_static_batch_ > 0)
     return std::move(run_batch({gpu_img}, {{orig_h, orig_w}}, stream)[0]);
 
-  int h = orig_h;
-  int w = orig_w;
-  float ratio = 1.0f;
-  if (std::max(h, w) > kMaxSideLen_) {
-    ratio = (h > w) ? static_cast<float>(kMaxSideLen_) / h
-                    : static_cast<float>(kMaxSideLen_) / w;
-  }
-  int resize_h = std::max(static_cast<int>(round(h * ratio / 32.0) * 32), 32);
-  int resize_w = std::max(static_cast<int>(round(w * ratio / 32.0) * 32), 32);
+  auto [resize_h, resize_w] = compute_det_resize(orig_h, orig_w, resize_);
 
   // Reset working pointers to single-image buffers (in case batch mode changed them)
   cur_output_ = d_output_.get();
@@ -363,8 +364,8 @@ PaddleDet::run(const GpuImage &gpu_img, int orig_h, int orig_w,
   }
 
   // 4. Threshold on GPU for bitmap
-  turbo_ocr::kernels::cuda_threshold_to_u8(cur_output_, cur_bitmap_, resize_w,
-                                    resize_h, kDetDbThresh, stream);
+  turbo_ocr::kernels::cuda_threshold_to_u8(cur_output_, cur_bitmap_, resize_w, resize_h, db_thresh_,
+                                           stream);
 
   // 5. Choose contour extraction path
   if (gpu_ccl_mode_ == 2) {
@@ -385,10 +386,10 @@ void PaddleDet::set_pdf_static_profile(int batch, int page_h, int page_w) {
   pdf_static_w_ = page_w;
 
   // init_buffers() sized the batch + CCL scratch for kMaxBatchSize ×
-  // DET_MAX_SIDE² pixels, but the fixed PDF page can exceed that (default
-  // 1280×960 > 960²) — grow everything indexed by per-image pixels so the
-  // static-shape execute can't write past its buffers. Per-slot metadata
-  // arrays stay at kMaxBatchSize: ServerConfig clamps pdf_batch to it.
+  // effective_det_max_side² pixels; grow everything indexed by per-image pixels
+  // when the fixed PDF page exceeds that, so the static-shape execute can't
+  // write past its buffers. Per-slot metadata arrays stay at kMaxBatchSize:
+  // ServerConfig clamps pdf_batch to it.
   const size_t page_pixels = static_cast<size_t>(page_h) * page_w;
   const size_t max_pixels  = static_cast<size_t>(kMaxSideLen_) * kMaxSideLen_;
   if (page_pixels <= max_pixels)
@@ -515,13 +516,8 @@ PaddleDet::run_batch(const std::vector<GpuImage> &gpu_imgs,
     for (int i = 0; i < batch_size; i++) {
       int h = orig_dims[i].first;
       int w = orig_dims[i].second;
-      float ratio = 1.0f;
-      if (std::max(h, w) > kMaxSideLen_) {
-        ratio = (h > w) ? static_cast<float>(kMaxSideLen_) / h
-                        : static_cast<float>(kMaxSideLen_) / w;
-      }
-      int rh = std::max(static_cast<int>(round(h * ratio / 32.0) * 32), 32);
-      int rw = std::max(static_cast<int>(round(w * ratio / 32.0) * 32), 32);
+      auto [rh, rw] = compute_det_resize(h, w, resize_);
+      float ratio = std::min(static_cast<float>(rh) / h, static_cast<float>(rw) / w);
       infos[i] = {h, w, ratio, rh, rw};
       max_resize_h = std::max(max_resize_h, rh);
       max_resize_w = std::max(max_resize_w, rw);
@@ -580,9 +576,9 @@ PaddleDet::run_batch(const std::vector<GpuImage> &gpu_imgs,
   engine_->bind_io(d_input_.get(), d_output_.get());
 
   // --- 4. Batched threshold (all images at once) ---
-  turbo_ocr::kernels::cuda_batch_threshold_to_u8(
-      d_batch_output_.get(), d_batch_bitmap_.get(), resize_w, resize_h,
-      batch_size, kDetDbThresh, stream);
+  turbo_ocr::kernels::cuda_batch_threshold_to_u8(d_batch_output_.get(), d_batch_bitmap_.get(),
+                                                 resize_w, resize_h, batch_size, db_thresh_,
+                                                 stream);
 
   // --- 5. Per-image post-processing (GPU CCL fast / CPU contours) ---
   // For each image slice in the batch output, run the appropriate path.

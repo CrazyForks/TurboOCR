@@ -68,8 +68,9 @@ OcrPipeline::~OcrPipeline() noexcept {
 bool OcrPipeline::init(const std::string &det_model,
                        const std::string &rec_model,
                        const std::string &rec_dict,
-                       const std::string &cls_model) {
-  if (!det_->load_model(det_model))
+                       const std::string &cls_model,
+                       const DetInferConfig &det_cfg) {
+  if (!det_->load_model(det_model, det_cfg.resize, det_cfg.db))
     return false;
   if (!rec_->load_model(rec_model))
     return false;

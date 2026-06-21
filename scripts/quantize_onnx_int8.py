@@ -277,7 +277,8 @@ def build_calibration_loader(model_type: str, image_paths: list[Path],
 def run_quantize(onnx_path: Path, model_type: str, out_path: Path,
                  n_calib: int = 200,
                  det_engine: Path | None = None,
-                 extra_exclude_regex: list[str] | None = None) -> int:
+                 extra_exclude_regex: list[str] | None = None,
+                 rec_exclude: bool = True) -> int:
     # Lazy import — modelopt currently breaks on .venv-paddle (onnx<1.18 missing
     # FLOAT4E2M1). Surface a clean error pointing at the fix instead of a
     # 30-line traceback.
@@ -320,7 +321,7 @@ def run_quantize(onnx_path: Path, model_type: str, out_path: Path,
     # Path G surgical exclusions for rec (#10): see REC_EXCLUDE_REGEX above.
     # Other models pass no exclusions — modelopt's default coverage is fine.
     exclude_regex = list(extra_exclude_regex or [])
-    if model_type == "rec":
+    if model_type == "rec" and rec_exclude:
         exclude_regex.extend(REC_EXCLUDE_REGEX)
 
     print(f"quantizing {onnx_path} → {out_path} (model_type={model_type})")
@@ -413,6 +414,10 @@ def main() -> int:
                     help="Skip modelopt; only run the FP32-scale safety pass "
                          "in place on --onnx. Use this to repair an existing "
                          "QDQ ONNX whose DQ scales are FP16 (TRT 10.15 reject).")
+    ap.add_argument("--no-exclude", action="store_true",
+                    help="rec only: quantize ALL eligible nodes (skip the Path G "
+                         "MatMul/Softmax/HardSigmoid exclusions). Fully-contiguous "
+                         "INT8 minimizes reformat islands — favors speed over accuracy.")
     args = ap.parse_args()
 
     if not args.onnx.is_file():
@@ -440,7 +445,8 @@ def main() -> int:
 
     return run_quantize(args.onnx, args.model_type, out,
                         n_calib=args.n_calib,
-                        det_engine=args.det_engine)
+                        det_engine=args.det_engine,
+                        rec_exclude=not args.no_exclude)
 
 
 if __name__ == "__main__":

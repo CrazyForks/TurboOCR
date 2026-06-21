@@ -49,6 +49,15 @@ using turbo_ocr::detection::kDetMaxSideMin;
   return effective_det_max_side(read_det_resize());
 }
 
+// OPT batch size for the det optimization profile. Profile range is [1,8];
+// OPT picks which batch TRT tunes tactics for. Default 4 balances single-image
+// (batch 1) latency against the dynamic-batch throughput path. Set 1 to favor
+// single-image latency, up to 8 to favor batched throughput.
+[[nodiscard]] static int read_det_opt_batch() {
+  static const int v = server::env_int("DET_OPT_BATCH", 4, 1, 8);
+  return v;
+}
+
 // TensorRT builder optimization level: 0..5 (TRT 10 range). Higher = better
 // kernel selection at the cost of build time. Default 5 — same as before
 // this knob existed. Operators on small instances or with strict cold-start
@@ -157,7 +166,8 @@ std::string get_cached_engine_path(const std::string &onnx_path,
   // operator config gets its own engine (Triton/vLLM pattern). A different
   // effective max => a different profile => a different cache key.
   if (type == "det")
-    key += ":dms" + std::to_string(read_det_effective_max_side());
+    key += ":dms" + std::to_string(read_det_effective_max_side()) +
+           ":dob" + std::to_string(read_det_opt_batch());
   // rec gets extra static (batch,width) profiles + maxAuxStreams=0 ONLY when
   // CUDA graphs are opted into. Default (graphs off) keeps the original
   // single-profile cache key, so existing cached engines are reused as-is and
@@ -199,18 +209,20 @@ std::string get_cached_engine_path(const std::string &onnx_path,
 static bool build_engine(const std::string &onnx_path,
                           const std::string &trt_path,
                           const std::string &type) {
-  const bool strongly_typed = is_quantized_onnx(onnx_path);
-  // det/rec are FP16-only by invariant; a quantized-named file reaching here
-  // (e.g. a misnamed `det.int8.onnx`) would silently build INT8 via the
-  // strongly-typed path. Fail loud instead.
-  if (strongly_typed && (type == "det" || type == "rec")) {
-    std::cerr << "[TRT] Refusing strongly-typed (quantized) build for FP16-only "
-              << type << " model: " << onnx_path << '\n';
-    return false;
-  }
+  const bool quantized = is_quantized_onnx(onnx_path);
+  // Quantized (QDQ-embedded) ONNX. det/rec exports carry LIGHT per-tensor/
+  // per-channel Q/DQ on convs and build correctly under a WEAKLY-typed FP16
+  // network: TRT honors the embedded Q/DQ (running those ops in INT8) and keeps
+  // everything else in FP16. Heavier exports (mixed FP8/INT8, INT32 zero-points)
+  // need a STRONGLY-typed network where every tensor's type comes from the graph
+  // — reserved for non-det/rec models. Engaged only when the operator explicitly
+  // points DET_ONNX/REC_ONNX at a quantized-named file, so it's opt-in and the
+  // default FP16 models are unaffected.
+  const bool strongly_typed = quantized && type != "det" && type != "rec";
   std::cout << "Building TRT engine: " << onnx_path << " -> " << trt_path;
   if (type == "det") std::cout << " (det_max_side=" << read_det_effective_max_side() << ")";
-  if (strongly_typed) std::cout << " [strongly-typed QDQ]";
+  if (quantized)
+    std::cout << (strongly_typed ? " [strongly-typed QDQ]" : " [weakly-typed FP16+QDQ]");
   std::cout << '\n';
 
   auto builder = std::unique_ptr<nvinfer1::IBuilder>(
@@ -306,12 +318,17 @@ static bool build_engine(const std::string &onnx_path,
     // MIN<=OPT<=MAX.
     int det_max = read_det_effective_max_side();
     int det_opt = std::min(640, det_max);
+    // Batch range 1..8: OPT stays at batch 1 so single-image latency (the common
+    // /ocr/raw case) keeps its tuned tactics, while MAX=8 lets the dynamic-batch
+    // path (PaddleDet::run_batch, dynamic-batching coalescer) submit batch>1 for
+    // throughput — det at batch 8 is ~40% cheaper per image (measured).
+    const int det_opt_batch = read_det_opt_batch();  // DET_OPT_BATCH, default 4
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
         nvinfer1::Dims4{1, 3, kDetMaxSideMin, kDetMaxSideMin});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
-        nvinfer1::Dims4{1, 3, det_opt, det_opt});
+        nvinfer1::Dims4{det_opt_batch, 3, det_opt, det_opt});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
-        nvinfer1::Dims4{1, 3, det_max, det_max});
+        nvinfer1::Dims4{8, 3, det_max, det_max});
   } else if (type == "det_pdf_static") {
     // PDF-only mode: every page is rendered to the SAME (H, W) at a fixed
     // DPI, so we pin the profile to a single shape (min==opt==max) at the

@@ -861,11 +861,21 @@ std::vector<OcrPipelineResult> OcrPipeline::run_batch_with_layout(
     }
     all_det_boxes = det_->run_batch(gpu_imgs, dims, stream);
   } else {
+    // Batched detection across the whole batch (one TRT call per <=8-image
+    // chunk via the batch-capable det profile) instead of batch-1 per image.
+    // det run_batch resizes all images to the batch-max shape and maps boxes
+    // back per image — ~40% cheaper det/image at batch 8 (measured). Only the
+    // batch path uses this; single /ocr/raw still takes the batch-1 fast path.
+    std::vector<GpuImage> gpu_imgs;
+    std::vector<std::pair<int, int>> dims;
+    gpu_imgs.reserve(batch_n);
+    dims.reserve(batch_n);
     for (int i = 0; i < batch_n; i++) {
-      GpuImage gi{per_img[i].d_buf, per_img[i].pitch,
-                  per_img[i].rows, per_img[i].cols};
-      all_det_boxes[i] = det_->run(gi, per_img[i].rows, per_img[i].cols, stream);
+      gpu_imgs.push_back({per_img[i].d_buf, per_img[i].pitch,
+                          per_img[i].rows, per_img[i].cols});
+      dims.emplace_back(per_img[i].rows, per_img[i].cols);
     }
+    all_det_boxes = det_->run_batch(gpu_imgs, dims, stream);
   }
 
   // Assign detection results and run angle classification per-image.

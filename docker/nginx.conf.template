@@ -35,10 +35,11 @@ http {
         # Slow-loris mitigation: reap clients that open a connection and then
         # trickle (or never send) the request header/body or stall reading the
         # response, instead of pinning an nginx worker for proxy_*_timeout.
-        # Generous enough not to disturb normal large uploads.
-        client_header_timeout 30s;
-        client_body_timeout 30s;
-        send_timeout 30s;
+        # 60s matches nginx's own default (so this only adds an explicit floor,
+        # never shrinks a window an existing slow-upload client relied on).
+        client_header_timeout 60s;
+        client_body_timeout 60s;
+        send_timeout 60s;
 
         # JSON error pages for all nginx-generated errors
         error_page 413 =413 @error_413;

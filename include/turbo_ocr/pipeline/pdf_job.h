@@ -55,6 +55,11 @@
 
 namespace turbo_ocr::pipeline {
 
+// Accepted PDF render DPI range — shared by every transport's dpi validation
+// (HTTP pdf_routes + gRPC RecognizePDF) so the bound + message can't drift.
+constexpr int kMinPdfDpi = 50;
+constexpr int kMaxPdfDpi = 600;
+
 // Image-export mode for ?images=... — only "inline" is supported on HTTP; gRPC
 // never requests it. Kept here so the orchestrator carries the parity flag.
 enum class PdfImageMode { None, Inline };

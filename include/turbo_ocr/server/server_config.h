@@ -43,9 +43,14 @@ struct ServerConfig {
   int grpc_port = 50051;         // GRPC_PORT / --grpc-port
 
   // ---- Request lifecycle ----
-  // Per-request inference deadline (ms). A submit whose future does not resolve
-  // within this window returns 504 INFERENCE_TIMEOUT and frees its slot.
-  int request_timeout_ms = 30000;  // REQUEST_TIMEOUT_MS
+  // Per-request inference deadline (ms). When > 0, a submit whose future does
+  // not resolve within this window returns 504 INFERENCE_TIMEOUT and frees its
+  // slot. Default 0 = DISABLED (unbounded wait — the pre-hardening behavior),
+  // so this is strictly opt-in and never changes a deployed server's behavior.
+  // Recommended for production: set REQUEST_TIMEOUT_MS=30000 to recover wedged
+  // GPU slots. Applies to single-image / batch / gRPC; PDF pages are unaffected
+  // (the PDF path blocks-and-joins by design).
+  int request_timeout_ms = 0;  // REQUEST_TIMEOUT_MS (0 = disabled)
 
   // ---- Body limits ----
   int max_body_mb     = 100;     // MAX_BODY_MB / --max-body-mb
@@ -331,7 +336,7 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
   c.grpc_port = env_int_strict("GRPC_PORT", 50051, 1, 65535, c.errors);
 
   c.request_timeout_ms =
-      env_int_strict("REQUEST_TIMEOUT_MS", 30000, 1, 3600000, c.errors);
+      env_int_strict("REQUEST_TIMEOUT_MS", 0, 0, 3600000, c.errors);
 
   c.max_body_mb     = env_int_strict("MAX_BODY_MB",        100,  1, 102400, c.errors);
   c.max_body_mem_mb = env_int_strict("MAX_BODY_MEMORY_MB", 1024, 1, 102400, c.errors);
@@ -453,8 +458,8 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
     app.add_option("--http-port",   c.http_port,   "HTTP port")->capture_default_str()->check(CLI::Range(1, 65535));
     app.add_option("--grpc-port",   c.grpc_port,   "gRPC port")->capture_default_str()->check(CLI::Range(1, 65535));
     app.add_option("--request-timeout-ms", c.request_timeout_ms,
-        "Per-request inference deadline (ms); future not resolved within it returns 504")
-        ->capture_default_str()->check(CLI::Range(1, 3600000));
+        "Per-request inference deadline (ms); 0 = disabled (default); >0 returns 504 on overrun")
+        ->capture_default_str()->check(CLI::Range(0, 3600000));
     app.add_option("--max-body-mb", c.max_body_mb, "Max request body size (MB)")->capture_default_str()->check(CLI::Range(1, 102400));
     app.add_option("--max-body-memory-mb", c.max_body_mem_mb,
         "In-memory body buffer cap (MB); always clamped to --max-body-mb so effective default is min(1024, MAX_BODY_MB)")

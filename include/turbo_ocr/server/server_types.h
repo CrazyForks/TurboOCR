@@ -142,6 +142,11 @@ template <typename F>
 void run_with_error_handling(DrogonCallback &cb, const char *route, F &&fn) {
   try {
     fn();
+  } catch (const turbo_ocr::TimeoutError &e) {
+    // C4: a per-request deadline overrun. Must map to 504 INFERENCE_TIMEOUT —
+    // same as the GPU image routes — not the generic 500 below. /ocr (base64)
+    // is the one inference route still on this shared handler in the GPU build.
+    cb(error_response(drogon::k504GatewayTimeout, "INFERENCE_TIMEOUT", e.what()));
   } catch (const turbo_ocr::PoolExhaustedError &e) {
     cb(error_response(drogon::k503ServiceUnavailable, "SERVER_BUSY", e.what()));
   } catch (const turbo_ocr::ImageTooLargeError &e) {

@@ -219,6 +219,7 @@ add_executable(turbo_ocr_tests
     tests/cpp/test_server_config.cpp
     tests/cpp/test_docassembly.cpp
     tests/cpp/test_dict_resolution.cpp
+    tests/cpp/test_gpu_safety.cpp
     src/render/pdf_renderer.cpp
     third_party/catch2/catch_amalgamated.cpp
 )
@@ -234,6 +235,13 @@ target_compile_options(turbo_ocr_tests PRIVATE ${TURBO_OCR_CXX_FLAGS})
 # nothing. Catch2's amalgamated runner returns non-zero on any failure, so a
 # single add_test gates correctly. `ctest --no-tests=error` guards an empty suite.
 add_test(NAME turbo_ocr_unit COMMAND turbo_ocr_tests)
+
+# In the CPU build the test binary links turbo_ocr_common (not turbo_ocr_cpu),
+# so it doesn't inherit USE_CPU_ONLY — define it here so GPU-only test files
+# (test_gpu_safety.cpp, which includes CUDA headers) compile out cleanly.
+if(USE_CPU_ONLY)
+    target_compile_definitions(turbo_ocr_tests PRIVATE USE_CPU_ONLY)
+endif()
 
 if(USE_CPU_ONLY)
     message(STATUS "Building CPU-ONLY mode (ONNX Runtime backend)")

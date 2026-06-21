@@ -248,3 +248,18 @@ _(append as we go — each deferred High needs a one-line written acceptance her
   routes) is likewise left as-is: the route-level `GpuImage` is a deliberate
   zero-copy optimization, not a defect, and relocating it risks the hot path for
   no functional gain.
+- **REQUEST_TIMEOUT_MS defaults to 0 (DISABLED) — opt-in.** Review Round 1 flagged
+  a 30000ms default as an opt-OUT behavior change (previously-unbounded waits would
+  start returning 504). To stay strictly non-breaking on the deployed server, the
+  default is 0 (unbounded, the pre-hardening behavior); operators opt in with
+  `REQUEST_TIMEOUT_MS=30000` for wedged-slot recovery. PDF pages are unaffected.
+- **Phase H static gates run + triaged.** cppcheck is CI-wired (+ ASAN/TSAN nightly).
+  scan-build (H2) + valgrind memcheck (H3) were run manually this pass: valgrind
+  found + fixed one real OOB read in layout flatten_descendants (now 0 errors/0
+  leaks); scan-build reported 0 real production bugs (60 findings = dead-stores /
+  vendored simdutf / Catch2-REQUIRE FPs); cppcheck 0 error-severity. A nightly
+  scan-build/valgrind CI job (with a CUDA/ORT suppression file) is the follow-up.
+- **M1 per-stage histogram removed (dead code).** Built + serialized but never
+  populated; accurate GPU per-stage timing needs CUDA events (out of scope), so the
+  dead machinery was removed. The M1 saturation gauges (workpool queue depth /
+  inflight / dispatcher queue depth) are wired and live — that is M1's real value.

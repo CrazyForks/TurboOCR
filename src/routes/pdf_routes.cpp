@@ -37,10 +37,11 @@ namespace turbo_ocr::routes {
 
 namespace {
 
-// Render-DPI request bounds, shared by the CPU and GPU /ocr/pdf routes (L5):
-// previously the literal 50/600 pair appeared at every dpi range check.
-constexpr int kMinPdfDpi = 50;
-constexpr int kMaxPdfDpi = 600;
+// Render-DPI request bounds — the single definition lives in pdf_job.h so the
+// gRPC RecognizePDF check uses the same values (L5). Aliased here so the
+// existing unqualified call sites below keep compiling.
+using turbo_ocr::pipeline::kMinPdfDpi;
+using turbo_ocr::pipeline::kMaxPdfDpi;
 // Default render DPI for the CPU route when ?dpi= is absent. The GPU route
 // takes its default from ServerConfig (default_dpi); this is the CPU-only path.
 constexpr int kCpuDefaultDpi = 100;

@@ -554,10 +554,18 @@ public:
           // std::exception, so the per-slot catch below marks it empty.
           pipeline::OcrPipelineResult out;
           if (batch_deadline_on) {
-            long remaining_ms = std::max<long>(
-                0, std::chrono::duration_cast<std::chrono::milliseconds>(
-                       batch_deadline - std::chrono::steady_clock::now())
-                       .count());
+            long remaining_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    batch_deadline - std::chrono::steady_clock::now())
+                    .count();
+            if (remaining_ms <= 0) {
+              // Batch deadline already elapsed (an earlier slot consumed the
+              // window): abandon this slot empty. Must NOT call
+              // get_with_timeout(fut, 0) — 0 means "disabled" there and would
+              // block on future.get() forever, hanging the whole RPC.
+              mark_empty_slot(entries[i]);
+              continue;
+            }
             out = pipeline::get_with_timeout(futs[i], remaining_ms);
           } else {
             out = futs[i].get();
@@ -638,9 +646,10 @@ public:
     // profile (pdf_page_h/w) was sized for; 100 otherwise. Explicit request
     // dpi always wins.
     if (dpi == 0) dpi = default_pdf_dpi_;
-    if (dpi < 50 || dpi > 600)
-      return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
-                        "INVALID_DPI", "DPI must be between 50 and 600");
+    if (dpi < pipeline::kMinPdfDpi || dpi > pipeline::kMaxPdfDpi)
+      return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT, "INVALID_DPI",
+                        std::format("DPI must be between {} and {}",
+                                    pipeline::kMinPdfDpi, pipeline::kMaxPdfDpi));
 
     pdf::PdfMode req_mode = default_pdf_mode_;
     if (!request->mode().empty())

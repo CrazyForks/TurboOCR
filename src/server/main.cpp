@@ -407,10 +407,26 @@ int main(int argc, char **argv) {
            "body_cap_mb_drogon", max_body_mb, "body_cap_mb_nginx", max_body_mb,
            "body_mem_mb", max_body_mem_mb);
 
+  // Background readiness refresher: periodically re-runs the GPU probe (off the
+  // gRPC CQ poller) so the cached verdict gRPC Health reads stays fresh even for
+  // deployments that probe ONLY gRPC Health and never hit HTTP /health/ready.
+  // The probe's own 5s TTL gates the real GPU work, so this just guarantees a
+  // wake within that window. Stopped + joined before gRPC/dispatcher teardown.
+  std::atomic<bool> refresher_stop{false};
+  std::thread readiness_refresher([&readiness, &refresher_stop]() {
+    while (!refresher_stop.load(std::memory_order_acquire)) {
+      (void)readiness();
+      for (int i = 0; i < 30 && !refresher_stop.load(std::memory_order_acquire); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
+
   // Listener + body-size config + graceful-shutdown signal handlers + run().
   // Blocks until app().quit() (the drain thread) returns.
   bootstrap::run_http_server(cfg, io_threads, work_pool);
 
+  refresher_stop.store(true, std::memory_order_release);
+  readiness_refresher.join();
   bootstrap::shutdown_grpc_after_run(grpc_handle.server.get());
   return 0;
 }

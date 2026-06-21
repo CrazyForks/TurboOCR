@@ -139,30 +139,6 @@ public:
     set_workpool_max_depth(max_depth);
   }
 
-  // ── Per-stage timing ───────────────────────────────────────────────────
-
-  enum Stage : int { kDet = 0, kRec, kCls, kLayout, kStageCount };
-
-  static constexpr const char *stage_name(Stage s) {
-    constexpr const char *names[] = {"det", "rec", "cls", "layout"};
-    return names[s];
-  }
-
-  /// Record one stage execution. Pipeline calls this per det/rec/cls/layout
-  /// pass; no-op cost is a few relaxed atomics so it is safe on the hot path.
-  void record_stage(Stage stage, double duration_s) {
-    auto &s = stages_[stage];
-    s.hist_count.fetch_add(1, std::memory_order_relaxed);
-    s.hist_sum.fetch_add(
-        static_cast<uint64_t>(duration_s * 1e6), std::memory_order_relaxed);
-    for (size_t i = 0; i < kNumBuckets; ++i) {
-      if (duration_s <= kBuckets[i]) {
-        s.hist_buckets[i].fetch_add(1, std::memory_order_release);
-        break;
-      }
-    }
-  }
-
   // ── Prometheus text exposition ─────────────────────────────────────────
 
   [[nodiscard]] std::string serialize() const {
@@ -245,34 +221,6 @@ public:
                   dispatcher_queue_depth_.load(std::memory_order_relaxed));
     out += buf;
 
-    // Per-stage timing histograms (det/rec/cls/layout). Only emitted once some
-    // stage has been recorded — emitting a permanently-empty histogram (no
-    // caller of record_stage yet) would read as "instrumented but always 0",
-    // which is more misleading than the series being absent.
-    uint64_t stage_total = 0;
-    for (int i = 0; i < kStageCount; ++i)
-      stage_total += stages_[i].hist_count.load(std::memory_order_relaxed);
-    if (stage_total > 0) {
-    out += "# HELP turbo_ocr_stage_duration_seconds Per-stage inference latency histogram.\n";
-    out += "# TYPE turbo_ocr_stage_duration_seconds histogram\n";
-    for (int i = 0; i < kStageCount; ++i) {
-      auto &s = stages_[i];
-      auto name = stage_name(static_cast<Stage>(i));
-      uint64_t cumulative = 0;
-      for (size_t b = 0; b < kNumBuckets; ++b) {
-        cumulative += s.hist_buckets[b].load(std::memory_order_acquire);
-        char le_buf[32];
-        std::snprintf(le_buf, sizeof(le_buf), "%.3f", kBuckets[b]);
-        append_stage_bucket(out, name, le_buf, cumulative);
-      }
-      uint64_t count = s.hist_count.load(std::memory_order_relaxed);
-      append_stage_bucket(out, name, "+Inf", count);
-      double sum = static_cast<double>(
-          s.hist_sum.load(std::memory_order_relaxed)) / 1e6;
-      append_stage_summary(out, name, sum, count);
-    }
-    }
-
     // GPU VRAM. NOTE: cudaMemGetInfo (the scrape handler's source) reports
     // whole-device occupancy, not this process's footprint — on a shared GPU
     // these numbers include every other tenant. See the per-metric HELP below.
@@ -328,14 +276,7 @@ private:
     std::atomic<uint64_t> hist_count{0};
   };
 
-  struct StageMetrics {
-    std::array<std::atomic<uint64_t>, kNumBuckets> hist_buckets{};
-    std::atomic<uint64_t> hist_sum{0};   // microseconds
-    std::atomic<uint64_t> hist_count{0};
-  };
-
   std::array<RouteMetrics, kRouteCount> routes_{};
-  std::array<StageMetrics, kStageCount> stages_{};
   std::atomic<uint64_t> pool_exhaustions_{0};
   std::atomic<int> pool_size_{0};
   std::atomic<size_t> workpool_queue_depth_{0};
@@ -380,27 +321,6 @@ private:
     out += buf;
   }
 
-  static void append_stage_bucket(std::string &out, const char *stage,
-                                  const char *le, uint64_t cumulative) {
-    char buf[256];
-    std::snprintf(buf, sizeof(buf),
-        "turbo_ocr_stage_duration_seconds_bucket{stage=\"%s\",le=\"%s\"} %" PRIu64 "\n",
-        stage, le, cumulative);
-    out += buf;
-  }
-
-  static void append_stage_summary(std::string &out, const char *stage,
-                                   double sum, uint64_t count) {
-    char buf[256];
-    std::snprintf(buf, sizeof(buf),
-        "turbo_ocr_stage_duration_seconds_sum{stage=\"%s\"} %.6f\n",
-        stage, sum);
-    out += buf;
-    std::snprintf(buf, sizeof(buf),
-        "turbo_ocr_stage_duration_seconds_count{stage=\"%s\"} %" PRIu64 "\n",
-        stage, count);
-    out += buf;
-  }
 };
 
 /// Register the /metrics endpoint and automatic per-request recording.

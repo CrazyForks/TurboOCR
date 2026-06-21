@@ -97,6 +97,13 @@ def render(payload: dict) -> str:
         for f in (payload.get("formulas") or [])
         if f.get("layout_id") is not None
     }
+    # Table regions are recognized by the table-structure backend; prefer its
+    # reconstructed HTML (keyed by layout_id) over the empty placeholder.
+    table_by_lid = {
+        t["layout_id"]: (t.get("html") or "").strip()
+        for t in (payload.get("tables") or [])
+        if t.get("layout_id") is not None
+    }
 
     if order:
         by_id = {b["id"]: b for b in layout}
@@ -131,7 +138,8 @@ def render(payload: dict) -> str:
             if text:
                 emit(f"**Abstract** {text}")
         elif cls == "table":
-            emit("<table>", "</table>")
+            html = table_by_lid.get(blk.get("id"))
+            emit(html if html else "<table></table>")
         elif cls == "display_formula":
             latex = formula_by_lid.get(blk.get("id")) or text
             emit(f"$${latex}$$" if latex else "$$ $$")

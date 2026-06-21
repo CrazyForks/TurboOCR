@@ -1,4 +1,5 @@
 #include "turbo_ocr/pipeline/ocr_pipeline.h"
+#include <climits>
 #include "turbo_ocr/common/cuda_check.h"
 #include "turbo_ocr/common/errors.h"
 #include "turbo_ocr/common/timing.h"
@@ -9,6 +10,9 @@
 #include "turbo_ocr/layout/reading_order.h"
 #include "turbo_ocr/router/cua_router.h"
 #include "turbo_ocr/table/table_stage.h"
+#include "turbo_ocr/table/nemotron_table_struct.h"
+#include "turbo_ocr/table/nemotron_postprocess.h"
+#include "turbo_ocr/engine/onnx_to_trt.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -206,6 +210,27 @@ bool OcrPipeline::load_layout_model(const std::string &layout_trt_path) {
   return true;
 }
 
+bool OcrPipeline::load_table_struct_model(const std::string &onnx_path) {
+  if (onnx_path.empty()) return false;
+  const std::string trt = engine::ensure_trt_engine(onnx_path, "table_struct");
+  if (trt.empty()) {
+    std::cerr << "[Pipeline] table-struct engine build failed: " << onnx_path << '\n';
+    return false;
+  }
+  auto ts = std::make_unique<table::NemotronTableStruct>();
+  if (!ts->load_model(trt)) {
+    std::cerr << "[Pipeline] table-struct load_model failed — tables disabled\n";
+    return false;
+  }
+  table_struct_ = std::move(ts);
+  if (!table_stream_) {
+    CUDA_CHECK(cudaStreamCreateWithFlags(&table_stream_, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&table_done_event_, cudaEventDisableTiming));
+  }
+  std::cout << "[Pipeline] Table stage enabled (backend=nemotron, TRT FP16)\n";
+  return true;
+}
+
 bool OcrPipeline::load_doc_ori_model(const std::string &doc_ori_trt_path) {
   if (doc_ori_trt_path.empty()) return false;
   auto doc_ori = std::make_unique<classification::DocOrientation>();
@@ -396,14 +421,53 @@ void OcrPipeline::dispatch_router_(OcrPipelineResult &out,
   router_->classify(boxes, out.layout, plan_);
   timer.cpu_stop();
 
-  const bool has_table   = !plan_.table_layout_ids.empty() && table_stage_;
+  const bool has_table   = !plan_.table_layout_ids.empty() &&
+                           (table_stage_ || table_struct_);
   const bool has_formula = !plan_.formula_layout_ids.empty() && formula_;
   if (!has_table && !has_formula) return;          // routed-all-text bail
 
   // Tables: TableStage owns its own waitEvent(det_only_event_) and final
   // sync inside collect(), so by the time run() returns the work is done
   // and `gpu_img` is no longer being read by table_stream_.
-  if (has_table) {
+  if (has_table && table_struct_) {
+    // Single-pass Nemotron (TRT FP16): one execute per table region; cells
+    // are filled from the page's text-OCR results by AABB center containment.
+    timer.gpu_start("table_dispatch");
+    CUDA_CHECK(cudaStreamWaitEvent(table_stream_, det_only_event_, 0));
+    for (int lid : plan_.table_layout_ids) {
+      if (lid < 0 || static_cast<std::size_t>(lid) >= out.layout.size()) continue;
+      const Box &region = out.layout[lid].box;
+      int rx = INT_MAX, ry = INT_MAX;
+      for (const auto &p : region.pts) { rx = std::min(rx, p[0]); ry = std::min(ry, p[1]); }
+      const auto decoded  = table_struct_->infer(gpu_img, region, table_stream_);
+      const auto assembly = table::assemble_nemotron(decoded);
+      std::vector<std::string> cell_texts;
+      cell_texts.reserve(assembly.cells.size());
+      for (const auto &c : assembly.cells) {
+        std::string t;
+        const float x1 = c.bbox[0] + rx, y1 = c.bbox[1] + ry;
+        const float x2 = c.bbox[2] + rx, y2 = c.bbox[3] + ry;
+        for (const auto &r : out.results) {
+          int cx = 0, cy = 0;
+          for (const auto &p : r.box.pts) { cx += p[0]; cy += p[1]; }
+          cx /= 4; cy /= 4;
+          if (cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2) {
+            if (!t.empty()) t += ' ';
+            t += r.text;
+          }
+        }
+        cell_texts.push_back(std::move(t));
+      }
+      router::TableResult tr;
+      tr.layout_id = lid;
+      tr.html      = table::nemotron_to_html(assembly, cell_texts);
+      tr.score     = out.layout[lid].score;
+      tr.box       = region;
+      out.tables.push_back(std::move(tr));
+    }
+    timer.gpu_stop();
+    CUDA_CHECK(cudaEventRecord(table_done_event_, table_stream_));
+  } else if (has_table) {
     timer.gpu_start("table_dispatch");
     out.tables = table_stage_->run(gpu_img, out.layout, out.results,
                                    table_stream_, det_only_event_);

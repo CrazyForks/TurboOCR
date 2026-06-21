@@ -264,8 +264,8 @@ static bool build_engine(const std::string &onnx_path,
   // 4 GB (same ceiling as layout) so even 4096-side builds fit on a 16 GB
   // card alongside rec/cls/layout.
   size_t workspace_bytes;
-  if (type == "layout") {
-    workspace_bytes = 4ULL << 30;          // 4 GiB
+  if (type == "layout" || type == "table_struct") {
+    workspace_bytes = 4ULL << 30;          // 4 GiB (Nemotron YOLOX 1024² needs it)
   } else if (type == "det") {
     // (det_max/960)² × 1 GiB, capped at 4 GiB. 960 is the historical baseline
     // for the scale ratio: at 2048 → ~4 GiB, at 4096 → 4 GiB (cap). det_max is
@@ -466,6 +466,15 @@ static bool build_engine(const std::string &onnx_path,
         nvinfer1::Dims4{1, 3, 224, 224});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
         nvinfer1::Dims4{8, 3, 224, 224});
+  } else if (type == "table_struct") {
+    // Nemotron table-structure (YOLOX), fixed 1024×1024 letterbox. Batch pinned
+    // to 1 (NemotronTableStruct::infer sets {1,3,1024,1024} per region).
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{1, 3, 1024, 1024});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{1, 3, 1024, 1024});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{1, 3, 1024, 1024});
   } else {
     // cls: PP-OCRv5 textline orientation classifier (PP-LCNet_x0_25), input
     // 80x160. Must match kClsImageH/kClsImageW in classification/paddle_cls.h.

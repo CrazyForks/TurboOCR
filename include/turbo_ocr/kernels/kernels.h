@@ -66,6 +66,14 @@ void cuda_fused_slanext_pre(const GpuImage &src,
                             float *dst_chw,
                             cudaStream_t stream = 0);
 
+// Nemotron table-structure (YOLOX) preprocess: 1024×1024 letterbox (top-left,
+// pad 114), raw 0-255 BGR, CHW. Matches decode_nemotron's ratio inversion.
+void cuda_fused_nemotron_pre(const GpuImage &src,
+                             int rect_x, int rect_y,
+                             int rect_w, int rect_h,
+                             float *dst_chw,
+                             cudaStream_t stream = 0);
+
 // Batched fused resize + normalize + CHW for detection
 // Processes N images (each with different src dimensions) into a single
 // batched CHW tensor [N, 3, dst_h, dst_w].

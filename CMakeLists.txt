@@ -474,6 +474,8 @@ else()
         src/table/table_stage.cpp
         src/table/table_cls.cpp
         src/table/table_cell.cpp
+        src/table/nemotron_table_struct.cpp
+        src/table/nemotron_postprocess.cpp
         src/table/slanext.cpp
         src/table/slanext_dict.cpp
         src/table/slanext_postprocess.cpp

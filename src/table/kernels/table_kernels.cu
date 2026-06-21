@@ -217,6 +217,65 @@ void cuda_fused_slanext_pre(const GpuImage& src,
 }
 
 // =================================================================
+// Nemotron table-structure (YOLOX) preprocess: letterbox the sub-rect to a
+// 1024×1024 canvas (resize-by-long-side, top-left, pad 114), RAW 0-255 BGR
+// values (YOLOX takes unnormalized input), CHW. The top-left letterbox with
+// scale = 1024/max(w,h) is exactly what decode_nemotron inverts via
+// ratio = min(1024/h, 1024/w).
+// =================================================================
+__global__ __launch_bounds__(256)
+void nemotron_pre_kernel(
+    const unsigned char* __restrict__ src, int src_step,
+    int rect_x, int rect_y, int rect_w, int rect_h,
+    float* __restrict__ dst_chw, int dst,
+    int new_w, int new_h, float scale) {
+  int dx = blockIdx.x * blockDim.x + threadIdx.x;
+  int dy = blockIdx.y * blockDim.y + threadIdx.y;
+  if (dx >= dst || dy >= dst) return;
+  int idx = dy * dst + dx;
+  int plane = dst * dst;
+  if (dx < new_w && dy < new_h) {
+    float sx_rel = (dx + 0.5f) * scale - 0.5f;
+    float sy_rel = (dy + 0.5f) * scale - 0.5f;
+    float b, g, r;
+    bilinear_sample_norm(src, src_step, rect_x, rect_y, rect_w, rect_h,
+                         sx_rel, sy_rel,
+                         0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+                         b, g, r);
+    dst_chw[0 * plane + idx] = b;
+    dst_chw[1 * plane + idx] = g;
+    dst_chw[2 * plane + idx] = r;
+  } else {
+    dst_chw[0 * plane + idx] = 114.0f;
+    dst_chw[1 * plane + idx] = 114.0f;
+    dst_chw[2 * plane + idx] = 114.0f;
+  }
+}
+
+void cuda_fused_nemotron_pre(const GpuImage& src,
+                             int rect_x, int rect_y, int rect_w, int rect_h,
+                             float* dst_chw, cudaStream_t stream) {
+  constexpr int DST = 1024;
+  float long_side = (float)::max(rect_w, rect_h);
+  float s = (float)DST / long_side;
+  int new_w = (int)lroundf((float)rect_w * s);
+  int new_h = (int)lroundf((float)rect_h * s);
+  if (new_w > DST) new_w = DST;
+  if (new_h > DST) new_h = DST;
+  if (new_w < 1) new_w = 1;
+  if (new_h < 1) new_h = 1;
+  float scale = 1.0f / s;                          // src px per resized px
+
+  dim3 block(32, 8);
+  dim3 grid((DST + block.x - 1) / block.x, (DST + block.y - 1) / block.y);
+  nemotron_pre_kernel<<<grid, block, 0, stream>>>(
+      (const unsigned char*)src.data, (int)src.step,
+      rect_x, rect_y, rect_w, rect_h,
+      dst_chw, DST, new_w, new_h, scale);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// =================================================================
 // Sub-rect overload of layout preprocess (used by cell-det).
 // Same maths as the page-wide version in src/kernels/kernels.cu:
 //   resize sub-rect to dst_w × dst_h, /255, mean=0, std=1, BGR CHW.

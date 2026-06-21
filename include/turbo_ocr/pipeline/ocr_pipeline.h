@@ -17,7 +17,7 @@
 #include "turbo_ocr/router/routing_plan.h"
 
 namespace turbo_ocr::router  { class CuaRouter; }
-namespace turbo_ocr::table   { class TableStage; }
+namespace turbo_ocr::table   { class TableStage; class NemotronTableStruct; }
 namespace turbo_ocr::formula { class IFormulaRecognizer; }
 
 namespace turbo_ocr::pipeline {
@@ -40,6 +40,11 @@ public:
   // Plain run(...) continues to return text only (layout is computed and
   // discarded to keep a stable API for non-layout callers).
   [[nodiscard]] bool load_layout_model(const std::string &layout_trt_path);
+
+  // Single-pass Nemotron table-structure backend (builds a TRT FP16 engine
+  // from the ONNX). When loaded, table regions are recognized by this model
+  // and cells are filled from the page's text-OCR results.
+  [[nodiscard]] bool load_table_struct_model(const std::string &onnx_path);
 
   // Load the CUA router + table-stage + formula engines in one call.
   // Pass an empty path for any optional component (e.g. wireless table
@@ -234,6 +239,7 @@ private:
   // ---- CUA router + table/formula stages (lazy-allocated) ----------------
   std::unique_ptr<router::CuaRouter>   router_;
   std::unique_ptr<table::TableStage>   table_stage_;
+  std::unique_ptr<table::NemotronTableStruct> table_struct_;
   std::unique_ptr<formula::IFormulaRecognizer> formula_;
 
   cudaStream_t table_stream_       = nullptr;

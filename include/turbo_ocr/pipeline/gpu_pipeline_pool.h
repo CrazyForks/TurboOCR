@@ -48,15 +48,20 @@ inline void maybe_load_router_models(OcrPipeline &pipeline) {
     const char *v = std::getenv(k);
     return std::string(v ? v : "");
   };
+  const std::string table_struct_onnx = env("TABLE_STRUCT_ONNX");
   const bool want_router = std::getenv("FORMULA_BACKEND") != nullptr ||
                            !env("FORMULA_ONNX").empty() ||
-                           !env("TABLE_CLS_TRT").empty();
+                           !env("TABLE_CLS_TRT").empty() ||
+                           !table_struct_onnx.empty();
   if (!want_router) return;
   (void)pipeline.load_router_models(
       env("TABLE_CLS_TRT"), env("TABLE_CELL_WIRED_TRT"),
       env("TABLE_CELL_WIRELESS_TRT"), env("TABLE_SLANEXT_WIRED_TRT"),
       env("TABLE_SLANEXT_WIRELESS_TRT"), env("FORMULA_ONNX"),
       env("FORMULA_TOKENIZER"));
+  // Single-pass Nemotron table-structure backend (TRT FP16), built from ONNX.
+  if (!table_struct_onnx.empty())
+    (void)pipeline.load_table_struct_model(table_struct_onnx);
 }
 
 /// OcrPipeline + its dedicated CUDA stream + its own nvJPEG decoder, managed

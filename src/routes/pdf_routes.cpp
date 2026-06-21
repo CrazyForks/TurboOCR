@@ -25,6 +25,7 @@
 #include "turbo_ocr/pdf/page_image_encoder.h"
 #include "turbo_ocr/pdf/pdf_text_layer.h"
 #include "simdutf.h"
+#include "turbo_ocr/server/env_utils.h"
 #include "turbo_ocr/server/server_types.h"
 
 using turbo_ocr::OCRResultItem;
@@ -33,6 +34,51 @@ using turbo_ocr::results_to_json;
 namespace turbo_ocr::routes {
 
 namespace {
+
+// Render-DPI request bounds, shared by the CPU and GPU /ocr/pdf routes (L5):
+// previously the literal 50/600 pair appeared at every dpi range check.
+constexpr int kMinPdfDpi = 50;
+constexpr int kMaxPdfDpi = 600;
+// Default render DPI for the CPU route when ?dpi= is absent. The GPU route
+// takes its default from ServerConfig (default_dpi); this is the CPU-only path.
+constexpr int kCpuDefaultDpi = 100;
+
+// L3 strict-query-params (opt-in). Default OFF preserves the historical
+// lenient behavior (unknown params silently ignored). When
+// TURBO_OCR_STRICT_QUERY_PARAMS=1, an unrecognized query parameter is a 400
+// INVALID_PARAMETER instead. Read once; cached for the process lifetime.
+[[nodiscard]] bool strict_query_params_enabled() noexcept {
+  static const bool v = server::env_enabled("TURBO_OCR_STRICT_QUERY_PARAMS");
+  return v;
+}
+
+// When strict mode is on, reject the request if any query parameter is not in
+// `allowed`. Returns true (and invokes `callback`) on rejection. No-op (returns
+// false) when strict mode is off, so default behavior is byte-identical.
+// NOTE: Drogon's getParameters() merges x-www-form-urlencoded body fields with
+// the query string. The PDF route accepts multipart (file fields, which do NOT
+// land in getParameters()), JSON, or raw bodies — none populate plain form
+// params — so the map here is the query string only. The caller still passes
+// the multipart-only check downstream; we only gate query keys.
+[[nodiscard]] bool reject_unknown_query_params(
+    const drogon::HttpRequestPtr &req,
+    std::initializer_list<std::string_view> allowed,
+    std::function<void(const drogon::HttpResponsePtr &)> &callback) {
+  if (!strict_query_params_enabled()) return false;
+  for (const auto &kv : req->getParameters()) {
+    const std::string &key = kv.first;
+    bool known = false;
+    for (auto a : allowed)
+      if (a == key) { known = true; break; }
+    if (!known) {
+      callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+          std::format("Unknown query parameter '{}' "
+                      "(TURBO_OCR_STRICT_QUERY_PARAMS=1)", key)));
+      return true;
+    }
+  }
+  return false;
+}
 
 // Parse a query-param int safely (std::atoi is UB on overflow). Returns the
 // `fallback` for empty/non-numeric/out-of-int-range input, so the caller's
@@ -419,6 +465,21 @@ std::string emit_pdf_response(std::vector<PageResult> &page_results,
 }
 
 #ifndef USE_CPU_ONLY
+// C4 NOTE (GPU /ocr/pdf): unlike the single-image GPU routes, this route does
+// NOT use the synchronous dispatcher.submit(...).get() pattern that C4 converts
+// to submit_for_default. The streamed-render path fans page tasks out into
+// std::futures (run_streamed_render_gpu) and joins them with f.get() at the
+// end. Those tasks write results into the handler-scoped PdfPageSink and read
+// PPMs owned by the handler-scoped StreamHandle, so abandoning a future on
+// timeout (the basis of submit_for_default) would tear that shared state down
+// while a still-running task references it — a use-after-free, i.e. exactly the
+// non-breaking guarantee we must keep. Per-page abandonment-based timeout would
+// require restructuring every page task to own all of its state (a larger
+// refactor than this change authorizes). The dispatcher-level deadline
+// (set_request_timeout_ms, applied in main.cpp) still governs every other GPU
+// path; whole-request bounding for PDF stays the WorkPool's responsibility.
+// TODO(C4-pdf): make page tasks self-contained, then bound the join per page.
+
 // GPU page-result type carries the same fields as the base. The
 // per-page-future render loop resolves each rendered page on the dispatcher
 // thread pool and writes back into this shared vector under results_mutex.
@@ -884,12 +945,19 @@ void register_pdf_route(server::WorkPool &pool,
     const bool want_reading_order = opts.want_reading_order;
     const bool want_blocks = opts.want_blocks;
 
+    if (reject_unknown_query_params(
+            req, {"layout", "reading_order", "as_blocks", "dpi", "mode",
+                  "images", "format", "lossless", "png_compression", "quality",
+                  "max_side", "autorotate"}, callback))
+      return;
+
     auto dpi_str = req->getParameter("dpi");
     // Absent -> default; present-but-garbage/overflow -> -1 -> rejected below
     // (don't silently fall back to default on a bad explicit value).
     int dpi = dpi_str.empty() ? default_dpi : query_int(std::string(dpi_str), -1);
-    if (dpi < 50 || dpi > 600) {
-      callback(server::error_response(drogon::k400BadRequest, "INVALID_DPI", "DPI must be between 50 and 600"));
+    if (dpi < kMinPdfDpi || dpi > kMaxPdfDpi) {
+      callback(server::error_response(drogon::k400BadRequest, "INVALID_DPI",
+          std::format("DPI must be between {} and {}", kMinPdfDpi, kMaxPdfDpi)));
       return;
     }
 
@@ -1099,10 +1167,17 @@ void register_pdf_route(server::WorkPool &pool,
     const bool want_reading_order = opts.want_reading_order;
     const bool want_blocks = opts.want_blocks;
 
+    if (reject_unknown_query_params(
+            req, {"layout", "reading_order", "as_blocks", "dpi", "mode",
+                  "images", "format", "lossless", "png_compression", "quality",
+                  "max_side", "autorotate"}, callback))
+      return;
+
     auto dpi_str = req->getParameter("dpi");
-    int dpi = dpi_str.empty() ? 100 : query_int(std::string(dpi_str), -1);
-    if (dpi < 50 || dpi > 600) {
-      callback(server::error_response(drogon::k400BadRequest, "INVALID_DPI", "DPI must be between 50 and 600"));
+    int dpi = dpi_str.empty() ? kCpuDefaultDpi : query_int(std::string(dpi_str), -1);
+    if (dpi < kMinPdfDpi || dpi > kMaxPdfDpi) {
+      callback(server::error_response(drogon::k400BadRequest, "INVALID_DPI",
+          std::format("DPI must be between {} and {}", kMinPdfDpi, kMaxPdfDpi)));
       return;
     }
 

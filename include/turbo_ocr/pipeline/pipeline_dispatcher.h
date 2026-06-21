@@ -50,10 +50,17 @@ public:
     size_t n = entries.size();
     workers_.reserve(n);
     recycle_flags_.reserve(n);
+    // Per-worker task-start timestamp (steady_clock ms; 0 == idle). Read by the
+    // watchdog, written by the owning worker around work(*entry); heap-allocated
+    // shared_ptrs so the vector can't relocate atomics out from under either.
+    task_start_ms_.reserve(n);
     for (size_t i = 0; i < n; ++i) {
       auto flag = std::make_shared<std::atomic<bool>>(false);
       recycle_flags_.push_back(flag);
-      workers_.emplace_back([this, flag, entry = std::move(entries[i])]() mutable {
+      auto start_ms = std::make_shared<std::atomic<long long>>(0);
+      task_start_ms_.push_back(start_ms);
+      workers_.emplace_back([this, flag, start_ms,
+                             entry = std::move(entries[i])]() mutable {
         while (true) {
           WorkFn work;
           {
@@ -76,10 +83,16 @@ public:
           // entry suspect; the new stream/pipeline is independent of it.
           if (flag->exchange(false))
             maybe_recycle_(*entry);
+          start_ms->store(now_ms_(), std::memory_order_relaxed);
           work(*entry);
+          start_ms->store(0, std::memory_order_relaxed);
         }
       });
     }
+    // Single watchdog thread: flags workers whose in-flight task has overrun
+    // the request deadline (plus grace) for recycle. Only meaningful once a
+    // positive request_timeout_ms_ is set, so the scan early-outs otherwise.
+    watchdog_ = std::thread([this] { watchdog_loop_(); });
   }
 
   ~PipelineDispatcher() {
@@ -88,6 +101,10 @@ public:
       stop_ = true;
     }
     cv_.notify_all();
+    watchdog_cv_.notify_all();
+    // Stop the watchdog before joining workers so it never flags a recycle on
+    // a worker that is already shutting down.
+    if (watchdog_.joinable()) watchdog_.join();
     for (auto &w : workers_)
       if (w.joinable()) w.join();
   }
@@ -133,6 +150,28 @@ public:
     return get_with_timeout(future, timeout_ms);
   }
 
+  /// Set the per-request deadline applied by submit_for_default and used by
+  /// the stuck-worker watchdog. `ms <= 0` disables both (legacy unbounded
+  /// blocking). Default 0; relaxed atomic, safe to set once at startup.
+  void set_request_timeout_ms(long ms) noexcept {
+    request_timeout_ms_.store(ms, std::memory_order_relaxed);
+  }
+
+  /// Submit + wait honouring the configured request deadline. When a positive
+  /// timeout is set this is submit_for(timeout, fn) (throws TimeoutError on
+  /// overrun); when disabled (0) it preserves today's submit(fn).get()
+  /// unbounded-blocking behaviour exactly.
+  ///
+  /// Same SAFETY contract as submit_for: `fn` MUST own its inputs by value so
+  /// an abandoned timed-out task can outlive the caller.
+  template <typename F>
+  auto submit_for_default(F &&fn)
+      -> std::invoke_result_t<F, GpuPipelineEntry &> {
+    long timeout = request_timeout_ms_.load(std::memory_order_relaxed);
+    if (timeout > 0) return submit_for(timeout, std::forward<F>(fn));
+    return submit(std::forward<F>(fn)).get();
+  }
+
   [[nodiscard]] size_t worker_count() const noexcept { return workers_.size(); }
 
   /// Flag worker `worker_index`'s entry as wedged. Its owning worker rebuilds
@@ -151,6 +190,12 @@ public:
 private:
   using WorkFn = std::function<void(GpuPipelineEntry &)>;
 
+  static long long now_ms_() noexcept {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
   // Rebuild `entry` from the stored spec; on failure log and leave the entry
   // dead (pipeline == nullptr) — a subsequent task throws rather than touching
   // a half-built pipeline, and the watchdog can request another recycle.
@@ -163,11 +208,44 @@ private:
     }
   }
 
+  // Scan workers ~once a second; flag any whose in-flight task has run longer
+  // than the request deadline plus a grace for recycle. The flag only takes
+  // effect at the worker's NEXT loop iteration — it cannot interrupt a CUDA
+  // call mid-flight (that wedge is caught by the H4 sticky-fault fail-fast).
+  void watchdog_loop_() {
+    while (true) {
+      {
+        std::unique_lock lock(mutex_);
+        if (watchdog_cv_.wait_for(lock, kWatchdogInterval,
+                                  [this] { return stop_; }))
+          return;  // woken by shutdown
+      }
+      long timeout = request_timeout_ms_.load(std::memory_order_relaxed);
+      if (timeout <= 0) continue;  // watchdog inert until a deadline is set
+      long long deadline = static_cast<long long>(timeout) + kWatchdogGraceMs;
+      long long now = now_ms_();
+      for (size_t i = 0; i < task_start_ms_.size(); ++i) {
+        long long started =
+            task_start_ms_[i]->load(std::memory_order_relaxed);
+        if (started != 0 && now - started > deadline) request_recycle(i);
+      }
+    }
+  }
+
+  static constexpr std::chrono::milliseconds kWatchdogInterval{1000};
+  // Extra slack beyond the request deadline before declaring a worker wedged,
+  // so a task that finishes right at the deadline is never needlessly recycled.
+  static constexpr long long kWatchdogGraceMs = 2000;
+
   std::queue<WorkFn> queue_;
   std::mutex mutex_;
   std::condition_variable cv_;
+  std::condition_variable watchdog_cv_;
   std::vector<std::thread> workers_;
+  std::thread watchdog_;
   std::vector<std::shared_ptr<std::atomic<bool>>> recycle_flags_;
+  std::vector<std::shared_ptr<std::atomic<long long>>> task_start_ms_;
+  std::atomic<long> request_timeout_ms_{0};
   PipelineBuildSpec spec_;
   bool recycle_enabled_ = !spec_.det_model.empty();
   bool stop_{false};  // guarded by mutex_

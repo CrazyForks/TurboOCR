@@ -16,6 +16,7 @@
 #include "turbo_ocr/decode/image_config.h"
 #include "turbo_ocr/decode/nvjpeg_decoder.h"
 #include "turbo_ocr/server/env_utils.h"
+#include "turbo_ocr/server/error_codes.h"
 
 using turbo_ocr::OCRResultItem;
 using turbo_ocr::base64_decode;
@@ -26,6 +27,53 @@ using turbo_ocr::decode::NvJpegDecoder;
 namespace turbo_ocr::routes {
 
 namespace {
+
+// 504 response for a per-request inference deadline (C4). The dispatcher
+// abandons the still-running task and throws turbo_ocr::TimeoutError; map it
+// to the single shared kInferenceTimeout code so HTTP and gRPC stay in lockstep.
+[[nodiscard]] drogon::HttpResponsePtr timeout_response() {
+  using server::ErrorCode;
+  return server::error_response(
+      static_cast<drogon::HttpStatusCode>(
+          server::error_http_status(ErrorCode::kInferenceTimeout)),
+      server::error_code_str(ErrorCode::kInferenceTimeout).data(),
+      "Inference exceeded the configured request deadline");
+}
+
+// L3 strict-query-params (opt-in). Default OFF preserves the historical
+// lenient behavior (unknown params silently ignored). When
+// TURBO_OCR_STRICT_QUERY_PARAMS=1, an unrecognized query parameter is a 400
+// INVALID_PARAMETER instead. Read once; cached for the process lifetime.
+[[nodiscard]] bool strict_query_params_enabled() noexcept {
+  static const bool v = server::env_enabled("TURBO_OCR_STRICT_QUERY_PARAMS");
+  return v;
+}
+
+// When strict mode is on, reject the request if any query parameter is not in
+// `allowed`. Returns true (and invokes `callback`) on rejection. No-op (returns
+// false) when strict mode is off, so default behavior is byte-identical.
+// NOTE: Drogon's getParameters() merges x-www-form-urlencoded body fields with
+// the query string; these routes take JSON / binary / multipart-file bodies
+// (no plain form fields), so the map here is the query string only.
+[[nodiscard]] bool reject_unknown_query_params(
+    const drogon::HttpRequestPtr &req,
+    std::initializer_list<std::string_view> allowed,
+    std::function<void(const drogon::HttpResponsePtr &)> &callback) {
+  if (!strict_query_params_enabled()) return false;
+  for (const auto &kv : req->getParameters()) {
+    const std::string &key = kv.first;
+    bool known = false;
+    for (auto a : allowed)
+      if (a == key) { known = true; break; }
+    if (!known) {
+      callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+          std::format("Unknown query parameter '{}' "
+                      "(TURBO_OCR_STRICT_QUERY_PARAMS=1)", key)));
+      return true;
+    }
+  }
+  return false;
+}
 
 // --- /ocr/raw: GPU-direct JPEG decode, Wuffs PNG ---
 void register_ocr_raw_route_gpu(server::WorkPool &pool,
@@ -51,6 +99,9 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
                                        r.error_code.c_str(), r.error));
       return;
     }
+    if (reject_unknown_query_params(
+            req, {"layout", "reading_order", "as_blocks"}, callback))
+      return;
 
     server::submit_work(pool, std::move(callback),
         [req, &dispatcher, &decode, nvjpeg_available, opts](server::DrogonCallback &cb) {
@@ -78,7 +129,13 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
 
         // JPEG with nvJPEG: submit GPU-direct decode + infer as one work item
         if (nvjpeg_available && NvJpegDecoder::is_jpeg(data, len)) {
-          auto out = dispatcher.submit([data, len, opts, kMaxImageDim](auto &e) {
+          // C4: capture `req` by value so the JPEG bytes (data/len point into
+          // req->body()) stay alive if the future is abandoned on timeout and
+          // the task keeps running after this handler returns.
+          pipeline::OcrPipelineResult out;
+          try {
+          out = dispatcher.submit_for_default(
+              [req, data, len, opts, kMaxImageDim](auto &e) {
             auto &nvjpeg = e.get_nvjpeg();
             auto [w, h] = nvjpeg.get_dimensions(data, len);
             // Decompression-bomb guard for JPEGs the pre-decode header sniff
@@ -121,7 +178,11 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
             return e.pipeline->run_with_layout(img, e.stream,
                                                opts.want_layout,
                                                opts.want_reading_order);
-          }).get();
+          });
+          } catch (const turbo_ocr::TimeoutError &) {
+            cb(timeout_response());
+            return;
+          }
           cb(server::json_response(emit_results_json(out.results, out.layout, out.reading_order, opts.want_blocks)));
           return;
         }
@@ -138,11 +199,19 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
           return;
         }
 
-        auto out = dispatcher.submit([&img, opts](auto &e) {
-          return e.pipeline->run_with_layout(img, e.stream,
-                                              opts.want_layout,
-                                              opts.want_reading_order);
-        }).get();
+        // C4: capture `img` BY VALUE (cv::Mat copy is a cheap refcount bump)
+        // so an abandoned-on-timeout task never dereferences the freed local.
+        pipeline::OcrPipelineResult out;
+        try {
+          out = dispatcher.submit_for_default([img, opts](auto &e) {
+            return e.pipeline->run_with_layout(img, e.stream,
+                                                opts.want_layout,
+                                                opts.want_reading_order);
+          });
+        } catch (const turbo_ocr::TimeoutError &) {
+          cb(timeout_response());
+          return;
+        }
         cb(server::json_response(emit_results_json(out.results, out.layout, out.reading_order, opts.want_blocks)));
       });
     });
@@ -274,34 +343,55 @@ void batch_check_dims_post(std::vector<cv::Mat> &imgs,
 // and without layout the batched path applies (batched det/rec; in
 // pdf_only mode layout is one batched TRT execute per chunk too), so
 // ?layout=1 no longer falls back to serial single-image inference.
+//
+// C4: the submitted lambda is SELF-CONTAINED. It owns the decoded images
+// (moved in) and writes results into the packaged_task's own return value,
+// never into request-scoped state. So if the future is abandoned on timeout
+// (TimeoutError), the still-running task can finish safely against memory it
+// owns; the caller scatters the returned results back only after the future
+// resolves in time. Results are chunk-local (indexed 0..valid count); the
+// caller maps them to absolute slots via valid_indices.
 void batch_run_pipeline(pipeline::PipelineDispatcher &dispatcher,
-                         std::vector<cv::Mat> &valid_imgs,
-                         const std::vector<size_t> &valid_indices,
+                         std::vector<cv::Mat> valid_imgs,
+                         std::vector<size_t> valid_indices,
                          bool want_layout,
                          const server::InferOptions &opts,
                          std::vector<BatchItem> &all_items,
                          std::vector<std::string> &errors) {
   if (valid_imgs.empty()) return;
 
-  constexpr int kMaxBatch = 8;
+  // Self-contained per-valid-image output. PoolExhaustedError propagates out
+  // of the lambda (rethrown by future.get() -> 503 at the route); every other
+  // exception is tagged per-slot here, never escaping to taint other slots.
+  struct BatchOutput {
+    std::vector<pipeline::OcrPipelineResult> outs;
+    std::vector<std::string> slot_errors;
+  };
+
+  BatchOutput result;
   try {
-    dispatcher.submit([&](auto &e) {
-      for (size_t offset = 0; offset < valid_imgs.size(); offset += kMaxBatch) {
-        size_t end = std::min(offset + kMaxBatch, valid_imgs.size());
+    result = dispatcher.submit_for_default(
+        [imgs = std::move(valid_imgs), want_layout, opts](auto &e) mutable {
+      constexpr size_t kMaxBatch = 8;
+      const size_t total = imgs.size();
+      BatchOutput o;
+      o.outs.resize(total);
+      o.slot_errors.assign(total, std::string{});
+      for (size_t offset = 0; offset < total; offset += kMaxBatch) {
+        size_t end = std::min(offset + kMaxBatch, total);
         // Per-chunk try wraps chunk construction too: a failure here taints
         // ONLY this chunk's slots, never the completed results of earlier
-        // chunks (whose errors[] are empty == success, the same sentinel a
+        // chunks (whose slot_errors are empty == success, the same sentinel a
         // blanket outer-catch would wrongly overwrite).
         try {
           std::vector<cv::Mat> chunk(
-              std::make_move_iterator(valid_imgs.begin() + offset),
-              std::make_move_iterator(valid_imgs.begin() + end));
+              std::make_move_iterator(imgs.begin() + offset),
+              std::make_move_iterator(imgs.begin() + end));
           try {
             auto chunk_results = e.pipeline->run_batch_with_layout(
                 chunk, e.stream, want_layout, opts.want_reading_order);
             for (size_t j = 0; j < chunk_results.size(); ++j)
-              all_items[valid_indices[offset + j]].out =
-                  std::move(chunk_results[j]);
+              o.outs[offset + j] = std::move(chunk_results[j]);
           } catch (const std::exception &) {
             // One degenerate image (1×1 / corrupt-decoded Mat) poisons the
             // whole batched chunk. Retry its images individually through
@@ -309,9 +399,8 @@ void batch_run_pipeline(pipeline::PipelineDispatcher &dispatcher,
             // bad slot to an empty result and resets the stream — per-slot
             // isolation, same as the single-image routes.
             for (size_t j = 0; j < chunk.size(); ++j) {
-              const size_t idx = valid_indices[offset + j];
               try {
-                all_items[idx].out = e.pipeline->run_with_layout(
+                o.outs[offset + j] = e.pipeline->run_with_layout(
                     chunk[j], e.stream, want_layout, opts.want_reading_order);
               } catch (const turbo_ocr::PoolExhaustedError &) {
                 throw;  // -> 503 at the route, never a per-slot tag
@@ -319,8 +408,8 @@ void batch_run_pipeline(pipeline::PipelineDispatcher &dispatcher,
                 // Don't leak raw CUDA_CHECK text (absolute source paths) to
                 // clients; log the detail, tag the slot with a stable code.
                 TOCR_LOG_ERROR_RL("batch slot inference error",
-                                  "slot", idx, "error", std::string_view(ex.what()));
-                errors[idx] = "inference_failed";
+                                  "slot", offset + j, "error", std::string_view(ex.what()));
+                o.slot_errors[offset + j] = "inference_failed";
               }
             }
           }
@@ -332,15 +421,20 @@ void batch_run_pipeline(pipeline::PipelineDispatcher &dispatcher,
           TOCR_LOG_ERROR_RL("batch chunk error", "offset", offset,
                             "error", std::string_view(ex.what()));
           for (size_t j = offset; j < end; ++j)
-            if (errors[valid_indices[j]].empty())
-              errors[valid_indices[j]] = "inference_failed";
+            if (o.slot_errors[j].empty())
+              o.slot_errors[j] = "inference_failed";
         }
       }
-    }).get();
+      return o;
+    });
   } catch (const turbo_ocr::PoolExhaustedError &) {
     // GPU queue full at submit — no chunk ran. Propagate so the route's
     // run_with_error_handling turns it into 503 SERVER_BUSY, matching every
     // other inference route instead of a 200 with a fully-errored array.
+    throw;
+  } catch (const turbo_ocr::TimeoutError &) {
+    // Per-request deadline tripped. Propagate so the route maps it to a single
+    // 504 (the abandoned task keeps running against its own moved-in images).
     throw;
   } catch (const std::exception &ex) {
     // Submission-level failure before any chunk ran — tag every still-empty
@@ -349,6 +443,19 @@ void batch_run_pipeline(pipeline::PipelineDispatcher &dispatcher,
     TOCR_LOG_ERROR_RL("batch submission error", "error", std::string_view(ex.what()));
     for (size_t k : valid_indices)
       if (errors[k].empty()) errors[k] = "inference_failed";
+    return;
+  }
+
+  // Scatter chunk-local results back to absolute slots. Only reached when the
+  // future resolved in time, so the caller-scoped vectors are touched solely
+  // here on the request thread.
+  for (size_t j = 0; j < valid_indices.size(); ++j) {
+    const size_t idx = valid_indices[j];
+    if (!result.slot_errors[j].empty()) {
+      if (errors[idx].empty()) errors[idx] = std::move(result.slot_errors[j]);
+    } else {
+      all_items[idx].out = std::move(result.outs[j]);
+    }
   }
 }
 
@@ -411,6 +518,9 @@ void register_ocr_batch_route_gpu(server::WorkPool &pool,
                                        r.error_code.c_str(), r.error));
       return;
     }
+    if (reject_unknown_query_params(
+            req, {"layout", "reading_order", "as_blocks"}, callback))
+      return;
 
     auto json = req->getJsonObject();
     if (!json) {
@@ -479,8 +589,16 @@ void register_ocr_batch_route_gpu(server::WorkPool &pool,
         }
 
         std::vector<BatchItem> all_items(n);
-        batch_run_pipeline(dispatcher, valid_imgs, valid_indices,
-                            want_layout, opts, all_items, errors);
+        // C4: hand ownership of the decoded images to the submitted task so an
+        // abandoned-on-timeout run never touches this frame's vectors.
+        try {
+          batch_run_pipeline(dispatcher, std::move(valid_imgs),
+                              std::move(valid_indices),
+                              want_layout, opts, all_items, errors);
+        } catch (const turbo_ocr::TimeoutError &) {
+          cb(timeout_response());
+          return;
+        }
 
         cb(server::json_response(batch_emit_json(all_items, errors, want_layout, opts.want_blocks)));
       });
@@ -505,6 +623,9 @@ void register_ocr_pixels_route_gpu(server::WorkPool &pool,
                                        r.error_code.c_str(), r.error));
       return;
     }
+    if (reject_unknown_query_params(
+            req, {"layout", "reading_order", "as_blocks"}, callback))
+      return;
 
     auto w_str = req->getHeader("X-Width");
     auto h_str = req->getHeader("X-Height");
@@ -559,11 +680,20 @@ void register_ocr_pixels_route_gpu(server::WorkPool &pool,
         if (channels == 1)
           cv::cvtColor(img, img, cv::COLOR_GRAY2BGR);
 
-        auto out = dispatcher.submit([&img, opts](auto &e) {
-          return e.pipeline->run_with_layout(img, e.stream,
-                                              opts.want_layout,
-                                              opts.want_reading_order);
-        }).get();
+        // C4: a 3-channel `img` is a non-owning view into req->body(), so the
+        // task must hold both `img` (by value) and `req` (keeps the pixel
+        // buffer alive) to survive an abandoned-on-timeout run.
+        pipeline::OcrPipelineResult out;
+        try {
+          out = dispatcher.submit_for_default([img, req, opts](auto &e) {
+            return e.pipeline->run_with_layout(img, e.stream,
+                                                opts.want_layout,
+                                                opts.want_reading_order);
+          });
+        } catch (const turbo_ocr::TimeoutError &) {
+          cb(timeout_response());
+          return;
+        }
         cb(server::json_response(emit_results_json(out.results, out.layout, out.reading_order, opts.want_blocks)));
       });
     });

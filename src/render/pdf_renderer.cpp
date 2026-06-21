@@ -4,16 +4,20 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <string>
 #include <format>
 #include <memory>
 #include <mutex>
 #include <thread>
+
+#include <pthread.h>
 
 #include <opencv2/imgproc.hpp>
 #include <fcntl.h>
@@ -241,40 +245,91 @@ cv::Mat PdfRenderer::decode_ppm(const std::string &path) {
 // materialises under normal operation — the daemon stays alive across
 // the process lifetime. ~PdfRenderer reaps the daemons explicitly.
 
+// Fork+exec a fresh daemon into `d`. Shared by the constructor and the
+// runtime crash-recovery path (respawn_daemon). In the forked child we set
+// up stdin/stdout from the pipes and close every other daemon's inherited
+// fds, then exec. L4: dup2() can fail (EBADF/EINTR/EMFILE); an un-rewired
+// child would speak the daemon protocol on the wrong fds and wedge the
+// parent's pipe — so we check both dup2() calls and _exit on failure rather
+// than running the child in a corrupt fd state.
+void PdfRenderer::spawn_daemon(Daemon &d) {
+  int in_pipe[2], out_pipe[2];
+  if (pipe(in_pipe) < 0)
+    throw turbo_ocr::PdfRenderError("pipe() failed for PDF renderer daemon");
+  if (pipe(out_pipe) < 0) {
+    close(in_pipe[0]); close(in_pipe[1]);
+    throw turbo_ocr::PdfRenderError("pipe() failed for PDF renderer daemon");
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(in_pipe[0]); close(in_pipe[1]);
+    close(out_pipe[0]); close(out_pipe[1]);
+    throw turbo_ocr::PdfRenderError("fork() failed for PDF renderer daemon");
+  }
+
+  if (pid == 0) {
+    if (dup2(in_pipe[0], STDIN_FILENO) < 0) _exit(127);
+    if (dup2(out_pipe[1], STDOUT_FILENO) < 0) _exit(127);
+    close(in_pipe[0]); close(in_pipe[1]);
+    close(out_pipe[0]); close(out_pipe[1]);
+    // Close every other daemon's parent-side pipe fds so this child doesn't
+    // pin them open (during respawn the other daemons are live; &x == &d
+    // skips the slot we're replacing, whose old fds were already reaped).
+    // Use close(fileno(...)) rather than fclose(): after fork() in a
+    // multithreaded process only async-signal-safe calls are safe pre-exec,
+    // and another thread may be mid-fprintf holding that FILE*'s lock.
+    for (auto &x : daemons_) {
+      if (&x == &d) continue;
+      if (x.cmd_in) close(fileno(x.cmd_in));
+      if (x.result_out) close(fileno(x.result_out));
+    }
+    execl(binary_path_.c_str(), binary_path_.c_str(), "--daemon", nullptr);
+    _exit(1);
+  }
+
+  close(in_pipe[0]);
+  close(out_pipe[1]);
+  d.pid = pid;
+  d.cmd_in = fdopen(in_pipe[1], "w");
+  d.result_out = fdopen(out_pipe[0], "r");
+  if (!d.cmd_in || !d.result_out)
+    throw turbo_ocr::PdfRenderError("fdopen failed for PDF renderer daemon");
+}
+
+// Crash recovery for a wedged/dead daemon. Caller holds d.mutex. Reap the
+// dead child (best-effort; the no-SIGCHLD-reaper design means it's still
+// ours to wait on), tear down its stale pipe handles, then fork a fresh one.
+// Returns false (without throwing) if the respawn fails so send_cmd can
+// surface the original protocol error instead of masking it.
+bool PdfRenderer::respawn_daemon(Daemon &d) {
+  if (d.cmd_in)     { fclose(d.cmd_in);     d.cmd_in = nullptr; }
+  if (d.result_out) { fclose(d.result_out); d.result_out = nullptr; }
+  if (d.pid > 0) {
+    // The dead child may be a zombie (exited) or still dying (e.g. crashing
+    // mid-write). Don't block shutdown-style: try non-blocking, then SIGKILL.
+    if (waitpid(d.pid, nullptr, WNOHANG) == 0) {
+      kill(d.pid, SIGKILL);
+      waitpid(d.pid, nullptr, 0);
+    }
+  }
+  d.pid = 0;
+  try {
+    spawn_daemon(d);
+  } catch (const std::exception &) {
+    // Leave the slot dead (pid==0, null handles); a later request retries.
+    return false;
+  }
+  return d.pid > 0;
+}
+
 PdfRenderer::PdfRenderer(int pool_size, int workers_per_render)
     : pool_size_(pool_size), workers_per_render_(workers_per_render),
       daemons_(pool_size) {
   binary_path_ = find_binary();
 
-  for (int i = 0; i < pool_size_; ++i) {
-    int in_pipe[2], out_pipe[2];
-    if (pipe(in_pipe) < 0 || pipe(out_pipe) < 0)
-      throw turbo_ocr::PdfRenderError("pipe() failed for PDF renderer daemon");
-
-    pid_t pid = fork();
-    if (pid < 0) throw turbo_ocr::PdfRenderError("fork() failed for PDF renderer daemon");
-
-    if (pid == 0) {
-      dup2(in_pipe[0], STDIN_FILENO);
-      dup2(out_pipe[1], STDOUT_FILENO);
-      close(in_pipe[0]); close(in_pipe[1]);
-      close(out_pipe[0]); close(out_pipe[1]);
-      for (int j = 0; j < i; ++j) {
-        if (daemons_[j].cmd_in) fclose(daemons_[j].cmd_in);
-        if (daemons_[j].result_out) fclose(daemons_[j].result_out);
-      }
-      execl(binary_path_.c_str(), binary_path_.c_str(), "--daemon", nullptr);
-      _exit(1);
-    }
-
-    close(in_pipe[0]);
-    close(out_pipe[1]);
-    daemons_[i].pid = pid;
-    daemons_[i].cmd_in = fdopen(in_pipe[1], "w");
-    daemons_[i].result_out = fdopen(out_pipe[0], "r");
-    if (!daemons_[i].cmd_in || !daemons_[i].result_out)
-      throw turbo_ocr::PdfRenderError("fdopen failed for PDF renderer daemon");
-  }
+  for (int i = 0; i < pool_size_; ++i)
+    spawn_daemon(daemons_[i]);
 
   // Liveness probe: if the binary was missing a shared lib, wasn't executable,
   // or crashed during its own startup, the child calls _exit(1) within ~micro-
@@ -335,15 +390,73 @@ int PdfRenderer::acquire_daemon() {
   return idx;
 }
 
-std::string PdfRenderer::send_cmd(Daemon &d, const std::string &cmd) {
-  fprintf(d.cmd_in, "%s\n", cmd.c_str());
-  fflush(d.cmd_in);
+// Block SIGPIPE on the calling thread for the lifetime of the guard, draining
+// any pending instance on destruction. Writing to a daemon whose read end has
+// died would otherwise raise SIGPIPE and take down the whole server — exactly
+// the M9 crash we must instead recover from. Thread-local mask only; no
+// process-wide signal disposition change.
+namespace {
+struct SigpipeBlocker {
+  sigset_t old_set;
+  bool blocked = false;
+  SigpipeBlocker() {
+    sigset_t pipe_set;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    if (pthread_sigmask(SIG_BLOCK, &pipe_set, &old_set) == 0) blocked = true;
+  }
+  ~SigpipeBlocker() {
+    if (!blocked) return;
+    // Drain a SIGPIPE that fired while blocked so it doesn't get delivered
+    // once we unblock. sigtimedwait with a zero timeout is non-blocking.
+    sigset_t pipe_set;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    struct timespec zero{0, 0};
+    while (sigtimedwait(&pipe_set, nullptr, &zero) >= 0) {}
+    pthread_sigmask(SIG_SETMASK, &old_set, nullptr);
+  }
+};
+} // namespace
+
+// Single write+read round-trip to the daemon. Returns false (not throws) on a
+// pipe write/read failure so the caller (send_cmd) can decide whether to
+// respawn+retry vs. surface the error.
+bool PdfRenderer::send_cmd_once(Daemon &d, const std::string &cmd,
+                                std::string &out) {
+  if (!d.cmd_in || !d.result_out) return false;
+  {
+    SigpipeBlocker no_sigpipe;
+    if (fprintf(d.cmd_in, "%s\n", cmd.c_str()) < 0) return false;
+    if (fflush(d.cmd_in) != 0) return false;  // EPIPE if reader is dead
+  }
   char buf[4096];
-  if (!fgets(buf, sizeof(buf), d.result_out))
-    throw turbo_ocr::PdfRenderError("PDF renderer daemon read failed (daemon may have crashed)");
+  if (!fgets(buf, sizeof(buf), d.result_out)) return false;
   auto len = std::strlen(buf);
   if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
-  return buf;
+  out.assign(buf);
+  return true;
+}
+
+// M9: on a read/write failure the daemon has crashed. Under the caller-held
+// per-daemon mutex, reap+re-fork a fresh daemon and retry the command exactly
+// once. A single retry caps tight re-fork loops: a daemon that dies again on
+// the retry surfaces the error (and a brief backoff before the re-fork avoids
+// hammering exec when the binary itself is the problem). Steady-state callers
+// hit zero overhead — the first attempt succeeds and we never touch fork().
+std::string PdfRenderer::send_cmd(Daemon &d, const std::string &cmd) {
+  std::string out;
+  if (send_cmd_once(d, cmd, out)) return out;
+
+  // First attempt failed — assume crash, re-fork and retry once.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));  // re-fork backoff
+  if (!respawn_daemon(d))
+    throw turbo_ocr::PdfRenderError(
+        "PDF renderer daemon crashed and could not be re-forked");
+  if (send_cmd_once(d, cmd, out)) return out;
+
+  throw turbo_ocr::PdfRenderError(
+      "PDF renderer daemon read failed after re-fork (daemon may be crash-looping)");
 }
 
 std::vector<cv::Mat> PdfRenderer::render(const uint8_t *data, size_t len,

@@ -98,6 +98,19 @@ private:
 
   [[nodiscard]] int acquire_daemon();
   [[nodiscard]] std::string send_cmd(Daemon &d, const std::string &cmd);
+  // One write+read round-trip; returns false on a pipe write/read failure
+  // (daemon crash) instead of throwing, so send_cmd can respawn+retry.
+  [[nodiscard]] bool send_cmd_once(Daemon &d, const std::string &cmd,
+                                   std::string &out);
+  // Fork+exec a fresh fastpdf2png daemon into `d`, closing the inherited
+  // fds of every OTHER daemon in the child. Caller must hold d.mutex (or be
+  // the single-threaded constructor). Throws PdfRenderError on pipe/fork
+  // failure; on success populates d.pid/cmd_in/result_out. Does NOT reap any
+  // prior child occupying `d` — see respawn_daemon for the crash-recovery path.
+  void spawn_daemon(Daemon &d);
+  // Crash recovery: reap the dead child in `d` and spawn a replacement.
+  // Caller MUST hold d.mutex. Returns true if a live daemon now occupies `d`.
+  [[nodiscard]] bool respawn_daemon(Daemon &d);
   // Back-compat: forwards to decode_ppm(). Used only by the legacy
   // non-streamed render() code path.
   [[nodiscard]] static cv::Mat read_ppm(const std::string &path) {

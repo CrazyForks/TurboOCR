@@ -13,6 +13,41 @@ namespace turbo_ocr::routes {
 namespace {
 using decode::max_image_dim;
 
+// L3 strict-query-params (opt-in). Default OFF preserves the historical lenient
+// behavior (unknown params silently ignored). When
+// TURBO_OCR_STRICT_QUERY_PARAMS=1, an unrecognized query parameter is a 400
+// INVALID_PARAMETER instead. Read once; cached for the process lifetime.
+[[nodiscard]] bool strict_query_params_enabled() noexcept {
+  static const bool v = server::env_enabled("TURBO_OCR_STRICT_QUERY_PARAMS");
+  return v;
+}
+
+// When strict mode is on, reject the request if any query parameter is not in
+// `allowed`. Returns true (and invokes `callback`) on rejection. No-op (returns
+// false) when strict mode is off, so default behavior is byte-identical.
+// NOTE: /ocr takes a JSON body and /ocr/raw a binary body — neither populates
+// x-www-form-urlencoded form params, so Drogon's getParameters() is the query
+// string only here.
+[[nodiscard]] bool reject_unknown_query_params(
+    const drogon::HttpRequestPtr &req,
+    std::initializer_list<std::string_view> allowed,
+    server::DrogonCallback &callback) {
+  if (!strict_query_params_enabled()) return false;
+  for (const auto &kv : req->getParameters()) {
+    const std::string &key = kv.first;
+    bool known = false;
+    for (auto a : allowed)
+      if (a == key) { known = true; break; }
+    if (!known) {
+      callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+          std::format("Unknown query parameter '{}' "
+                      "(TURBO_OCR_STRICT_QUERY_PARAMS=1)", key)));
+      return true;
+    }
+  }
+  return false;
+}
+
 // Two-stage check for /ocr and /ocr/raw:
 //   1. Pre-decode header sniff (PNG / JPEG): refuses oversized inputs
 //      without ever calling the decoder, defending against decompression
@@ -102,6 +137,9 @@ void register_ocr_base64_route(server::WorkPool &pool,
                                            r.error_code.c_str(), r.error));
           return;
         }
+        if (reject_unknown_query_params(
+                req, {"layout", "reading_order", "as_blocks"}, callback))
+          return;
 
         auto json = req->getJsonObject();
         if (!json) {
@@ -166,6 +204,9 @@ void register_ocr_raw_route(server::WorkPool &pool,
                                            r.error_code.c_str(), r.error));
           return;
         }
+        if (reject_unknown_query_params(
+                req, {"layout", "reading_order", "as_blocks"}, callback))
+          return;
 
         server::submit_work(pool, std::move(callback),
             [req, &infer, &decode, opts](server::DrogonCallback &cb) {

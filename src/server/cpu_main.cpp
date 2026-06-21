@@ -41,6 +41,9 @@ using turbo_ocr::emit_results_json;
 namespace {
 std::atomic<bool> g_shutdown_requested{false};
 turbo_ocr::server::WorkPool *g_work_pool_for_drain = nullptr;
+// Set in main() before the signal handlers can fire; read from the detached
+// drain thread (the gRPC server outlives that thread — see GPU main.cpp).
+grpc::Server *g_grpc_server_for_drain = nullptr;
 // Atomic because the signal handler may fire on a different thread than
 // the writer in main().
 std::atomic<int> g_shutdown_grace_seconds{30};
@@ -49,16 +52,25 @@ int shutdown_grace_seconds() {
   return g_shutdown_grace_seconds.load(std::memory_order_acquire);
 }
 
-// Mirrors the GPU binary: graceful drain of WorkPool inflight before
-// app().quit() so K8s SIGTERM doesn't truncate inflight responses.
+// Mirrors the GPU binary: graceful drain of WorkPool inflight AND of the gRPC
+// server (stop admitting + drain in-flight up to the deadline, in parallel)
+// before app().quit() so K8s SIGTERM doesn't truncate inflight responses.
 void begin_graceful_shutdown(const char *signal_name) {
   if (g_shutdown_requested.exchange(true)) return;
   TOCR_LOG_INFO("Graceful shutdown requested",
                 "signal", std::string_view(signal_name),
                 "grace_seconds", shutdown_grace_seconds());
   std::thread([signal_name]() {
+    const int grace = shutdown_grace_seconds();
+    if (g_grpc_server_for_drain) {
+      auto grpc_deadline =
+          std::chrono::system_clock::now() + std::chrono::seconds(grace);
+      g_grpc_server_for_drain->Shutdown(grpc_deadline);
+      TOCR_LOG_INFO("gRPC graceful shutdown complete",
+                    "signal", std::string_view(signal_name));
+    }
     if (g_work_pool_for_drain) {
-      auto deadline = std::chrono::seconds(shutdown_grace_seconds());
+      auto deadline = std::chrono::seconds(grace);
       bool drained = g_work_pool_for_drain->wait_drain(deadline);
       TOCR_LOG_INFO("Inflight work drain complete",
                     "drained", drained, "signal", std::string_view(signal_name));
@@ -111,6 +123,17 @@ int main(int argc, char **argv) {
     cls_model.clear();
     TOCR_LOG_INFO("Angle classification disabled via DISABLE_ANGLE_CLS=1");
   }
+
+  // Build the PdfRenderer FIRST, before the ORT pipeline pool below. The
+  // renderer fork()s a pool of fastpdf2png daemons; forking is safest done
+  // before the inference backend spins up its own worker threads / runtime
+  // state (matching the GPU binary, where forking after CUDA init is UB). The
+  // renderer has no dependency on the pool, so hoisting it is safe.
+  const int pdf_daemons = cfg.pdf_daemons;
+  const int pdf_workers = cfg.pdf_workers;
+  turbo_ocr::render::PdfRenderer pdf_renderer(pdf_daemons, pdf_workers);
+  TOCR_LOG_INFO("PDF renderer initialized", "daemons", pdf_daemons, "workers", pdf_workers);
+  turbo_ocr::pdf::ensure_pdfium_initialized();
 
   // Layout model (CPU via ONNX Runtime) — on by default. Optional: a
   // missing layout.onnx soft-disables the stage below rather than aborting.
@@ -296,12 +319,8 @@ int main(int argc, char **argv) {
       {drogon::Post});
 
   // --- /ocr/pdf endpoint (CPU: sequential page OCR) ---
-  const int pdf_daemons = cfg.pdf_daemons;
-  const int pdf_workers = cfg.pdf_workers;
-  turbo_ocr::render::PdfRenderer pdf_renderer(pdf_daemons, pdf_workers);
-  TOCR_LOG_INFO("PDF renderer initialized", "daemons", pdf_daemons, "workers", pdf_workers);
-  turbo_ocr::pdf::ensure_pdfium_initialized();
-
+  // pdf_renderer + pdfium are initialized near the top of main(), before the
+  // ORT pipeline pool, so the daemon fork()s happen ahead of backend startup.
   const turbo_ocr::pdf::PdfMode default_pdf_mode = cfg.default_pdf_mode;
 
   turbo_ocr::routes::register_pdf_route(work_pool, infer, pdf_renderer, default_pdf_mode, layout_available,
@@ -516,6 +535,7 @@ int main(int argc, char **argv) {
   // gRPC server
   auto grpc_handle = turbo_ocr::server::start_grpc_server(
       infer, cfg, &pdf_renderer, layout_available, readiness);
+  g_grpc_server_for_drain = grpc_handle.server.get();
 
   // HTTP server (Drogon)
   const int port = cfg.http_port;
@@ -549,6 +569,9 @@ int main(int argc, char **argv) {
       .setClientMaxMemoryBodySize(max_mem_bytes)
       .run();
 
+  // On a signal-driven exit begin_graceful_shutdown() already drained gRPC, so
+  // this is an idempotent no-op (Shutdown is safe to call twice). On any other
+  // exit path it's the one that stops the server before the thread joins.
   TOCR_LOG_INFO("HTTP server stopped, shutting down gRPC");
   grpc_handle.server->Shutdown();
   TOCR_LOG_INFO("Shutdown complete");

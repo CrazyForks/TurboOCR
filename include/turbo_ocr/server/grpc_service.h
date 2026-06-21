@@ -23,6 +23,7 @@
 #include "turbo_ocr/decode/image_config.h"
 #include "turbo_ocr/decode/image_dims.h"
 #include "turbo_ocr/server/env_utils.h"
+#include "turbo_ocr/server/error_codes.h"
 #include "turbo_ocr/server/grpc_response_mode.h"
 #include "turbo_ocr/server/server_config.h"
 #include "turbo_ocr/decode/fast_png_decoder.h"
@@ -51,6 +52,17 @@ grpc_error(grpc::ServerContext *ctx, grpc::StatusCode code,
            const char *error_code, std::string message) {
   if (ctx) ctx->AddTrailingMetadata("x-error-code", error_code);
   return grpc::Status(code, std::move(message));
+}
+
+// Same as grpc_error but sources the wire string + gRPC status from the shared
+// error_codes.h table, so the code/status pairing can't drift from HTTP. Used
+// for codes that have no hand-written literal at the call site (e.g. the C4
+// inference-timeout -> DEADLINE_EXCEEDED mapping).
+[[nodiscard]] inline grpc::Status
+grpc_error(grpc::ServerContext *ctx, ErrorCode code, std::string message) {
+  std::string_view name = error_code_str(code);
+  if (ctx) ctx->AddTrailingMetadata("x-error-code", std::string(name));
+  return grpc::Status(error_grpc_status(code), std::move(message));
 }
 
 // Mirror parse_query_options() in server_types.h: when the client asks for
@@ -188,6 +200,7 @@ public:
         max_pdf_pages_(cfg.max_pdf_pages),
         max_batch_images_(cfg.max_batch_images),
         default_pdf_dpi_(cfg.pdf_only ? cfg.pdf_dpi : 100),
+        request_timeout_ms_(cfg.request_timeout_ms),
         pdf_chunk_batch_(cfg.pdf_only ? cfg.pdf_batch : 0) {}
 #endif
 
@@ -204,11 +217,13 @@ public:
         grpc_batch_workers_(cfg.grpc_batch_workers),
         max_pdf_pages_(cfg.max_pdf_pages),
         max_batch_images_(cfg.max_batch_images),
-        default_pdf_dpi_(cfg.pdf_only ? cfg.pdf_dpi : 100) {}
+        default_pdf_dpi_(cfg.pdf_only ? cfg.pdf_dpi : 100),
+        request_timeout_ms_(cfg.request_timeout_ms) {}
 
-  /// Set the readiness probe used by Health(). Same signature as the
-  /// HTTP /health/ready check; called once per Health RPC. nullptr
-  /// (default) means "always ready".
+  /// Set the readiness probe used by Health(). Called once per Health RPC on
+  /// the gRPC CQ poller thread, so it MUST be cheap and non-blocking — the GPU
+  /// server passes a CACHE-ONLY view of the HTTP /health/ready verdict (it
+  /// never runs a fresh GPU pass here). nullptr (default) means "always ready".
   void set_readiness_check(std::function<bool()> check) {
     readiness_check_ = std::move(check);
   }
@@ -217,10 +232,12 @@ public:
   grpc::Status Health(grpc::ServerContext *ctx,
                       const ocr::HealthRequest *,
                       ocr::HealthResponse *response) override {
-    // Mirror HTTP /health/ready: probe the underlying pipeline so k8s
-    // gRPC liveness/readiness probes can actually fail when the
-    // dispatcher is wedged. Without the check, Health() always
-    // succeeded — a pod with a corrupt engine would stay in service.
+    // Readiness view of the pipeline, so a wedged/corrupt-engine pod fails its
+    // k8s gRPC readiness probe. readiness_check_ MUST be cache-only on the GPU
+    // path (set in main.cpp): running the GPU probe inline here would stall the
+    // CQ poller thread and every RPC queued behind it (H2). Liveness stays
+    // GPU-free — a process that answers this RPC at all is live, and a busy GPU
+    // cannot block this call to flap the process out of service (M2).
     if (readiness_check_ && !readiness_check_()) {
       response->set_status("not_ready");
       return grpc_error(ctx, grpc::StatusCode::UNAVAILABLE,
@@ -294,6 +311,13 @@ public:
       } catch (const turbo_ocr::PoolExhaustedError &e) {
         return grpc_error(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED,
                           "SERVER_BUSY", e.what());
+#ifndef USE_CPU_ONLY
+        // TimeoutError only exists on the GPU dispatcher path; the CPU
+        // InferFunc is synchronous and never throws it (and the type isn't
+        // even declared in that build), so the catch is GPU-only.
+      } catch (const turbo_ocr::TimeoutError &e) {
+        return grpc_error(ctx, ErrorCode::kInferenceTimeout, e.what());
+#endif
       } catch (const std::exception &e) {
         std::cerr << std::format("[gRPC] Pixels inference error: {}\n", e.what());
         return grpc_error(ctx, grpc::StatusCode::INTERNAL,
@@ -317,9 +341,12 @@ public:
       if (dispatcher_ &&
           decode::NvJpegDecoder::is_jpeg(bytes, blen)) {
         try {
-          auto out = grpc_jpeg_decode_and_infer(*dispatcher_, request->image(),
+          // grpc_jpeg_decode_and_infer's lambda owns its bytes by value, so a
+          // timed-out future is safe to abandon (C4).
+          auto fut = grpc_jpeg_decode_and_infer(*dispatcher_, request->image(),
                                                  want_layout,
-                                                 want_reading_order).get();
+                                                 want_reading_order);
+          auto out = pipeline::get_with_timeout(fut, request_timeout_ms_);
           fill_response(response, out.results, out.layout, out.reading_order,
                         want_blocks);
           return grpc::Status::OK;
@@ -332,6 +359,8 @@ public:
         } catch (const turbo_ocr::PoolExhaustedError &e) {
           return grpc_error(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED,
                             "SERVER_BUSY", e.what());
+        } catch (const turbo_ocr::TimeoutError &e) {
+          return grpc_error(ctx, ErrorCode::kInferenceTimeout, e.what());
         } catch (const std::exception &e) {
           std::cerr << std::format("[gRPC] JPEG infer error: {}\n", e.what());
           return grpc_error(ctx, grpc::StatusCode::INTERNAL,
@@ -364,6 +393,10 @@ public:
     } catch (const turbo_ocr::PoolExhaustedError &e) {
       return grpc_error(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED,
                         "SERVER_BUSY", e.what());
+#ifndef USE_CPU_ONLY
+    } catch (const turbo_ocr::TimeoutError &e) {  // GPU-only type (see above)
+      return grpc_error(ctx, ErrorCode::kInferenceTimeout, e.what());
+#endif
     } catch (const std::exception &e) {
       std::cerr << std::format("[gRPC] Inference error: {}\n", e.what());
       return grpc_error(ctx, grpc::StatusCode::INTERNAL,
@@ -499,7 +532,12 @@ public:
       for (int i = 0; i < n; ++i) {
         if (!futs[i].valid()) continue;
         try {
-          auto out = futs[i].get();
+          // Per-request deadline (C4): a wedged slot is abandoned and tagged
+          // empty rather than hanging the whole batch RPC. The submit lambdas
+          // above already own their inputs by value, so an abandoned future is
+          // safe. TimeoutError derives from std::exception, so the per-slot
+          // catch below marks it empty — the batch contract drops bad slots.
+          auto out = pipeline::get_with_timeout(futs[i], request_timeout_ms_);
           fill_response(entries[i], out.results, out.layout,
                         out.reading_order, want_blocks);
         } catch (const std::exception &e) {
@@ -798,6 +836,13 @@ public:
           dropped_pages.fetch_add(static_cast<int>(live.size()),
                                   std::memory_order_relaxed);
           return;  // leave slots empty; the RPC will RESOURCE_EXHAUSTED
+        } catch (const turbo_ocr::TimeoutError &) {
+          // A chunk that blew the per-request deadline counts as dropped, so
+          // the RPC reports RESOURCE_EXHAUSTED rather than emitting blank pages
+          // under an OK status (parity with the PoolExhausted path; C4).
+          dropped_pages.fetch_add(static_cast<int>(live.size()),
+                                  std::memory_order_relaxed);
+          return;
         }
 
         for (size_t j = 0; j < outs.size(); ++j) {
@@ -943,6 +988,12 @@ public:
                 } catch (const turbo_ocr::PoolExhaustedError &) {
                   dropped_pages.fetch_add(1, std::memory_order_relaxed);
                   return;  // leave slot empty; RPC -> RESOURCE_EXHAUSTED
+                } catch (const turbo_ocr::TimeoutError &) {
+                  // Per-request deadline (C4): a page that overran the deadline
+                  // is a dropped page, so the RPC ends RESOURCE_EXHAUSTED
+                  // instead of emitting a blank page under OK.
+                  dropped_pages.fetch_add(1, std::memory_order_relaxed);
+                  return;
                 }
 
                 if (page_mode == pdf::PdfMode::AutoVerified &&
@@ -1163,9 +1214,13 @@ private:
       };
     }
 #ifndef USE_CPU_ONLY
-    return dispatcher_->submit([&img, want_layout, want_reading_order](auto &e) {
-      return e.pipeline->run_with_layout(img, e.stream, want_layout, want_reading_order);
-    }).get();
+    // BY-VALUE capture of img (cheap cv::Mat refcount bump): submit_for_default
+    // may abandon the task on timeout, so it must not reference caller stack.
+    return dispatcher_->submit_for_default(
+        [img, want_layout, want_reading_order](auto &e) {
+          return e.pipeline->run_with_layout(img, e.stream, want_layout,
+                                             want_reading_order);
+        });
 #else
     throw std::logic_error("No inference backend configured");
 #endif
@@ -1179,11 +1234,14 @@ private:
   run_infer_batch(const std::vector<cv::Mat> &imgs, bool want_layout,
                   bool want_reading_order) {
     if (want_reading_order) want_layout = want_layout || layout_available_;
-    return dispatcher_->submit(
-        [&imgs, want_layout, want_reading_order](auto &e) {
-      return e.pipeline->run_batch_with_layout(imgs, e.stream, want_layout,
-                                               want_reading_order);
-    }).get();
+    // BY-VALUE capture: a copy of the vector is cheap (each cv::Mat is a
+    // refcount bump) and lets the task safely outlive this call if abandoned
+    // on timeout. submit_for_default applies the dispatcher's request deadline.
+    return dispatcher_->submit_for_default(
+        [imgs, want_layout, want_reading_order](auto &e) {
+          return e.pipeline->run_batch_with_layout(imgs, e.stream, want_layout,
+                                                   want_reading_order);
+        });
   }
 #endif
 
@@ -1202,6 +1260,11 @@ private:
   // Default render DPI when the request doesn't specify one: cfg.pdf_dpi
   // in pdf_only mode (matching the static det profile), 100 otherwise.
   int default_pdf_dpi_ = 100;
+  // Per-request inference deadline (C4) from cfg.request_timeout_ms; 0 = wait
+  // unbounded (legacy). Applied to every GPU future .get() so a wedged worker
+  // surfaces as DEADLINE_EXCEEDED instead of hanging an RPC. CPU path leaves
+  // it unused (InferFunc is synchronous, no dispatcher/wedge risk).
+  long request_timeout_ms_ = 30000;
   // pdf_only mode: chunk size for batched PDF page OCR (cfg.pdf_batch,
   // the static det engine's batch dim); 0 = per-page path. Only ever
   // non-zero on the GPU dispatcher constructor.

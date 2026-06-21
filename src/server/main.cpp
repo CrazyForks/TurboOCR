@@ -41,6 +41,11 @@ using turbo_ocr::render::PdfRenderer;
 namespace {
 std::atomic<bool> g_shutdown_requested{false};
 turbo_ocr::server::WorkPool *g_work_pool_for_drain = nullptr;
+// Set once in main() before the signal handlers can fire; read from the
+// detached drain thread. The gRPC server outlives that thread (it is owned by
+// the GrpcHandle on main()'s stack, which is only destroyed after run()
+// returns — i.e. after the drain has driven app().quit()).
+grpc::Server *g_grpc_server_for_drain = nullptr;
 // Atomic because the signal handler may fire on a different thread than
 // the writer in main(). Default 30 matches today's behaviour in case the
 // signal fires before main() has finished assigning it.
@@ -53,15 +58,29 @@ int shutdown_grace_seconds() {
 // Runs from Drogon's main loop (registered via setTermSignalHandler) —
 // safe to start a thread, log, and call app().quit(). The detached
 // drainer waits for the WorkPool to quiesce before tearing down Drogon
-// so inflight requests get to send their response.
+// so inflight requests get to send their response. It ALSO begins the gRPC
+// graceful shutdown in parallel (stop admitting new RPCs + drain in-flight up
+// to the same deadline) rather than waiting for run() to return — otherwise an
+// in-flight gRPC call would be cut mid-response when Shutdown() finally fired.
 void begin_graceful_shutdown(const char *signal_name) {
   if (g_shutdown_requested.exchange(true)) return;
   TOCR_LOG_INFO("Graceful shutdown requested",
                 "signal", std::string_view(signal_name),
                 "grace_seconds", shutdown_grace_seconds());
   std::thread([signal_name]() {
+    const int grace = shutdown_grace_seconds();
+    // Kick off the gRPC drain first so HTTP and gRPC drain concurrently within
+    // the one grace window. Shutdown(deadline) stops admitting immediately and
+    // hard-cancels anything still running at the deadline.
+    if (g_grpc_server_for_drain) {
+      auto grpc_deadline =
+          std::chrono::system_clock::now() + std::chrono::seconds(grace);
+      g_grpc_server_for_drain->Shutdown(grpc_deadline);
+      TOCR_LOG_INFO("gRPC graceful shutdown complete",
+                    "signal", std::string_view(signal_name));
+    }
     if (g_work_pool_for_drain) {
-      auto deadline = std::chrono::seconds(shutdown_grace_seconds());
+      auto deadline = std::chrono::seconds(grace);
       bool drained = g_work_pool_for_drain->wait_drain(deadline);
       TOCR_LOG_INFO("Inflight work drain complete",
                     "drained", drained, "signal", std::string_view(signal_name));
@@ -109,6 +128,20 @@ int main(int argc, char **argv) {
   require_model(rec_paths.rec, "REC");
   if (!cfg.pdf_only)
     require_model(cfg.cls_onnx, "CLS");
+
+  // Build the PdfRenderer here — AFTER the fail-fast model validation above
+  // (so a missing model std::exit(1)s without orphaning forked daemons) but
+  // BEFORE any CUDA/TRT call below. The renderer fork()s a pool of fastpdf2png
+  // daemons, and fork() in a process that has already initialized a CUDA
+  // context is undefined behaviour (CUDA's driver threads, pinned allocations
+  // and fds don't survive a fork cleanly). sweep_orphan_engine_temps /
+  // ensure_trt_engine / cudaMemGetInfo below all touch the CUDA context, so the
+  // daemons must be spawned ahead of them. The renderer depends on neither the
+  // dispatcher nor any model path, so hoisting it above them is safe.
+  const int pdf_daemons = cfg.pdf_daemons;
+  const int pdf_workers = cfg.pdf_workers;
+  PdfRenderer pdf_renderer(pdf_daemons, pdf_workers);
+  TOCR_LOG_INFO("PDF renderer initialized", "daemons", pdf_daemons, "workers", pdf_workers);
 
   // Auto-build TRT engines from ONNX (cached by TRT version + model hash)
   // Sweep orphan .trt.tmp.* files left by previous crashed processes; safe
@@ -189,6 +222,30 @@ int main(int argc, char **argv) {
       else if (vram_gb >= 12) pool_size = 3;
       else if (vram_gb >= 8)  pool_size = 2;
       else                     pool_size = 1;
+
+      // Footprint-based safety floor: the tier above keys off TOTAL VRAM, but a
+      // card that *reports* 16 GB while another process already holds most of
+      // it would OOM during warmup. Estimate each pipeline's resident footprint
+      // (engines + activation/workspace buffers, generous to stay conservative)
+      // and reduce the tier so it fits in the FREE VRAM measured right now.
+      // This only ever LOWERS the count — never raises it above the tier cap —
+      // and never below 1, so a healthy 32 GB card with the tiny model still
+      // picks 5 (a few hundred MB per pipeline against ~31 GB free). The
+      // explicit --pool-size / PIPELINE_POOL_SIZE override above bypasses this
+      // entirely and always wins.
+      constexpr size_t kPerPipelineFootprintBytes = size_t{2} << 30;  // 2 GiB
+      // Leave a 1 GiB headroom so the renderer daemons / CUDA context / OS
+      // don't get squeezed to the byte.
+      constexpr size_t kVramHeadroomBytes = size_t{1} << 30;
+      size_t budget = free_mem > kVramHeadroomBytes ? free_mem - kVramHeadroomBytes : 0;
+      int fits = static_cast<int>(budget / kPerPipelineFootprintBytes);
+      if (fits < 1) fits = 1;
+      if (fits < pool_size) {
+        TOCR_LOG_WARN("Reducing pipeline pool to fit available VRAM",
+                      "tier_pool_size", pool_size, "footprint_capped", fits,
+                      "free_mem_gb", static_cast<int>(free_mem >> 30));
+        pool_size = fits;
+      }
       TOCR_LOG_INFO("Auto-detected pipeline pool size", "pool_size", pool_size, "vram_gb", vram_gb);
     }
   }
@@ -213,11 +270,12 @@ int main(int argc, char **argv) {
   // off the count actually built.
   pool_size = static_cast<int>(dispatcher->worker_count());
 
-  // PDF renderer
-  const int pdf_daemons = cfg.pdf_daemons;
-  const int pdf_workers = cfg.pdf_workers;
-  PdfRenderer pdf_renderer(pdf_daemons, pdf_workers);
-  TOCR_LOG_INFO("PDF renderer initialized", "daemons", pdf_daemons, "workers", pdf_workers);
+  // Per-request inference deadline (C4). 0 leaves the dispatcher in its
+  // legacy unbounded-wait mode; cfg.request_timeout_ms defaults to 30s, which
+  // is per-image/per-page so it only trips a genuinely wedged worker, never a
+  // normal request. A timed-out future is ABANDONED, so every GPU submit below
+  // captures its request inputs BY VALUE (see the infer lambda).
+  dispatcher->set_request_timeout_ms(cfg.request_timeout_ms);
 
   // nvJPEG
   TOCR_LOG_INFO("Initializing nvJPEG decoders");
@@ -258,10 +316,18 @@ int main(int argc, char **argv) {
       [&dispatcher](const cv::Mat &img,
                     const turbo_ocr::server::InferOptions &opts)
           -> turbo_ocr::server::InferResult {
-    auto out = dispatcher->submit([&img, &opts](auto &e) {
-      return e.pipeline->run_with_layout(img, e.stream, opts.want_layout,
-                                          opts.want_reading_order);
-    }).get();
+    // submit_for_default may ABANDON the task on timeout, so the lambda owns
+    // its inputs BY VALUE: img is a cheap cv::Mat refcount bump, the flags are
+    // bools. The dispatcher itself is long-lived and captured by reference.
+    // On deadline this throws turbo_ocr::TimeoutError; the route's
+    // run_with_error_handling maps it to HTTP 504 (INFERENCE_TIMEOUT).
+    const bool want_layout = opts.want_layout;
+    const bool want_reading_order = opts.want_reading_order;
+    auto out = dispatcher->submit_for_default(
+        [img, want_layout, want_reading_order](auto &e) {
+          return e.pipeline->run_with_layout(img, e.stream, want_layout,
+                                             want_reading_order);
+        });
     return turbo_ocr::server::InferResult{
         .results       = std::move(out.results),
         .layout        = std::move(out.layout),
@@ -307,12 +373,16 @@ int main(int argc, char **argv) {
 
     bool ok = false;
     try {
-      dispatcher->submit([layout_available](auto &e) {
+      // submit_for_default honours the request timeout, so a wedged worker
+      // flips readiness to not-ready (caught below) instead of blocking this
+      // probe thread forever. The dummy Mat is created inside the task, so
+      // there is nothing request-scoped to abandon on timeout.
+      dispatcher->submit_for_default([layout_available](auto &e) {
         cv::Mat dummy(48, 48, CV_8UC3, cv::Scalar(255, 255, 255));
         (void)e.pipeline->run_with_layout(dummy, e.stream,
                                           /*want_layout=*/layout_available,
                                           /*want_reading_order=*/false);
-      }).get();
+      });
       ok = true;
     } catch (...) {}
     probe->ok.store(ok, std::memory_order_release);
@@ -329,9 +399,26 @@ int main(int argc, char **argv) {
                                         cfg.max_pdf_pages,
                                         /*doc_ori_available=*/!doc_ori_model.empty());
 
+  // Seed the readiness cache once now (the dispatcher just warmed up), so the
+  // gRPC cached-only probe has a real verdict before the first HTTP probe runs.
+  (void)readiness();
+
+  // gRPC Health uses a CACHE-ONLY view of the readiness verdict (H2): it must
+  // never run the GPU probe inline, because Health() executes on the gRPC CQ
+  // poller thread and a fresh GPU pass there would stall every queued RPC on
+  // that poller. It reads the last cached value the HTTP /health/ready probe
+  // (above) refreshes; the cache TTL keeps it fresh under any real probe
+  // traffic and we seeded it just above. This also keeps gRPC liveness/
+  // readiness GPU-free (M2): a busy GPU can't make Health() block, so it can't
+  // flap the process out of service.
+  auto readiness_cached = [probe]() -> bool {
+    return probe->ok.load(std::memory_order_acquire);
+  };
+
   // gRPC
   auto grpc_handle = turbo_ocr::server::start_grpc_server(
-      *dispatcher, cfg, &pdf_renderer, layout_available, readiness);
+      *dispatcher, cfg, &pdf_renderer, layout_available, readiness_cached);
+  g_grpc_server_for_drain = grpc_handle.server.get();
 
   // HTTP (Drogon) — behind nginx (port 8000), direct access on 8080
   const int port = cfg.http_port;
@@ -371,6 +458,11 @@ int main(int argc, char **argv) {
       .setClientMaxMemoryBodySize(max_mem_bytes)
       .run();
 
+  // Final safety Shutdown(): on a signal-driven exit begin_graceful_shutdown()
+  // already drained gRPC, so this is an idempotent no-op (Shutdown is safe to
+  // call twice). On a non-signal exit (e.g. app().quit() from elsewhere) this
+  // is the one that stops the server. Either way the thread join below needs
+  // the CQ shut down first.
   TOCR_LOG_INFO("HTTP server stopped, shutting down gRPC");
   grpc_handle.server->Shutdown();
   TOCR_LOG_INFO("Shutdown complete");

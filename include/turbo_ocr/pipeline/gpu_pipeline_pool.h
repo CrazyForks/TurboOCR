@@ -13,19 +13,8 @@
 #include "turbo_ocr/common/errors.h"
 #include "turbo_ocr/decode/nvjpeg_decoder.h"
 
-namespace turbo_ocr {
-
-// A blocking wait (e.g. dispatcher.submit().get()) exceeded its per-request
-// deadline. Mirrors PoolExhaustedError so routes/gRPC can map it to a stable
-// timeout status (504 / DEADLINE_EXCEEDED). Defined here rather than in
-// errors.h to keep the pipeline timeout surface self-contained.
-class TimeoutError : public OcrError {
-public:
-  TimeoutError() : OcrError("Inference timed out") {}
-  explicit TimeoutError(const std::string &msg) : OcrError(msg) {}
-};
-
-} // namespace turbo_ocr
+// TimeoutError now lives in turbo_ocr/common/errors.h (included above) so the
+// CPU build sees it too.
 
 namespace turbo_ocr::pipeline {
 

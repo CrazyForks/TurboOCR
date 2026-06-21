@@ -27,6 +27,7 @@
 #include "turbo_ocr/server/grpc_service.h"
 #include "turbo_ocr/server/language_paths.h"
 #include "turbo_ocr/server/metrics.h"
+#include "turbo_ocr/server/server_bootstrap.h"
 #include "turbo_ocr/server/server_config.h"
 #include "turbo_ocr/server/server_types.h"
 #include "turbo_ocr/server/work_pool.h"
@@ -38,63 +39,13 @@ using turbo_ocr::decode::FastPngDecoder;
 using turbo_ocr::decode::NvJpegDecoder;
 using turbo_ocr::render::PdfRenderer;
 
-namespace {
-std::atomic<bool> g_shutdown_requested{false};
-turbo_ocr::server::WorkPool *g_work_pool_for_drain = nullptr;
-// Set once in main() before the signal handlers can fire; read from the
-// detached drain thread. The gRPC server outlives that thread (it is owned by
-// the GrpcHandle on main()'s stack, which is only destroyed after run()
-// returns — i.e. after the drain has driven app().quit()).
-grpc::Server *g_grpc_server_for_drain = nullptr;
-// Atomic because the signal handler may fire on a different thread than
-// the writer in main(). Default 30 matches today's behaviour in case the
-// signal fires before main() has finished assigning it.
-std::atomic<int> g_shutdown_grace_seconds{30};
-
-int shutdown_grace_seconds() {
-  return g_shutdown_grace_seconds.load(std::memory_order_acquire);
-}
-
-// Runs from Drogon's main loop (registered via setTermSignalHandler) —
-// safe to start a thread, log, and call app().quit(). The detached
-// drainer waits for the WorkPool to quiesce before tearing down Drogon
-// so inflight requests get to send their response. It ALSO begins the gRPC
-// graceful shutdown in parallel (stop admitting new RPCs + drain in-flight up
-// to the same deadline) rather than waiting for run() to return — otherwise an
-// in-flight gRPC call would be cut mid-response when Shutdown() finally fired.
-void begin_graceful_shutdown(const char *signal_name) {
-  if (g_shutdown_requested.exchange(true)) return;
-  TOCR_LOG_INFO("Graceful shutdown requested",
-                "signal", std::string_view(signal_name),
-                "grace_seconds", shutdown_grace_seconds());
-  std::thread([signal_name]() {
-    const int grace = shutdown_grace_seconds();
-    // Kick off the gRPC drain first so HTTP and gRPC drain concurrently within
-    // the one grace window. Shutdown(deadline) stops admitting immediately and
-    // hard-cancels anything still running at the deadline.
-    if (g_grpc_server_for_drain) {
-      auto grpc_deadline =
-          std::chrono::system_clock::now() + std::chrono::seconds(grace);
-      g_grpc_server_for_drain->Shutdown(grpc_deadline);
-      TOCR_LOG_INFO("gRPC graceful shutdown complete",
-                    "signal", std::string_view(signal_name));
-    }
-    if (g_work_pool_for_drain) {
-      auto deadline = std::chrono::seconds(grace);
-      bool drained = g_work_pool_for_drain->wait_drain(deadline);
-      TOCR_LOG_INFO("Inflight work drain complete",
-                    "drained", drained, "signal", std::string_view(signal_name));
-    }
-    drogon::app().quit();
-  }).detach();
-}
-} // namespace
+namespace bootstrap = turbo_ocr::server::bootstrap;
 
 int main(int argc, char **argv) {
   const auto cfg = turbo_ocr::server::ServerConfig::load_or_die(argc, argv);
   cfg.log_effective();
-  g_shutdown_grace_seconds.store(cfg.shutdown_grace_seconds,
-                                  std::memory_order_release);
+  bootstrap::g_shutdown_grace_seconds.store(cfg.shutdown_grace_seconds,
+                                            std::memory_order_release);
 
   // Parallelism lives at the request level (work-pool threads); OpenCV's
   // per-op thread pool on top of that just oversubscribes cores under load.
@@ -114,15 +65,7 @@ int main(int argc, char **argv) {
   // pipeline construction. ensure_trt_engine() returns "" on missing ONNX,
   // which the dispatcher only notices much later.
   auto require_model = [](const std::string &path, const char *purpose) {
-    if (!std::filesystem::exists(path)) {
-      TOCR_LOG_ERROR("Model file missing",
-                     "purpose", std::string_view(purpose),
-                     "path", std::string_view(path));
-      std::cerr << "[FATAL] " << purpose << " model not found at: " << path
-                << "\n        Run scripts/download_models.sh or set "
-                << purpose << "_ONNX env var.\n";
-      std::exit(1);
-    }
+    bootstrap::require_model(path, purpose, "model", "_ONNX");
   };
   require_model(cfg.det_onnx, "DET");
   require_model(rec_paths.rec, "REC");
@@ -439,7 +382,7 @@ int main(int argc, char **argv) {
   // gRPC
   auto grpc_handle = turbo_ocr::server::start_grpc_server(
       *dispatcher, cfg, &pdf_renderer, layout_available, readiness_cached);
-  g_grpc_server_for_drain = grpc_handle.server.get();
+  bootstrap::g_grpc_server_for_drain = grpc_handle.server.get();
 
   // HTTP (Drogon) — behind nginx (port 8000), direct access on 8080
   const int port = cfg.http_port;
@@ -458,34 +401,16 @@ int main(int argc, char **argv) {
   const int max_body_mb = cfg.max_body_mb;
   int max_body_mem_mb = cfg.max_body_mem_mb;
   if (max_body_mem_mb > max_body_mb) max_body_mem_mb = max_body_mb;
-  size_t max_body_bytes = static_cast<size_t>(max_body_mb) * 1024 * 1024;
-  size_t max_mem_bytes  = static_cast<size_t>(max_body_mem_mb) * 1024 * 1024;
 
   TOCR_LOG_INFO("HTTP server starting", "port", port, "io_threads", io_threads,
            "work_threads", work_threads, "pool_size", dispatcher->worker_count(),
            "body_cap_mb_drogon", max_body_mb, "body_cap_mb_nginx", max_body_mb,
            "body_mem_mb", max_body_mem_mb);
 
-  // Graceful shutdown on SIGTERM (Docker / K8s) and SIGINT (Ctrl-C):
-  // drain WorkPool inflight up to SHUTDOWN_GRACE_SECONDS before quit().
-  g_work_pool_for_drain = &work_pool;
-  drogon::app()
-      .setTermSignalHandler([] { begin_graceful_shutdown("SIGTERM"); })
-      .setIntSignalHandler([]  { begin_graceful_shutdown("SIGINT");  })
-      .addListener(cfg.host, port)
-      .setThreadNum(io_threads)
-      .setIdleConnectionTimeout(120)
-      .setClientMaxBodySize(max_body_bytes)
-      .setClientMaxMemoryBodySize(max_mem_bytes)
-      .run();
+  // Listener + body-size config + graceful-shutdown signal handlers + run().
+  // Blocks until app().quit() (the drain thread) returns.
+  bootstrap::run_http_server(cfg, io_threads, work_pool);
 
-  // Final safety Shutdown(): on a signal-driven exit begin_graceful_shutdown()
-  // already drained gRPC, so this is an idempotent no-op (Shutdown is safe to
-  // call twice). On a non-signal exit (e.g. app().quit() from elsewhere) this
-  // is the one that stops the server. Either way the thread join below needs
-  // the CQ shut down first.
-  TOCR_LOG_INFO("HTTP server stopped, shutting down gRPC");
-  grpc_handle.server->Shutdown();
-  TOCR_LOG_INFO("Shutdown complete");
+  bootstrap::shutdown_grpc_after_run(grpc_handle.server.get());
   return 0;
 }

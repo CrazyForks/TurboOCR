@@ -26,6 +26,7 @@
 #include "turbo_ocr/server/grpc_service.h"
 #include "turbo_ocr/server/language_paths.h"
 #include "turbo_ocr/server/metrics.h"
+#include "turbo_ocr/server/server_bootstrap.h"
 #include "turbo_ocr/server/server_config.h"
 #include "turbo_ocr/server/server_types.h"
 #include "turbo_ocr/server/work_pool.h"
@@ -38,55 +39,15 @@ using turbo_ocr::base64_decode;
 using turbo_ocr::results_to_json;
 using turbo_ocr::emit_results_json;
 
-namespace {
-std::atomic<bool> g_shutdown_requested{false};
-turbo_ocr::server::WorkPool *g_work_pool_for_drain = nullptr;
-// Set in main() before the signal handlers can fire; read from the detached
-// drain thread (the gRPC server outlives that thread — see GPU main.cpp).
-grpc::Server *g_grpc_server_for_drain = nullptr;
-// Atomic because the signal handler may fire on a different thread than
-// the writer in main().
-std::atomic<int> g_shutdown_grace_seconds{30};
-
-int shutdown_grace_seconds() {
-  return g_shutdown_grace_seconds.load(std::memory_order_acquire);
-}
-
-// Mirrors the GPU binary: graceful drain of WorkPool inflight AND of the gRPC
-// server (stop admitting + drain in-flight up to the deadline, in parallel)
-// before app().quit() so K8s SIGTERM doesn't truncate inflight responses.
-void begin_graceful_shutdown(const char *signal_name) {
-  if (g_shutdown_requested.exchange(true)) return;
-  TOCR_LOG_INFO("Graceful shutdown requested",
-                "signal", std::string_view(signal_name),
-                "grace_seconds", shutdown_grace_seconds());
-  std::thread([signal_name]() {
-    const int grace = shutdown_grace_seconds();
-    if (g_grpc_server_for_drain) {
-      auto grpc_deadline =
-          std::chrono::system_clock::now() + std::chrono::seconds(grace);
-      g_grpc_server_for_drain->Shutdown(grpc_deadline);
-      TOCR_LOG_INFO("gRPC graceful shutdown complete",
-                    "signal", std::string_view(signal_name));
-    }
-    if (g_work_pool_for_drain) {
-      auto deadline = std::chrono::seconds(grace);
-      bool drained = g_work_pool_for_drain->wait_drain(deadline);
-      TOCR_LOG_INFO("Inflight work drain complete",
-                    "drained", drained, "signal", std::string_view(signal_name));
-    }
-    drogon::app().quit();
-  }).detach();
-}
-} // namespace
+namespace bootstrap = turbo_ocr::server::bootstrap;
 
 int main(int argc, char **argv) {
   TOCR_LOG_INFO("PaddleOCR CPU-Only Mode (ONNX Runtime)");
 
   const auto cfg = turbo_ocr::server::ServerConfig::load_or_die(argc, argv);
   cfg.log_effective();
-  g_shutdown_grace_seconds.store(cfg.shutdown_grace_seconds,
-                                  std::memory_order_release);
+  bootstrap::g_shutdown_grace_seconds.store(cfg.shutdown_grace_seconds,
+                                            std::memory_order_release);
 
   const auto &rec_paths = cfg.rec_paths;
   if (!cfg.selected_model_name.empty())
@@ -104,15 +65,7 @@ int main(int argc, char **argv) {
   // with a clear error rather than tripping a confusing ORT load failure
   // deep in pipeline construction. Dict file is also required on CPU.
   auto require_model = [](const std::string &path, const char *purpose) {
-    if (!std::filesystem::exists(path)) {
-      TOCR_LOG_ERROR("Model file missing",
-                     "purpose", std::string_view(purpose),
-                     "path", std::string_view(path));
-      std::cerr << "[FATAL] " << purpose << " file not found at: " << path
-                << "\n        Run scripts/download_models.sh or set "
-                << purpose << "_MODEL env var.\n";
-      std::exit(1);
-    }
+    bootstrap::require_model(path, purpose, "file", "_MODEL");
   };
   require_model(det_model, "DET");
   require_model(rec_model, "REC");
@@ -556,7 +509,7 @@ int main(int argc, char **argv) {
   // gRPC server
   auto grpc_handle = turbo_ocr::server::start_grpc_server(
       infer, cfg, &pdf_renderer, layout_available, readiness);
-  g_grpc_server_for_drain = grpc_handle.server.get();
+  bootstrap::g_grpc_server_for_drain = grpc_handle.server.get();
 
   // HTTP server (Drogon)
   const int port = cfg.http_port;
@@ -570,31 +523,15 @@ int main(int argc, char **argv) {
   const int max_body_mb = cfg.max_body_mb;
   int max_body_mem_mb = cfg.max_body_mem_mb;
   if (max_body_mem_mb > max_body_mb) max_body_mem_mb = max_body_mb;
-  size_t max_body_bytes = static_cast<size_t>(max_body_mb) * 1024 * 1024;
-  size_t max_mem_bytes  = static_cast<size_t>(max_body_mem_mb) * 1024 * 1024;
 
   TOCR_LOG_INFO("Starting CPU-Only OCR Server", "port", port, "grpc_port",
                 cfg.grpc_port, "body_cap_mb_drogon", max_body_mb,
                 "body_cap_mb_nginx", max_body_mb, "body_mem_mb", max_body_mem_mb);
 
-  // Graceful shutdown on SIGTERM (Docker / K8s) and SIGINT (Ctrl-C):
-  // drain WorkPool inflight up to SHUTDOWN_GRACE_SECONDS before quit().
-  g_work_pool_for_drain = &work_pool;
-  drogon::app()
-      .setTermSignalHandler([] { begin_graceful_shutdown("SIGTERM"); })
-      .setIntSignalHandler([]  { begin_graceful_shutdown("SIGINT");  })
-      .addListener(cfg.host, port)
-      .setThreadNum(4)
-      .setIdleConnectionTimeout(120)
-      .setClientMaxBodySize(max_body_bytes)
-      .setClientMaxMemoryBodySize(max_mem_bytes)
-      .run();
+  // Listener + body-size config + graceful-shutdown signal handlers + run().
+  // The CPU server uses a fixed 4 IO threads. Blocks until app().quit().
+  bootstrap::run_http_server(cfg, /*io_threads=*/4, work_pool);
 
-  // On a signal-driven exit begin_graceful_shutdown() already drained gRPC, so
-  // this is an idempotent no-op (Shutdown is safe to call twice). On any other
-  // exit path it's the one that stops the server before the thread joins.
-  TOCR_LOG_INFO("HTTP server stopped, shutting down gRPC");
-  grpc_handle.server->Shutdown();
-  TOCR_LOG_INFO("Shutdown complete");
+  bootstrap::shutdown_grpc_after_run(grpc_handle.server.get());
   return 0;
 }

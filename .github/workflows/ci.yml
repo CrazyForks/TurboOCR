@@ -4,6 +4,9 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  schedule:
+    # Nightly sanitizer run (ASAN/TSAN are too slow for every push).
+    - cron: "0 3 * * *"
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -88,3 +91,32 @@ jobs:
           echo "::group::cppcheck summary"; grep -E "\(error\)|unusedFunction" cppcheck.txt || echo "no error-severity / dead-code findings"; echo "::endgroup::"
       - name: Docker (CPU) image builds
         run: docker build -f docker/Dockerfile.cpu -t turboocr-cpu:ci . || true
+
+  # Nightly sanitizer run (L2). ASAN catches leaks/UAF, TSAN catches data races
+  # in the multi-threaded WorkPool/dispatcher/renderer paths. Too slow per-push,
+  # so scheduled-only. The CMake options already exist (ENABLE_ASAN/ENABLE_TSAN).
+  sanitizers:
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        san: [asan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build libopencv-dev
+      - name: Configure (${{ matrix.san }})
+        run: |
+          FLAG=$([ "${{ matrix.san }}" = asan ] && echo -DENABLE_ASAN=ON || echo -DENABLE_TSAN=ON)
+          cmake -S . -B build-san -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DNATIVE_ARCH=OFF $FLAG
+      - name: Build unit tests
+        run: cmake --build build-san --target turbo_ocr_tests -j"$(nproc)"
+      - name: Run unit tests under ${{ matrix.san }}
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=0
+          TSAN_OPTIONS: halt_on_error=0
+        run: ctest --test-dir build-san --output-on-failure --no-tests=error

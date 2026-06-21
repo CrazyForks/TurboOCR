@@ -368,6 +368,14 @@ flatten_descendants(int parent_idx,
     std::vector<int> kids;
     if (idx < 0 || static_cast<size_t>(idx) >= links.size()) return kids;
     kids = links[static_cast<size_t>(idx)].child_indices;
+    // child_indices can carry stale/out-of-range entries; drop them before the
+    // comparator dereferences layout[k] — otherwise an invalid index reads a
+    // 16-byte box past the layout vector (caught by valgrind). The walk below
+    // already bounds-checks each child, so this only removes entries that would
+    // have been skipped anyway.
+    std::erase_if(kids, [&](int k) {
+      return k < 0 || static_cast<size_t>(k) >= layout.size();
+    });
     std::sort(kids.begin(), kids.end(), [&](int a, int b) {
       auto [ax0, ay0, ax1, ay1] = turbo_ocr::aabb(layout[a].box);
       auto [bx0, by0, bx1, by1] = turbo_ocr::aabb(layout[b].box);

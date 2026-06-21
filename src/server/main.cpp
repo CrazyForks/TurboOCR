@@ -213,11 +213,12 @@ int main(int argc, char **argv) {
   // off the count actually built.
   pool_size = static_cast<int>(dispatcher->worker_count());
 
-  // Per-request inference deadline (C4). 0 leaves the dispatcher in its
-  // legacy unbounded-wait mode; cfg.request_timeout_ms defaults to 30s, which
-  // is per-image/per-page so it only trips a genuinely wedged worker, never a
-  // normal request. A timed-out future is ABANDONED, so every GPU submit below
-  // captures its request inputs BY VALUE (see the infer lambda).
+  // Per-request inference deadline (C4). cfg.request_timeout_ms defaults to 0,
+  // which leaves the dispatcher in its legacy unbounded-wait mode (non-breaking
+  // for existing deployments). When an operator sets REQUEST_TIMEOUT_MS>0 the
+  // deadline is per-image/per-page, so it only trips a genuinely wedged worker,
+  // never a normal request. A timed-out future is ABANDONED, so every GPU submit
+  // below captures its request inputs BY VALUE (see the infer lambda).
   dispatcher->set_request_timeout_ms(cfg.request_timeout_ms);
 
   // nvJPEG
@@ -318,9 +319,9 @@ int main(int argc, char **argv) {
     bool ok = false;
     try {
       // submit_for_default honours the request timeout, so a wedged worker
-      // flips readiness to not-ready (caught below) instead of blocking this
-      // probe thread forever. The dummy Mat is created inside the task, so
-      // there is nothing request-scoped to abandon on timeout.
+      // flips readiness to not-ready (TimeoutError, caught below) instead of
+      // blocking this probe thread forever. The dummy Mat is created inside the
+      // task, so there is nothing request-scoped to abandon on timeout.
       dispatcher->submit_for_default([layout_available](auto &e) {
         cv::Mat dummy(48, 48, CV_8UC3, cv::Scalar(255, 255, 255));
         (void)e.pipeline->run_with_layout(dummy, e.stream,
@@ -328,7 +329,15 @@ int main(int argc, char **argv) {
                                           /*want_reading_order=*/false);
       });
       ok = true;
-    } catch (...) {}
+    } catch (const turbo_ocr::PoolExhaustedError &) {
+      // Queue full = the server is BUSY but healthy. Flipping to not-ready here
+      // would pull a fine-but-loaded pod out of rotation under a burst (and shed
+      // load exactly when it's needed). Keep the last verdict; reserve not-ready
+      // for a wedged worker (TimeoutError) or a genuine inference fault.
+      ok = probe->ok.load(std::memory_order_acquire);
+    } catch (...) {
+      ok = false;
+    }
     probe->ok.store(ok, std::memory_order_release);
     probe->last_check_ms.store(now_ms, std::memory_order_release);
     return ok;

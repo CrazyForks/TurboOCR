@@ -136,3 +136,19 @@ class TestGrpcEndpoint:
             assert grpc_texts == http_texts, (
                 f"gRPC and HTTP returned different text: grpc={grpc_texts}, http={http_texts}"
             )
+
+    def test_health_rpc(self, grpc_stub):
+        """Health RPC returns a status and the discoverable response mode."""
+        resp = grpc_stub.Health(ocr_pb2.HealthRequest(), timeout=10)
+        assert resp.status, "Health returned an empty status"
+        # response_mode is additive (H7); getattr keeps the test robust if the
+        # cached stub predates the proto field. When present it must be valid.
+        mode = getattr(resp, "response_mode", "")
+        if mode:
+            assert mode in ("json_bytes", "structured")
+
+    def test_recognize_pdf(self, grpc_stub, test_pdf_bytes):
+        """RecognizePDF renders + OCRs a PDF and returns per-page results."""
+        req = ocr_pb2.OCRPDFRequest(pdf_data=test_pdf_bytes, mode="ocr")
+        resp = grpc_stub.RecognizePDF(req, timeout=30)
+        assert len(resp.pages) >= 1, "RecognizePDF returned no pages"

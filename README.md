@@ -45,7 +45,7 @@ layout and PDF parsing) on a single multi-stream CUDA/TensorRT pipeline, behind
 HTTP and gRPC. On forms and receipts it is both the most accurate open engine and
 15–90× faster than the alternatives.
 
-- 🚀 **Up to 556 img/s** (receipts) / **447 img/s** (forms) on one RTX 5090, fastest by default
+- 🚀 **Up to 556 img/s** (receipts) / **481 img/s** (forms) on one RTX 5090, fastest by default
 - 🎯 **Most accurate on forms & receipts** &mdash; beats PaddleOCR-VL, PaddleOCR-Python, RapidOCR, EasyOCR and Tesseract ([benchmarks](#benchmarks))
 - 🧠 **PP-OCRv6** &mdash; one model covers Latin + Chinese + Japanese; pick `tiny` (default) / `small` / `medium`
 - 🌐 **More scripts** &mdash; Arabic, Cyrillic, Korean, Thai, Greek via retained PP-OCRv5 recognizers
@@ -97,9 +97,9 @@ Same images, same word-F1 metric for every engine; FUNSD (English forms) and COR
 
 | Engine | FUNSD F1 | CORD F1 | Speed (FUNSD) |
 |---|---:|---:|---:|
-| **TurboOCR-medium** | **91.9%** | **93.4%** | 83 img/s |
-| TurboOCR-small | 90.3% | 92.8% | 225 img/s |
-| TurboOCR-tiny *(default)* | 84.5% | 88.9% | **447 img/s** |
+| **TurboOCR-medium** | **92.3%** | **93.4%** | 89 img/s |
+| TurboOCR-small | 90.8% | 92.8% | 234 img/s |
+| TurboOCR-tiny *(default)* | 85.4% | 88.9% | **481 img/s** |
 | TurboOCR-v5 *(legacy)* | 90.2% | 91.8% | 249 img/s |
 | PaddleOCR-VL-1.6 | 91.6% | 89.4% | 5 img/s |
 | PaddleOCR PP-OCRv5 (Python) | 86.6% | 86.4% | 6 img/s |
@@ -138,9 +138,9 @@ PP-OCRv6 (Latin + Chinese + Japanese) in three tiers via `OCR_MODEL`:
 
 | `OCR_MODEL` | FUNSD F1 | Throughput | Use it for |
 |---|---:|---:|---|
-| `tiny` *(default)* | 84.5% | ~447 img/s | Max throughput — edge / high-volume |
-| `small` | 90.3% | ~225 img/s | Balanced accuracy/speed |
-| `medium` | **91.9%** | ~83 img/s | Best accuracy |
+| `tiny` *(default)* | 85.4% | ~481 img/s | Max throughput — edge / high-volume |
+| `small` | 90.8% | ~234 img/s | Balanced accuracy/speed |
+| `medium` | **92.3%** | ~89 img/s | Best accuracy |
 
 Other scripts use retained PP-OCRv5 recognizers, also via `OCR_MODEL`: `arabic`,
 `eslav` (Cyrillic), `korean`, `thai`, `greek`.

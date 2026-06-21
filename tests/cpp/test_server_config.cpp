@@ -14,8 +14,6 @@ namespace {
 const char* const kAllEnvVars[] = {
     "TURBO_OCR_HOST",
     "BIND_HOST",
-    "API_AUTH_TOKEN",
-    "ALLOW_INSECURE_PUBLIC_BIND",
     "REQUEST_TIMEOUT_MS",
     "PORT",
     "GRPC_PORT",
@@ -79,9 +77,7 @@ TEST_CASE("from_env defaults are sane (GPU)", "[server_config]") {
   reset_env();
   auto c = ServerConfig::from_env(Profile::Gpu);
   CHECK(c.errors.empty());
-  // Default bind is loopback (C2): public bind requires auth or an explicit
-  // insecure override, so the safe default never exposes the backend directly.
-  CHECK(c.host == "127.0.0.1");
+  CHECK(c.host == "0.0.0.0");
   CHECK(c.http_port == 8080);
   CHECK(c.grpc_port == 50051);
   CHECK(c.max_body_mb == 100);
@@ -376,7 +372,7 @@ TEST_CASE("to_json produces non-empty JSON object", "[server_config]") {
   REQUIRE(j.size() > 2);
   CHECK(j.front() == '{');
   CHECK(j.back() == '}');
-  CHECK(j.find("\"host\":\"127.0.0.1\"") != std::string::npos);
+  CHECK(j.find("\"host\":\"0.0.0.0\"") != std::string::npos);
   CHECK(j.find("\"http_port\":8080") != std::string::npos);
 }
 
@@ -461,29 +457,20 @@ TEST_CASE("exposure-hardening caps: defaults, env override, bounds", "[server_co
   REQUIRE_FALSE(bad.errors.empty());
 }
 
-TEST_CASE("public bind requires auth or explicit override (C2)", "[server_config]") {
-  // Loopback default never trips the gate.
+TEST_CASE("BIND_HOST aliases the bind address; REQUEST_TIMEOUT_MS validates", "[server_config]") {
+  // BIND_HOST is an additive alias for TURBO_OCR_HOST (non-breaking; default
+  // stays 0.0.0.0 — auth/exposure are the fronting gateway's job).
   reset_env();
-  CHECK(ServerConfig::from_env(Profile::Gpu).errors.empty());
+  ::setenv("BIND_HOST", "127.0.0.1", 1);
+  CHECK(ServerConfig::from_env(Profile::Gpu).host == "127.0.0.1");
 
-  // Public bind with no auth and no override is refused at startup.
+  // TURBO_OCR_HOST wins when both are set (it predates BIND_HOST).
   reset_env();
-  ::setenv("BIND_HOST", "0.0.0.0", 1);
-  CHECK_FALSE(ServerConfig::from_env(Profile::Gpu).errors.empty());
+  ::setenv("BIND_HOST", "127.0.0.1", 1);
+  ::setenv("TURBO_OCR_HOST", "0.0.0.0", 1);
+  CHECK(ServerConfig::from_env(Profile::Gpu).host == "0.0.0.0");
 
-  // Public bind is allowed once a bearer token is configured.
-  reset_env();
-  ::setenv("BIND_HOST", "0.0.0.0", 1);
-  ::setenv("API_AUTH_TOKEN", "s3cret", 1);
-  CHECK(ServerConfig::from_env(Profile::Gpu).errors.empty());
-
-  // ...or when the operator accepts the risk explicitly.
-  reset_env();
-  ::setenv("BIND_HOST", "0.0.0.0", 1);
-  ::setenv("ALLOW_INSECURE_PUBLIC_BIND", "1", 1);
-  CHECK(ServerConfig::from_env(Profile::Gpu).errors.empty());
-
-  // REQUEST_TIMEOUT_MS validates like the other strict ints.
+  // REQUEST_TIMEOUT_MS validates like the other strict ints (M3).
   reset_env();
   ::setenv("REQUEST_TIMEOUT_MS", "not_a_number", 1);
   CHECK_FALSE(ServerConfig::from_env(Profile::Gpu).errors.empty());

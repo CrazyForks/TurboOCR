@@ -47,18 +47,6 @@ if ! [[ "$MAX_BODY_MB" =~ ^[1-9][0-9]*$ ]] || (( MAX_BODY_MB > 102400 )); then
   exit 1
 fi
 
-# /metrics is restricted to loopback + this CIDR at the nginx edge; everything
-# else gets 403 (it leaks VRAM/topology and must not face the public proxy).
-# Default to the RFC1918 pod/cluster range so an in-cluster Prometheus can
-# scrape out of the box; narrow it per deployment. A bad value here becomes a
-# raw nginx parse error 90s into startup, so reject it up front: accept either
-# a CIDR (a.b.c.d/n) or a bare IPv4, matching nginx's allow-directive syntax.
-export METRICS_ALLOW_CIDR="${METRICS_ALLOW_CIDR:-10.0.0.0/8}"
-if ! [[ "$METRICS_ALLOW_CIDR" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]]; then
-  echo "[entrypoint] FATAL: METRICS_ALLOW_CIDR must be an IPv4 address or CIDR (got: '$METRICS_ALLOW_CIDR')" >&2
-  exit 1
-fi
-
 # ---- Preflight: TRT engine cache must be writable -------------------------
 # Mirrors get_engine_cache_dir() in src/engine/onnx_to_trt.cpp:
 #   $TRT_ENGINE_CACHE → $HOME/.cache/turbo-ocr → /tmp/turbo-ocr-engines
@@ -103,7 +91,7 @@ fi
 rm -f "${TRT_CACHE_SENTINEL}"
 
 NGINX_CONF=/tmp/nginx.conf
-envsubst '${MAX_BODY_MB} ${METRICS_ALLOW_CIDR}' < /app/docker/nginx.conf.template > "$NGINX_CONF"
+envsubst '${MAX_BODY_MB}' < /app/docker/nginx.conf.template > "$NGINX_CONF"
 
 # Start nginx reverse proxy (absorbs connection storms, keep-alive to Drogon)
 nginx -c "$NGINX_CONF"

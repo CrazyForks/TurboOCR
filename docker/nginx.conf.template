@@ -16,11 +16,6 @@ http {
     tcp_nodelay on;
     default_type application/json;
 
-    # proxy_request_buffering on (below) spools the request body to disk past
-    # the in-memory buffer; keep that scratch under /tmp like pid, so it works
-    # on a read-only rootfs and without the package's /var/lib/nginx dir.
-    client_body_temp_path /tmp/nginx-client-body;
-
     upstream ocr_backend {
         server 127.0.0.1:8080;
         keepalive 128;
@@ -34,17 +29,13 @@ http {
         proxy_read_timeout 120s;
         proxy_send_timeout 120s;
         proxy_buffering off;
+        proxy_request_buffering off;
         proxy_next_upstream off;
-
-        # Bodies are hard-capped at MAX_BODY_MB, so buffer the full request
-        # before opening an upstream connection: shields Drogon from
-        # slow-trickle uploads holding a backend worker, and lets the
-        # client_body_timeout below reap stalled senders at the edge.
-        proxy_request_buffering on;
 
         # Slow-loris mitigation: reap clients that open a connection and then
         # trickle (or never send) the request header/body or stall reading the
         # response, instead of pinning an nginx worker for proxy_*_timeout.
+        # Generous enough not to disturb normal large uploads.
         client_header_timeout 30s;
         client_body_timeout 30s;
         send_timeout 30s;
@@ -64,20 +55,10 @@ http {
             return 504 '{"error":"Backend timeout"}';
         }
 
-        # /metrics leaks VRAM/topology — keep it off the public proxy.
-        # Reachable only from loopback and the operator-supplied CIDR
-        # (METRICS_ALLOW_CIDR, defaults to the RFC1918 pod range); everyone
-        # else gets 403. Listed before location / so it wins the match.
-        location = /metrics {
-            allow 127.0.0.1;
-            allow ${METRICS_ALLOW_CIDR};
-            deny all;
-
-            proxy_pass http://ocr_backend;
-            proxy_http_version 1.1;
-            proxy_set_header Connection "";
-            proxy_set_header X-Request-Id $http_x_request_id;
-        }
+        # NOTE: /metrics exposes VRAM/topology. Restricting it is the fronting
+        # gateway's job (this server is meant to sit behind one); the bundled
+        # proxy intentionally does not add an allow/deny here so it stays a
+        # drop-in for existing scrapers.
 
         location / {
             proxy_pass http://ocr_backend;

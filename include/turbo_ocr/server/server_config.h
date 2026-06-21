@@ -34,21 +34,13 @@ constexpr Profile build_profile() noexcept {
 /// for the HTTP/gRPC servers. Loaded once at startup via load_or_die().
 struct ServerConfig {
   // ---- Network ----
-  // Default to loopback so a fresh deploy is not exposed off-box. An operator
-  // who wants a public bind must set BIND_HOST/--host explicitly AND either
-  // configure API_AUTH_TOKEN or set ALLOW_INSECURE_PUBLIC_BIND (see the bind
-  // security gate in cross_field_validate).
-  std::string host = "127.0.0.1";  // TURBO_OCR_HOST / BIND_HOST / --host
-  int http_port = 8080;            // PORT / --http-port
-  int grpc_port = 50051;           // GRPC_PORT / --grpc-port
-
-  // ---- Auth / bind security ----
-  // Optional static bearer token required on every request when non-empty
-  // (empty = auth disabled). Consumed by the HTTP/gRPC auth middleware.
-  std::string api_auth_token;            // API_AUTH_TOKEN
-  // Opt-in escape hatch: allow a non-loopback bind with no auth token. Without
-  // it, a public bind + empty token refuses to start (the bind security gate).
-  bool allow_insecure_public_bind = false;  // ALLOW_INSECURE_PUBLIC_BIND
+  // Binds all interfaces by default (vLLM-style): this server is meant to sit
+  // behind a gateway/proxy that handles auth, TLS, and exposure. Set BIND_HOST
+  // (or TURBO_OCR_HOST / --host) to restrict, e.g. 127.0.0.1 when the proxy is
+  // co-located.
+  std::string host = "0.0.0.0";  // TURBO_OCR_HOST / BIND_HOST / --host
+  int http_port = 8080;          // PORT / --http-port
+  int grpc_port = 50051;         // GRPC_PORT / --grpc-port
 
   // ---- Request lifecycle ----
   // Per-request inference deadline (ms). A submit whose future does not resolve
@@ -248,30 +240,6 @@ inline void cross_field_validate(ServerConfig &c, bool mem_explicit) {
                            "); clamping to body cap");
     c.max_body_mem_mb = c.max_body_mb;
   }
-
-  // ---- Bind security gate ----
-  // A non-loopback bind exposes the server off-box. Refuse to start unless
-  // either an auth token is configured or the operator explicitly accepted the
-  // risk via ALLOW_INSECURE_PUBLIC_BIND. A public bind with auth still warns so
-  // the trusted-network assumption is visible in the post-mortem.
-  if (!is_loopback_host(c.host)) {
-    const bool has_auth = !c.api_auth_token.empty();
-    if (!has_auth && !c.allow_insecure_public_bind) {
-      c.errors.push_back(
-          "host=\"" + c.host + "\" is a public (non-loopback) bind with no "
-          "API_AUTH_TOKEN set. Set API_AUTH_TOKEN to require a bearer token, "
-          "or set ALLOW_INSECURE_PUBLIC_BIND=1 to accept the risk explicitly.");
-    } else if (!has_auth) {
-      c.warnings.push_back(
-          "host=\"" + c.host + "\" is a public (non-loopback) bind running "
-          "WITHOUT auth (ALLOW_INSECURE_PUBLIC_BIND set); ensure this port is "
-          "reachable only from a trusted network.");
-    } else {
-      c.warnings.push_back(
-          "host=\"" + c.host + "\" is a public (non-loopback) bind; every "
-          "request must carry the API_AUTH_TOKEN bearer token.");
-    }
-  }
 }
 
 } // namespace detail
@@ -284,9 +252,6 @@ inline std::string ServerConfig::to_json() const {
   j += ",\"host\":"              + esc(host);
   j += ",\"http_port\":"         + std::to_string(http_port);
   j += ",\"grpc_port\":"         + std::to_string(grpc_port);
-  // Never log the token itself — only whether auth is active.
-  j += ",\"api_auth\":"          + esc(api_auth_token.empty() ? "off" : "on");
-  j += ",\"allow_insecure_public_bind\":" + std::string(allow_insecure_public_bind ? "true" : "false");
   j += ",\"request_timeout_ms\":" + std::to_string(request_timeout_ms);
   j += ",\"max_body_mb\":"       + std::to_string(max_body_mb);
   j += ",\"max_body_mem_mb\":"   + std::to_string(max_body_mem_mb);
@@ -360,14 +325,11 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
 
   // ---- Pass 1: load from env, accumulating parse errors ----
   // Host accepts BIND_HOST as an alias for TURBO_OCR_HOST; the latter wins when
-  // both are set (it predates BIND_HOST). Default is loopback (see field doc).
-  c.host      = env_or("TURBO_OCR_HOST", env_or("BIND_HOST", "127.0.0.1"));
+  // both are set (it predates BIND_HOST). Default 0.0.0.0 (see field doc).
+  c.host      = env_or("TURBO_OCR_HOST", env_or("BIND_HOST", "0.0.0.0"));
   c.http_port = env_int_strict("PORT",      8080,  1, 65535, c.errors);
   c.grpc_port = env_int_strict("GRPC_PORT", 50051, 1, 65535, c.errors);
 
-  c.api_auth_token            = env_or("API_AUTH_TOKEN", "");
-  c.allow_insecure_public_bind =
-      env_bool_strict("ALLOW_INSECURE_PUBLIC_BIND", false, c.errors);
   c.request_timeout_ms =
       env_int_strict("REQUEST_TIMEOUT_MS", 30000, 1, 3600000, c.errors);
 
@@ -487,11 +449,9 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
     app.add_flag("--check-config", flag_check_config,
                  "Validate configuration and exit (zero on valid, 2 on errors)");
 
-    app.add_option("--host",        c.host,        "Bind address for HTTP and gRPC (default loopback)")->capture_default_str();
+    app.add_option("--host",        c.host,        "Bind address for HTTP and gRPC (default 0.0.0.0)")->capture_default_str();
     app.add_option("--http-port",   c.http_port,   "HTTP port")->capture_default_str()->check(CLI::Range(1, 65535));
     app.add_option("--grpc-port",   c.grpc_port,   "gRPC port")->capture_default_str()->check(CLI::Range(1, 65535));
-    app.add_flag("--allow-insecure-public-bind", c.allow_insecure_public_bind,
-                 "Permit a non-loopback bind with no auth token (accepts the exposure risk)");
     app.add_option("--request-timeout-ms", c.request_timeout_ms,
         "Per-request inference deadline (ms); future not resolved within it returns 504")
         ->capture_default_str()->check(CLI::Range(1, 3600000));

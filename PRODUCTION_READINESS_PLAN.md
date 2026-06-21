@@ -24,6 +24,21 @@ API/contract, concurrency/resource) + clang-tidy/cppcheck/lizard/cloc.
 4. GPU runtime validation (Phase G) passes once VRAM is available: FUNSD F1 ≥ 0.90, sustained ≥ 10 pages/s.
 5. Static-analysis baseline recorded (clang-tidy clean of cert-/bugprone- in app code; cppcheck dead-code pass complete excluding `third_party`).
 
+### HARD CONSTRAINT (added after review feedback)
+
+**The service is already deployed — no behavioral breaking changes.** Defaults, bind
+address, response shapes, ports, and existing env semantics must keep working as-is. New
+behavior is opt-in (additive env/flags) only.
+
+**This is a vLLM-class inference server — auth, TLS, API versioning, and exposure are the
+fronting gateway/proxy's job, NOT the server's.** Therefore:
+- **C2 reduced** to non-breaking edge hardening only: keep default bind `0.0.0.0`; add
+  `BIND_HOST` as an *optional* alias to restrict; add slow-loris timeouts in the bundled
+  nginx; `/metrics` restriction is left to the fronting gateway (documented, not enforced).
+  No in-server auth token, no refuse-to-boot gate. (Done; corrected in commit after Batch 1.)
+- **H6 (API versioning) — DROPPED.** Versioning/routing belongs at the gateway.
+- Re-audit every remaining item for breaking behavior before landing.
+
 **Effort key:** S ≤ 0.5 day · M ≈ 1–2 days · L ≈ 3–5 days · XL > 1 week.
 **Each task lands as its own commit** with a `[phase-id]` prefix so the branch history maps to this plan.
 
@@ -107,10 +122,10 @@ API/contract, concurrency/resource) + clang-tidy/cppcheck/lizard/cloc.
 - **Fix:** script the model-release publish + `SHA256SUMS.txt` generation; document a `MODELS_RELEASE_URL` mirror env; pin a default `PDFIUM_RELEASE=chromium/NNNN` + ship its SHA256; pin the aarch64 ORT hash. Add `third_party/VERSIONS.md` (nlohmann 3.12.0, CLI11 2.4.2, ORT 1.22.0, clipper/wuffs/simdutf commits + URLs).
 - **Validate:** clean-checkout build with no network except the pinned URLs; checksum mismatch → hard fail.
 
-### H6 — API versioning · effort M · risk Medium
-- No `/v1`; proto package `ocr` not `ocr.v1`. Breaking changes are unshippable without lockstep client upgrades.
-- **Fix:** register routes under `/v1/...` (single change point in route registration); rename proto package `ocr.v1`; keep unversioned paths as deprecated aliases for one release; document the deprecation window.
-- **Validate:** both `/ocr` and `/v1/ocr` work; deprecation logged once per process.
+### H6 — API versioning · DROPPED
+Versioning/routing is the fronting gateway's responsibility for a vLLM-class server; adding
+`/v1` in-server provides no value the gateway can't, and aliasing risks breaking deployed
+clients. Not implemented by design.
 
 ### H7 — Unify the response contract across HTTP/gRPC · effort L · risk Medium
 - gRPC `json_bytes` mode (default, `server_config.h:71`) leaves `results[].text` empty — response meaning depends on a server env var the client can't see. PDF shapes drift (autorotate/inline-images only on HTTP); text-layer helpers duplicated (`pdf_routes.cpp:151` vs `grpc_service.h:634`).

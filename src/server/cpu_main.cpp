@@ -227,6 +227,27 @@ int main(int argc, char **argv) {
   turbo_ocr::routes::register_common_routes(work_pool, infer, decode,
                                              layout_available, readiness);
 
+  // GET /capabilities (M6) — advertise this build's honored feature set so a
+  // client can discover the known GPU/CPU divergences without trial requests.
+  // CPU registers /profile and aliases auto_verified->auto (not honored as a
+  // distinct path; see pdf_routes.cpp), and its /ocr/pdf default DPI is 100.
+  {
+    turbo_ocr::routes::CapabilitiesInfo caps;
+    caps.is_gpu              = false;
+    caps.layout_available    = layout_available;
+    caps.autorotate_available = doc_ori_available;
+    caps.profile_endpoint    = true;
+    caps.grpc_response_mode  =
+        std::string(turbo_ocr::server::detail::grpc_mode_str(cfg.grpc_response_mode));
+    caps.honored_auto_verified = false;
+    caps.pdf_default_dpi     = 100;
+    caps.max_pdf_pages       = cfg.max_pdf_pages;
+    caps.max_body_mb         = cfg.max_body_mb;
+    caps.max_image_dim       = cfg.max_image_dim;
+    caps.max_batch_images    = cfg.max_batch_images;
+    turbo_ocr::routes::register_capabilities_route(caps);
+  }
+
   // --- /profile endpoint: read+reset per-stage timing (PROFILE_STAGES=1) ---
   drogon::app().registerHandler(
       "/profile",

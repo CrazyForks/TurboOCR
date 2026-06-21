@@ -1,8 +1,51 @@
 #pragma once
 
+#include <string>
+
 #include "turbo_ocr/server/server_types.h"
 
 namespace turbo_ocr::routes {
+
+/// Inputs for the GET /capabilities endpoint (M6 cross-build parity).
+/// Each binary fills this from its already-resolved ServerConfig + the
+/// runtime-availability bools it computed at startup, then hands it to
+/// register_capabilities_route. Kept as an explicit POD (rather than the
+/// whole ServerConfig) so the contract is exactly the advertised surface
+/// and adding a field here can't silently leak an unrelated config value.
+///
+/// `/capabilities` is purely additive: it advertises the known GPU/CPU
+/// build divergences (which the two binaries deliberately keep — see M6)
+/// so a client can discover, without trial requests, which features the
+/// deployment it reached actually honors. It changes no existing default,
+/// response shape, or endpoint behavior.
+struct CapabilitiesInfo {
+  bool is_gpu = false;                // build flavor: gpu vs cpu
+
+  // ---- features ----
+  bool layout_available = false;      // layout stage loaded
+  bool autorotate_available = false;  // doc-orientation model loaded
+  bool profile_endpoint = false;      // GET /profile registered (CPU only)
+  // gRPC response encoding: "json_bytes" (default) or "structured".
+  std::string grpc_response_mode = "json_bytes";
+
+  // ---- pdf ----
+  // honored_auto_verified: the GPU build runs auto_verified as its own path;
+  // the CPU build aliases it to auto. auto_verified is listed in the modes
+  // array only when it is honored as a distinct path.
+  bool honored_auto_verified = false;
+  int  pdf_default_dpi = 100;         // render DPI when ?dpi= is absent
+  int  max_pdf_pages = 2000;          // cfg.max_pdf_pages
+
+  // ---- limits ----
+  int max_body_mb = 100;              // cfg.max_body_mb
+  int max_image_dim = 16384;          // cfg.max_image_dim
+  int max_batch_images = 1024;        // cfg.max_batch_images
+};
+
+/// Register GET /capabilities. Registered by BOTH binaries so a client can
+/// query the contract of whichever deployment it reached. Returns a stable
+/// JSON document; see CapabilitiesInfo for the field semantics.
+void register_capabilities_route(const CapabilitiesInfo &info);
 
 /// Register /health, /ocr (base64 JSON), /ocr/raw (CPU decode path).
 /// The GPU binary overrides /ocr/raw with its own nvJPEG version in

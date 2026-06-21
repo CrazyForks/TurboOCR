@@ -400,6 +400,26 @@ int main(int argc, char **argv) {
                                         cfg.max_pdf_pages,
                                         /*doc_ori_available=*/!doc_ori_model.empty());
 
+  // GET /capabilities (M6) — advertise this build's honored feature set so a
+  // client can discover the known GPU/CPU divergences without trial requests.
+  // GPU honors auto_verified as its own path and has no /profile endpoint.
+  {
+    turbo_ocr::routes::CapabilitiesInfo caps;
+    caps.is_gpu              = true;
+    caps.layout_available    = layout_available;
+    caps.autorotate_available = !doc_ori_model.empty();
+    caps.profile_endpoint    = false;
+    caps.grpc_response_mode  =
+        std::string(turbo_ocr::server::detail::grpc_mode_str(cfg.grpc_response_mode));
+    caps.honored_auto_verified = true;
+    caps.pdf_default_dpi     = cfg.pdf_only ? cfg.pdf_dpi : 100;
+    caps.max_pdf_pages       = cfg.max_pdf_pages;
+    caps.max_body_mb         = cfg.max_body_mb;
+    caps.max_image_dim       = cfg.max_image_dim;
+    caps.max_batch_images    = cfg.max_batch_images;
+    turbo_ocr::routes::register_capabilities_route(caps);
+  }
+
   // Seed the readiness cache once now (the dispatcher just warmed up), so the
   // gRPC cached-only probe has a real verdict before the first HTTP probe runs.
   (void)readiness();

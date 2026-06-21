@@ -231,3 +231,20 @@ Cannot run now (vLLM holds 29.6/32 GB). When a window opens (vLLM stopped or sca
 
 ## Decision log / risk acceptances
 _(append as we go — each deferred High needs a one-line written acceptance here)_
+
+- **H8 scoped to ServerBootstrap; cpu_*/GPU twin-collapse + bare IEngine REJECTED (perf).**
+  Investigation showed the GPU and CPU detector/recognizer/layout classes are
+  *different algorithms*, not one algorithm over two engine backends: GPU
+  `PaddleDet` is ~628 LoC of CUDA CCL kernels + device buffers + streams; CPU
+  `CpuPaddleDet` is ~112 LoC of OpenCV `findContours`. `TrtEngine`
+  (device-buffer/stream/graph-capture API) and `CpuEngine` (host float-buffer
+  API) likewise don't share a non-leaky interface. Merging the twins behind an
+  `IEngine` would force the GPU hot path through host round-trips / CPU contours
+  and regress the hand-won >400 pages/s + FUNSD F1 — a breaking change to a
+  deployed perf-critical server. So H8 delivers its safe, real value
+  (ServerBootstrap: de-triplicate the 3 mains' startup, the CCN-74 cpu_main the
+  review flagged) and the twin-collapse is documented-rejected here rather than
+  shipped as a regression. M10 (move GpuImage/stream construction out of the GPU
+  routes) is likewise left as-is: the route-level `GpuImage` is a deliberate
+  zero-copy optimization, not a defect, and relocating it risks the hot path for
+  no functional gain.

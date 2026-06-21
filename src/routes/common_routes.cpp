@@ -79,6 +79,53 @@ using decode::max_image_dim;
 }
 } // namespace
 
+void register_capabilities_route(const CapabilitiesInfo &info) {
+  // Build the stable advertisement once at registration and serve the same
+  // bytes for every request — nothing here is request- or runtime-varying
+  // (the availability bools are fixed once startup finished). Built as a
+  // shared string captured by the handler so each call is a cheap copy.
+  std::string body;
+  body.reserve(640);
+  const auto b = [](bool v) { return v ? "true" : "false"; };
+
+  body += R"({"build":")";
+  body += info.is_gpu ? "gpu" : "cpu";
+  body += R"(","features":{)";
+  body += R"("layout":)";          body += b(info.layout_available);
+  body += R"(,"autorotate":)";     body += b(info.autorotate_available);
+  body += R"(,"profile_endpoint":)"; body += b(info.profile_endpoint);
+  body += R"(,"grpc_response_mode":")";
+  body += info.grpc_response_mode;
+  body += R"("},"pdf":{"modes":[)";
+  // auto_verified is advertised only when the build runs it as its own path
+  // (GPU). The CPU build aliases it to auto, so listing it there would be a
+  // false promise of verification it doesn't perform.
+  body += R"("ocr","geometric","auto")";
+  if (info.honored_auto_verified) body += R"(,"auto_verified")";
+  body += R"(],"default_dpi":)";  body += std::to_string(info.pdf_default_dpi);
+  body += R"(,"max_pages":)";      body += std::to_string(info.max_pdf_pages);
+  body += R"(},"limits":{"max_body_mb":)";
+  body += std::to_string(info.max_body_mb);
+  body += R"(,"max_image_dim":)";  body += std::to_string(info.max_image_dim);
+  body += R"(,"max_batch_images":)"; body += std::to_string(info.max_batch_images);
+  // Endpoints both builds register, in stable order. /profile is CPU-only,
+  // so it is appended only when this build registered it.
+  body += R"(},"endpoints":["/health","/health/live","/health/ready",)"
+          R"("/metrics","/capabilities","/ocr","/ocr/raw","/ocr/batch",)"
+          R"("/ocr/pixels","/ocr/pdf")";
+  if (info.profile_endpoint) body += R"(,"/profile")";
+  body += "]}";
+
+  auto shared = std::make_shared<std::string>(std::move(body));
+  drogon::app().registerHandler(
+      "/capabilities",
+      [shared](const drogon::HttpRequestPtr &,
+               std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
+        callback(server::json_response(*shared));
+      },
+      {drogon::Get});
+}
+
 void register_health_route(std::function<bool()> readiness_check,
                            server::WorkPool *pool) {
   auto health_ok = [](const drogon::HttpRequestPtr &,

@@ -246,19 +246,23 @@ cv::Mat PdfRenderer::decode_ppm(const std::string &path) {
 // the process lifetime. ~PdfRenderer reaps the daemons explicitly.
 
 // Fork+exec a fresh daemon into `d`. Shared by the constructor and the
-// runtime crash-recovery path (respawn_daemon). In the forked child we set
-// up stdin/stdout from the pipes and close every other daemon's inherited
-// fds, then exec. L4: dup2() can fail (EBADF/EINTR/EMFILE); an un-rewired
-// child would speak the daemon protocol on the wrong fds and wedge the
-// parent's pipe — so we check both dup2() calls and _exit on failure rather
-// than running the child in a corrupt fd state.
+// runtime crash-recovery path (respawn_daemon). The pipes are created
+// O_CLOEXEC so every sibling daemon's parent-side fd (and our own unused pipe
+// ends) is dropped automatically at execl(); only the two fds dup2()'d onto
+// STDIN/STDOUT survive (dup2 clears CLOEXEC on its target). This is what makes
+// runtime respawn safe: the forked child never reads another daemon's FILE*
+// fields, so it can't race a concurrent sibling respawn mutating them. pipe2()
+// sets the flag atomically — no fd-leak window for a concurrent fork.
+// L4: dup2() can fail (EBADF/EINTR/EMFILE); an un-rewired child would speak the
+// daemon protocol on the wrong fds and wedge the parent's pipe, so check both
+// dup2() calls and _exit on failure.
 void PdfRenderer::spawn_daemon(Daemon &d) {
   int in_pipe[2], out_pipe[2];
-  if (pipe(in_pipe) < 0)
-    throw turbo_ocr::PdfRenderError("pipe() failed for PDF renderer daemon");
-  if (pipe(out_pipe) < 0) {
+  if (pipe2(in_pipe, O_CLOEXEC) < 0)
+    throw turbo_ocr::PdfRenderError("pipe2() failed for PDF renderer daemon");
+  if (pipe2(out_pipe, O_CLOEXEC) < 0) {
     close(in_pipe[0]); close(in_pipe[1]);
-    throw turbo_ocr::PdfRenderError("pipe() failed for PDF renderer daemon");
+    throw turbo_ocr::PdfRenderError("pipe2() failed for PDF renderer daemon");
   }
 
   pid_t pid = fork();
@@ -269,21 +273,12 @@ void PdfRenderer::spawn_daemon(Daemon &d) {
   }
 
   if (pid == 0) {
+    // dup2 clears CLOEXEC on STDIN/STDOUT so they survive exec; all other
+    // (CLOEXEC) fds — our unused pipe ends and every sibling's pipe fd — are
+    // closed automatically by execl(). No manual cross-daemon close loop, so
+    // nothing here touches another daemon's FILE* (race-free vs respawn).
     if (dup2(in_pipe[0], STDIN_FILENO) < 0) _exit(127);
     if (dup2(out_pipe[1], STDOUT_FILENO) < 0) _exit(127);
-    close(in_pipe[0]); close(in_pipe[1]);
-    close(out_pipe[0]); close(out_pipe[1]);
-    // Close every other daemon's parent-side pipe fds so this child doesn't
-    // pin them open (during respawn the other daemons are live; &x == &d
-    // skips the slot we're replacing, whose old fds were already reaped).
-    // Use close(fileno(...)) rather than fclose(): after fork() in a
-    // multithreaded process only async-signal-safe calls are safe pre-exec,
-    // and another thread may be mid-fprintf holding that FILE*'s lock.
-    for (auto &x : daemons_) {
-      if (&x == &d) continue;
-      if (x.cmd_in) close(fileno(x.cmd_in));
-      if (x.result_out) close(fileno(x.result_out));
-    }
     execl(binary_path_.c_str(), binary_path_.c_str(), "--daemon", nullptr);
     _exit(1);
   }

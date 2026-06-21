@@ -210,7 +210,7 @@ int main(int argc, char **argv) {
 
   turbo_ocr::server::Metrics::instance().set_pool_size(pool_size);
   turbo_ocr::server::register_observability_middleware();
-  turbo_ocr::server::register_metrics_route();
+  turbo_ocr::server::register_metrics_route(&work_pool);
 
   // Single readiness probe shared by HTTP /health/ready and gRPC Health.
   // Bounded try-acquire (the CPU pool's acquire() is unbounded, so a plain

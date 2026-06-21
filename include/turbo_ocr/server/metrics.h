@@ -6,6 +6,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -14,6 +15,8 @@
 #include <cuda_runtime_api.h>
 #endif
 #include <drogon/HttpAppFramework.h>
+
+#include "turbo_ocr/server/work_pool.h"
 
 namespace turbo_ocr::server {
 
@@ -242,7 +245,14 @@ public:
                   dispatcher_queue_depth_.load(std::memory_order_relaxed));
     out += buf;
 
-    // Per-stage timing histograms (det/rec/cls/layout).
+    // Per-stage timing histograms (det/rec/cls/layout). Only emitted once some
+    // stage has been recorded — emitting a permanently-empty histogram (no
+    // caller of record_stage yet) would read as "instrumented but always 0",
+    // which is more misleading than the series being absent.
+    uint64_t stage_total = 0;
+    for (int i = 0; i < kStageCount; ++i)
+      stage_total += stages_[i].hist_count.load(std::memory_order_relaxed);
+    if (stage_total > 0) {
     out += "# HELP turbo_ocr_stage_duration_seconds Per-stage inference latency histogram.\n";
     out += "# TYPE turbo_ocr_stage_duration_seconds histogram\n";
     for (int i = 0; i < kStageCount; ++i) {
@@ -260,6 +270,7 @@ public:
       double sum = static_cast<double>(
           s.hist_sum.load(std::memory_order_relaxed)) / 1e6;
       append_stage_summary(out, name, sum, count);
+    }
     }
 
     // GPU VRAM. NOTE: cudaMemGetInfo (the scrape handler's source) reports
@@ -394,12 +405,20 @@ private:
 
 /// Register the /metrics endpoint and automatic per-request recording.
 /// Call this BEFORE drogon::app().run().
-inline void register_metrics_route() {
-  // Endpoint — update GPU VRAM on each scrape (cheap syscall)
+///
+/// `pool` (optional): snapshot WorkPool saturation gauges at scrape time.
+/// `dispatcher_queue_depth` (optional): GPU dispatcher queue depth at scrape.
+/// Both default off (CPU build / no dispatcher) so the gauges read 0 only when
+/// genuinely unwired, never stale.
+inline void register_metrics_route(
+    const WorkPool *pool = nullptr,
+    std::function<size_t()> dispatcher_queue_depth = nullptr) {
+  // Endpoint — update GPU VRAM + saturation on each scrape (cheap)
   drogon::app().registerHandler(
       "/metrics",
-      [](const drogon::HttpRequestPtr &,
-         std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
+      [pool, dispatcher_queue_depth = std::move(dispatcher_queue_depth)](
+          const drogon::HttpRequestPtr &,
+          std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 #ifndef USE_CPU_ONLY
         // cudaMemGetInfo is process-global on a shared GPU: free/total reflect
         // the whole device (every tenant), not this server's footprint. The
@@ -411,6 +430,12 @@ inline void register_metrics_route() {
           Metrics::instance().set_gpu_vram_total_bytes(total_mem);
         }
 #endif
+        // Snapshot saturation at the moment of scrape (point-in-time gauges).
+        if (pool)
+          Metrics::instance().record_saturation(
+              pool->queue_depth(), pool->inflight(), pool->max_depth());
+        if (dispatcher_queue_depth)
+          Metrics::instance().set_dispatcher_queue_depth(dispatcher_queue_depth());
         auto resp = drogon::HttpResponse::newHttpResponse();
         resp->setStatusCode(drogon::k200OK);
         resp->setBody(Metrics::instance().serialize());

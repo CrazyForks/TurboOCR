@@ -174,6 +174,13 @@ public:
 
   [[nodiscard]] size_t worker_count() const noexcept { return workers_.size(); }
 
+  /// Current GPU-queue depth, for the /metrics saturation gauge. Takes the
+  /// same mutex as submit()/the worker loop so the read is consistent.
+  [[nodiscard]] size_t queue_depth() const {
+    std::lock_guard lock(mutex_);
+    return queue_.size();
+  }
+
   /// Flag worker `worker_index`'s entry as wedged. Its owning worker rebuilds
   /// the OcrPipeline + CUDA stream from the build spec before its next task,
   /// rather than leaking the slot forever. Safe to call from any thread (e.g.
@@ -238,7 +245,7 @@ private:
   static constexpr long long kWatchdogGraceMs = 2000;
 
   std::queue<WorkFn> queue_;
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::condition_variable watchdog_cv_;
   std::vector<std::thread> workers_;

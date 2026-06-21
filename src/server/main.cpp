@@ -343,7 +343,8 @@ int main(int argc, char **argv) {
   // --- Register all routes ---
   turbo_ocr::server::Metrics::instance().set_pool_size(pool_size);
   turbo_ocr::server::register_observability_middleware();
-  turbo_ocr::server::register_metrics_route();
+  turbo_ocr::server::register_metrics_route(
+      &work_pool, [d = dispatcher.get()] { return d->queue_depth(); });
   // Single readiness probe shared by HTTP /health/ready and gRPC Health
   // so k8s probes behave identically across protocols.
   //

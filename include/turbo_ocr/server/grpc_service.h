@@ -529,15 +529,33 @@ public:
                             "SERVER_BUSY", e.what());
         }
       }
+      // Single overall deadline for the whole batch (C4): the slots run
+      // concurrently on the dispatcher, so the per-request window applies to
+      // the batch as a whole, not to each slot in turn (otherwise a wedged GPU
+      // could block up to n * request_timeout_ms). Each .get() waits only the
+      // time remaining until that one deadline. timeout<=0 means disabled, so
+      // block (matches submit_for_default's disabled path).
+      const bool batch_deadline_on = request_timeout_ms_ > 0;
+      const auto batch_deadline =
+          std::chrono::steady_clock::now() +
+          std::chrono::milliseconds(batch_deadline_on ? request_timeout_ms_ : 0);
       for (int i = 0; i < n; ++i) {
         if (!futs[i].valid()) continue;
         try {
-          // Per-request deadline (C4): a wedged slot is abandoned and tagged
-          // empty rather than hanging the whole batch RPC. The submit lambdas
-          // above already own their inputs by value, so an abandoned future is
-          // safe. TimeoutError derives from std::exception, so the per-slot
-          // catch below marks it empty — the batch contract drops bad slots.
-          auto out = pipeline::get_with_timeout(futs[i], request_timeout_ms_);
+          // A wedged slot is abandoned and tagged empty rather than hanging the
+          // whole batch RPC. The submit lambdas above own their inputs by
+          // value, so an abandoned future is safe. TimeoutError derives from
+          // std::exception, so the per-slot catch below marks it empty.
+          pipeline::OcrPipelineResult out;
+          if (batch_deadline_on) {
+            long remaining_ms = std::max<long>(
+                0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                       batch_deadline - std::chrono::steady_clock::now())
+                       .count());
+            out = pipeline::get_with_timeout(futs[i], remaining_ms);
+          } else {
+            out = futs[i].get();
+          }
           fill_response(entries[i], out.results, out.layout,
                         out.reading_order, want_blocks);
         } catch (const std::exception &e) {

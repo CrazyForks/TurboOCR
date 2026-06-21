@@ -59,6 +59,13 @@ message OCRResult {
 }
 
 message OCRResponse {
+  // NOTE: under the default server response mode "json_bytes" the structured
+  // `results` repeated field is intentionally LEFT EMPTY — the full result
+  // (text/confidence/boxes + layout/reading_order/blocks) is carried in
+  // `json_response` instead, byte-identical to the HTTP JSON body. Under
+  // response mode "structured", `results` is populated and `json_response` is
+  // empty. Query the active mode from HealthResponse.response_mode so a client
+  // knows which field to read without inferring it from emptiness.
   repeated OCRResult results = 1;
   int32 num_detections = 2;
   // Fast path: pre-serialized JSON (same as HTTP response).
@@ -105,4 +112,11 @@ message HealthRequest {}
 
 message HealthResponse {
   string status = 1;
+  // Active server response mode for OCRResponse / OCRPageResult, so a client
+  // can discover at runtime which field carries the result. One of:
+  //   "json_bytes"  — read `json_response` (default); `results` is empty.
+  //   "structured"  — read the repeated `results`; `json_response` is empty.
+  // Additive (field 2): older clients that ignore it are unaffected, and the
+  // value is purely informational — it does not change any other output.
+  string response_mode = 2;
 }

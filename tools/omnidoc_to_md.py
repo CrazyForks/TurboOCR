@@ -90,6 +90,13 @@ def render(payload: dict) -> str:
     layout = payload.get("layout") or []
     results = payload.get("results") or []
     order = payload.get("reading_order")
+    # Formula regions are recognized by the formula backend (FORMULA_BACKEND);
+    # prefer its LaTeX (keyed by layout_id) over the raw text-rec read.
+    formula_by_lid = {
+        f["layout_id"]: (f.get("latex") or "").strip()
+        for f in (payload.get("formulas") or [])
+        if f.get("layout_id") is not None
+    }
 
     if order:
         by_id = {b["id"]: b for b in layout}
@@ -126,9 +133,11 @@ def render(payload: dict) -> str:
         elif cls == "table":
             emit("<table>", "</table>")
         elif cls == "display_formula":
-            emit(f"$${text}$$" if text else "$$ $$")
+            latex = formula_by_lid.get(blk.get("id")) or text
+            emit(f"$${latex}$$" if latex else "$$ $$")
         elif cls == "inline_formula":
-            emit(f"${text}$" if text else "$ $")
+            latex = formula_by_lid.get(blk.get("id")) or text
+            emit(f"${latex}$" if latex else "$ $")
         elif cls in ("reference", "reference_content"):
             if not refs_open:
                 emit("### References")

@@ -12,19 +12,14 @@
 #include "turbo_ocr/decode/gpu_image.h"
 #include "turbo_ocr/engine/trt_engine.h"
 #include "turbo_ocr/formula/formula_kernels.h"
+#include "turbo_ocr/formula/formula_recognizer.h"
 #include "turbo_ocr/formula/formula_tokenizer.h"
 
 namespace turbo_ocr::formula {
 
-// Engine-level result emitted per input box (aligned with the input order).
-// Distinct from `router::FormulaResult` (which carries layout_id + box and is
-// the pipeline-output shape). The orchestrator maps engine results to router
-// results when it assembles the page result.
-struct FormulaEngineResult {
-  std::string latex;
-  std::size_t token_count = 0;
-  bool        hit_eos = false;
-};
+// FormulaEngineResult and the IFormulaRecognizer interface are defined in
+// formula_recognizer.h (shared across the formulanet / ppformulanet_s / vlm
+// backends so the pipeline can select one via FORMULA_BACKEND).
 
 // Plan 03 §5.2 + §11: sub-batch crops at kFormulaBatchMax for the encoder /
 // decoder Loop. Anything larger is chunked internally.
@@ -42,7 +37,7 @@ inline constexpr int kFormulaMaxOutputTokens = 1024 + 3 + 8;
 //   - One execute + one mandatory cudaStreamSynchronize per sub-batch:
 //     the Loop's output `[B, T]` has runtime-resolved `T` so we must sync
 //     before reading the shape.
-class FormulaNet {
+class FormulaNet final : public IFormulaRecognizer {
 public:
   FormulaNet();
   ~FormulaNet() noexcept = default;
@@ -56,9 +51,15 @@ public:
   // load it. Internally calls `engine::ensure_trt_engine(onnx_path, "formula")`.
   [[nodiscard]] bool load_model(const std::string &onnx_path);
 
+  // IFormulaRecognizer entry point. The pipeline passes the formula ONNX path
+  // here (FormulaNet is file-based, not directory-based); forward to load_model.
+  [[nodiscard]] bool load_model_dir(const std::string &onnx_path) override {
+    return load_model(onnx_path);
+  }
+
   // Load the byte-level BPE tokenizer JSON used to decode the output token
   // stream into LaTeX. Returns false if the file is missing or malformed.
-  [[nodiscard]] bool load_tokenizer(const std::string &tokenizer_json_path);
+  [[nodiscard]] bool load_tokenizer(const std::string &tokenizer_json_path) override;
 
   // Run the engine over the formula crops described by `boxes` (sub-rects of
   // `page`). Returns one `FormulaEngineResult` per input box, aligned with
@@ -68,11 +69,15 @@ public:
   // `stream` is reused for H2D, kernels, engine execute, and D2H. The method
   // blocks on a `cudaStreamSynchronize` after each sub-batch (mandatory).
   [[nodiscard]] std::vector<FormulaEngineResult>
-  run(const GpuImage &page, const std::vector<Box> &boxes, cudaStream_t stream);
+  run(const GpuImage &page, const std::vector<Box> &boxes, cudaStream_t stream) override;
 
   // Exposed for tests / orchestrator wiring.
-  [[nodiscard]] bool is_ready() const noexcept {
+  [[nodiscard]] bool is_ready() const noexcept override {
     return engine_ != nullptr && tokenizer_ != nullptr && buffers_allocated_;
+  }
+
+  [[nodiscard]] std::string_view backend_name() const noexcept override {
+    return "formulanet";
   }
 
 private:

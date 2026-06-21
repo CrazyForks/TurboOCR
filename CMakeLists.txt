@@ -482,6 +482,10 @@ else()
         src/table/kernels/table_kernels.cu
         src/formula/formulanet.cpp
         src/formula/formula_tokenizer.cpp
+        src/formula/formula_recognizer.cpp
+        src/formula/vlm_formula.cpp
+        src/formula/ppformulanet_s.cpp
+        src/vlm/crop_pool.cpp
         src/formula/kernels/formula_kernels.cu
     )
     target_include_directories(turbo_ocr_gpu PUBLIC
@@ -500,6 +504,9 @@ else()
     # (nvJPEG handles the GPU default path; already linked below).
     find_library(TURBOJPEG_LIB turbojpeg REQUIRED)
     message(STATUS "libjpeg-turbo: ${TURBOJPEG_LIB}")
+    # libcurl: VLMFormula/VLMTable call an OpenAI-compatible vLLM endpoint.
+    find_library(CURL_LIB curl REQUIRED)
+    message(STATUS "libcurl: ${CURL_LIB}")
     target_link_libraries(turbo_ocr_gpu PUBLIC
         turbo_ocr_common
         nvinfer
@@ -509,6 +516,7 @@ else()
         cudart
         ${TURBO_PDFIUM_DIR}/lib/libpdfium.so
         ${TURBOJPEG_LIB}
+        ${CURL_LIB}
     )
     target_compile_options(turbo_ocr_gpu PRIVATE ${TURBO_OCR_CXX_FLAGS})
     add_library(turbo_ocr::gpu ALIAS turbo_ocr_gpu)

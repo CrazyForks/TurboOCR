@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdlib>
 #include <format>
 #include <iostream>
 #include <memory>
@@ -35,6 +36,28 @@ struct PipelineBuildSpec {
   DetInferConfig det_cfg{turbo_ocr::detection::kDetResizeDefault,
                          turbo_ocr::detection::kDbDefaults};
 };
+
+// Load the optional CUA router + table/formula stages onto `pipeline` when a
+// backend is configured via env (matches the server's env-config style):
+//   FORMULA_BACKEND  formulanet | ppformulanet_s | vlm  (vlm needs no local files)
+//   FORMULA_ONNX / FORMULA_TOKENIZER         file-based formula backends
+//   TABLE_{CLS,CELL_*,SLANEXT_*}_TRT         table stage (self-skips if absent)
+// No-op when nothing is configured, so the text-only path is untouched.
+inline void maybe_load_router_models(OcrPipeline &pipeline) {
+  auto env = [](const char *k) {
+    const char *v = std::getenv(k);
+    return std::string(v ? v : "");
+  };
+  const bool want_router = std::getenv("FORMULA_BACKEND") != nullptr ||
+                           !env("FORMULA_ONNX").empty() ||
+                           !env("TABLE_CLS_TRT").empty();
+  if (!want_router) return;
+  (void)pipeline.load_router_models(
+      env("TABLE_CLS_TRT"), env("TABLE_CELL_WIRED_TRT"),
+      env("TABLE_CELL_WIRELESS_TRT"), env("TABLE_SLANEXT_WIRED_TRT"),
+      env("TABLE_SLANEXT_WIRELESS_TRT"), env("FORMULA_ONNX"),
+      env("FORMULA_TOKENIZER"));
+}
 
 /// OcrPipeline + its dedicated CUDA stream + its own nvJPEG decoder, managed
 /// as a single poolable unit. One per dispatcher worker thread.
@@ -88,6 +111,7 @@ struct GpuPipelineEntry {
       throw turbo_ocr::ModelLoadError("[Recycle] Failed to reload layout model");
     if (!spec.doc_ori_model.empty())
       (void)fresh->load_doc_ori_model(spec.doc_ori_model); // soft-disable on fail
+    maybe_load_router_models(*fresh);
 
     cudaStream_t fresh_stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&fresh_stream, cudaStreamNonBlocking));
@@ -150,6 +174,7 @@ using GpuPipelinePool = PipelinePool<GpuPipelineEntry>;
             i, pool_size));
       }
     }
+    maybe_load_router_models(*pipeline);
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     entries.push_back(std::make_unique<GpuPipelineEntry>(std::move(pipeline), stream));

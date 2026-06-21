@@ -18,7 +18,7 @@
 
 namespace turbo_ocr::router  { class CuaRouter; }
 namespace turbo_ocr::table   { class TableStage; }
-namespace turbo_ocr::formula { class FormulaNet; }
+namespace turbo_ocr::formula { class IFormulaRecognizer; }
 
 namespace turbo_ocr::pipeline {
 
@@ -234,7 +234,7 @@ private:
   // ---- CUA router + table/formula stages (lazy-allocated) ----------------
   std::unique_ptr<router::CuaRouter>   router_;
   std::unique_ptr<table::TableStage>   table_stage_;
-  std::unique_ptr<formula::FormulaNet> formula_;
+  std::unique_ptr<formula::IFormulaRecognizer> formula_;
 
   cudaStream_t table_stream_       = nullptr;
   cudaStream_t formula_stream_     = nullptr;

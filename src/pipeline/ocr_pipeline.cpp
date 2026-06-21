@@ -4,6 +4,7 @@
 #include "turbo_ocr/common/timing.h"
 #include "turbo_ocr/decode/gpu_image.h"
 #include "turbo_ocr/common/serialization.h"
+#include "turbo_ocr/formula/formula_recognizer.h"
 #include "turbo_ocr/formula/formulanet.h"
 #include "turbo_ocr/layout/reading_order.h"
 #include "turbo_ocr/router/cua_router.h"
@@ -146,26 +147,36 @@ bool OcrPipeline::load_router_models(
     std::cout << "[Pipeline] Table stage enabled" << '\n';
   }
 
-  // Formula half — entirely optional. Guarded against missing files so
-  // the server starts cleanly while upstream re-exports the split-ONNX
-  // bundle (see .claude/plans/10_trt_gate_results.md).
-  const bool want_formula = !formula_onnx.empty() &&
-                            !formula_tokenizer_json.empty() &&
-                            std::filesystem::exists(formula_onnx) &&
-                            std::filesystem::exists(formula_tokenizer_json);
+  // Formula half — backend selected via FORMULA_BACKEND
+  // (formulanet | ppformulanet_s | vlm). The file-based backends are guarded
+  // against missing files so the server starts cleanly while upstream
+  // re-exports the split-ONNX bundle (see .claude/plans/10_trt_gate_results.md);
+  // the "vlm" backend talks to a remote endpoint and needs no local files.
+  const std::string formula_backend = formula::resolve_formula_backend_env();
+  const bool formula_is_remote = (formula_backend == "vlm");
+  const bool want_formula =
+      formula_is_remote ||
+      (!formula_onnx.empty() && !formula_tokenizer_json.empty() &&
+       std::filesystem::exists(formula_onnx) &&
+       std::filesystem::exists(formula_tokenizer_json));
   if (want_formula) {
-    auto eng = std::make_unique<formula::FormulaNet>();
-    if (!eng->load_model(formula_onnx)) {
-      std::cerr << "[Pipeline] Formula engine load_model failed — formulas disabled\n";
+    auto eng = formula::make_formula_recognizer(formula_backend);
+    if (!eng) {
+      std::cerr << "[Pipeline] Unknown FORMULA_BACKEND='" << formula_backend
+                << "' — formulas disabled\n";
+    } else if (!eng->load_model_dir(formula_onnx)) {
+      std::cerr << "[Pipeline] Formula backend '" << formula_backend
+                << "' load failed — formulas disabled\n";
     } else if (!eng->load_tokenizer(formula_tokenizer_json)) {
       std::cerr << "[Pipeline] Formula tokenizer load failed — formulas disabled\n";
     } else {
+      const auto bname = eng->backend_name();
       formula_ = std::move(eng);
       if (!formula_stream_) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&formula_stream_, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&formula_done_event_, cudaEventDisableTiming));
       }
-      std::cout << "[Pipeline] Formula stage enabled" << '\n';
+      std::cout << "[Pipeline] Formula stage enabled (backend=" << bname << ")\n";
     }
   } else if (!formula_onnx.empty()) {
     std::cout << "[Pipeline] Formula engine skipped (path missing): "

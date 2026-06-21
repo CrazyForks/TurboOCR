@@ -285,6 +285,7 @@ private:
         "[Dispatcher] Failed to load layout model for pipeline {}", idx));
   if (!doc_ori_model.empty())
     (void)pipeline->load_doc_ori_model(doc_ori_model); // soft-disable on fail
+  maybe_load_router_models(*pipeline);
   cudaStream_t stream;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   auto entry = std::make_unique<GpuPipelineEntry>(std::move(pipeline), stream);

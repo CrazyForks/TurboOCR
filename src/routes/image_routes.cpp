@@ -183,7 +183,7 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
             cb(timeout_response());
             return;
           }
-          cb(server::json_response(emit_results_json(out.results, out.layout, out.reading_order, opts.want_blocks)));
+          cb(server::json_response(emit_pipeline_result_json(out, opts.want_blocks)));
           return;
         }
 
@@ -212,7 +212,7 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
           cb(timeout_response());
           return;
         }
-        cb(server::json_response(emit_results_json(out.results, out.layout, out.reading_order, opts.want_blocks)));
+        cb(server::json_response(emit_pipeline_result_json(out, opts.want_blocks)));
       });
     });
   }, {drogon::Post});
@@ -694,7 +694,7 @@ void register_ocr_pixels_route_gpu(server::WorkPool &pool,
           cb(timeout_response());
           return;
         }
-        cb(server::json_response(emit_results_json(out.results, out.layout, out.reading_order, opts.want_blocks)));
+        cb(server::json_response(emit_pipeline_result_json(out, opts.want_blocks)));
       });
     });
   }, {drogon::Post});

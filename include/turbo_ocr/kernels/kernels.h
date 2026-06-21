@@ -142,12 +142,17 @@ int cuda_gpu_ccl_detect(
 //   d_compact_ids       = CCL compact label map (int32_t, -1=bg, 0..N-1)
 //   d_expand_per_comp   = float[kMaxGpuComponents], per-component expand (px)
 //   d_expanded_labels   = uint32_t output (1..N, 0=bg)
+// d_seeds / d_seeds_alt are packed uint32 seeds (x<<16 | (y&0xFFFF), 0xFFFFFFFF
+// = empty). max_expand is the GLOBAL expand clamp (max over all components);
+// the JFA jump range is bounded to it (bounded JFA), so far passes that would
+// only resolve pixels beyond max_expand — which expand discards anyway — are
+// skipped. Requires w,h <= 65535 (guaranteed by the det resize cap).
 void cuda_jfa_expand_labels(const uint8_t *d_bitmap,
                             const int32_t *d_compact_ids,
                             const float *d_expand_per_comp,
                             uint32_t *d_expanded_labels,
-                            int w, int h,
-                            int2 *d_seeds, int2 *d_seeds_alt,
+                            int w, int h, float max_expand,
+                            uint32_t *d_seeds, uint32_t *d_seeds_alt,
                             cudaStream_t stream);
 
 // Compute per-component expand distance from PRE-filter CCL bboxes.

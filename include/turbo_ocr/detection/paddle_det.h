@@ -163,8 +163,8 @@ private:
   // Used by run_gpu_ccl_fast (GPU_CCL=2): all-GPU post-processing path that
   // matches CPU CCL=1 accuracy without downloading the prediction map.
   CudaPtr<uint32_t> d_jfa_labels_;     // [max_pixels] expanded label map
-  CudaPtr<int2> d_jfa_seeds_;          // [max_pixels] JFA nearest-seed coords (primary)
-  CudaPtr<int2> d_jfa_seeds_alt_;      // [max_pixels] JFA ping-pong buffer
+  CudaPtr<uint32_t> d_jfa_seeds_;      // [max_pixels] packed JFA nearest-seed coords (primary)
+  CudaPtr<uint32_t> d_jfa_seeds_alt_;  // [max_pixels] JFA ping-pong buffer
   CudaPtr<float> d_expand_per_comp_;   // [kMaxGpuComponents] per-component expand
   // Pinned host buffer for post-expand bboxes. Pre-allocated once so
   // run_gpu_ccl_fast doesn't cudaMallocHost on every request.

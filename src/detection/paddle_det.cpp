@@ -103,8 +103,8 @@ bool PaddleDet::init_buffers(const DetResizeParams& resize, const DbParams& db) 
 
     // JFA (Jump Flooding) per-component label expansion
     d_jfa_labels_ = CudaPtr<uint32_t>(max_pixels);
-    d_jfa_seeds_ = CudaPtr<int2>(max_pixels);
-    d_jfa_seeds_alt_ = CudaPtr<int2>(max_pixels);
+    d_jfa_seeds_ = CudaPtr<uint32_t>(max_pixels);
+    d_jfa_seeds_alt_ = CudaPtr<uint32_t>(max_pixels);
     d_expand_per_comp_ = CudaPtr<float>(turbo_ocr::kernels::kMaxGpuComponents);
     h_exp_boxes_ = CudaHostPtr<turbo_ocr::kernels::GpuDetBox>(
         turbo_ocr::kernels::kMaxGpuComponents);
@@ -267,15 +267,18 @@ PaddleDet::run_gpu_ccl_fast(int resize_h, int resize_w,
   if (num_slots == 0) return boxes;
 
   // Step 2: Per-component expand distance from CCL bboxes (Clipper-equivalent
-  // area*ratio/perim). Indexed by PRE-filter compact_id.
+  // area*ratio/perim). Indexed by PRE-filter compact_id. kMaxExpand is the
+  // global cutoff; it also bounds the JFA jump range below — keep them equal.
+  constexpr float kMaxExpand = 24.0f;
   turbo_ocr::kernels::cuda_compute_expand_per_comp(
-      d_ccl_bboxes_.get(), num_slots, unclip_ratio_ * unclip_scale_, /*min*/ 2.0f, /*max*/ 24.0f,
+      d_ccl_bboxes_.get(), num_slots, unclip_ratio_ * unclip_scale_, /*min*/ 2.0f, kMaxExpand,
       box_thresh_, d_expand_per_comp_.get(), stream);
 
-  // Step 3: JFA + per-component label expansion (variable cutoff per component)
+  // Step 3: JFA + per-component label expansion (variable cutoff per component).
+  // Pass kMaxExpand so JFA bounds its jump range to it (no pixel beyond it survives).
   turbo_ocr::kernels::cuda_jfa_expand_labels(
       cur_bitmap_, d_ccl_compact_ids_.get(), d_expand_per_comp_.get(),
-      d_jfa_labels_.get(), resize_w, resize_h,
+      d_jfa_labels_.get(), resize_w, resize_h, kMaxExpand,
       d_jfa_seeds_.get(), d_jfa_seeds_alt_.get(), stream);
 
   // Step 4: GPU bbox extraction over expanded region. Launcher inits sentinels
@@ -408,8 +411,8 @@ void PaddleDet::set_pdf_static_profile(int batch, int page_h, int page_w) {
     d_ccl_labels_      = CudaPtr<int>(page_pixels);
     d_ccl_compact_ids_ = CudaPtr<int>(page_pixels);
     d_jfa_labels_      = CudaPtr<uint32_t>(page_pixels);
-    d_jfa_seeds_       = CudaPtr<int2>(page_pixels);
-    d_jfa_seeds_alt_   = CudaPtr<int2>(page_pixels);
+    d_jfa_seeds_       = CudaPtr<uint32_t>(page_pixels);
+    d_jfa_seeds_alt_   = CudaPtr<uint32_t>(page_pixels);
   }
 }
 

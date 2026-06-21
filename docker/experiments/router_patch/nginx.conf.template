@@ -22,12 +22,12 @@ http {
     client_body_temp_path /tmp/nginx-client-body;
 
     upstream ocr_backend {
-        server 127.0.0.1:8080;
+        server 127.0.0.1:8083;
         keepalive 128;
     }
 
     server {
-        listen 8000 backlog=4096 reuseport;
+        listen 8082 backlog=4096 reuseport;
 
         client_max_body_size ${MAX_BODY_MB}m;
         proxy_connect_timeout 120s;
@@ -37,8 +37,8 @@ http {
         proxy_next_upstream off;
 
         # Bodies are hard-capped at MAX_BODY_MB, so buffer the full request
-        # before opening an upstream connection: shields Drogon from
-        # slow-trickle uploads holding a backend worker, and lets the
+        # before opening an upstream connection: shields the backend from
+        # slow-trickle uploads holding a worker, and lets the
         # client_body_timeout below reap stalled senders at the edge.
         proxy_request_buffering on;
 
@@ -49,16 +49,16 @@ http {
         client_body_timeout 30s;
         send_timeout 30s;
 
-        # JSON error pages for all nginx-generated errors
         error_page 413 =413 @error_413;
-        error_page 502 =502 @error_502;
+        error_page 502 =503 @error_upstream_down;
         error_page 504 =504 @error_504;
 
         location @error_413 {
             return 413 '{"error":"Request body too large (max ${MAX_BODY_MB}MB)"}';
         }
-        location @error_502 {
-            return 502 '{"error":"Backend unavailable"}';
+        location @error_upstream_down {
+            add_header Retry-After 15 always;
+            return 503 '{"error":"Backend not ready"}';
         }
         location @error_504 {
             return 504 '{"error":"Backend timeout"}';

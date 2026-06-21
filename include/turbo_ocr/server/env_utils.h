@@ -117,4 +117,15 @@ namespace turbo_ocr::server {
   return v && *v;
 }
 
+/// True iff `host` is a loopback bind that is not reachable off-box:
+/// 127.0.0.0/8, IPv6 ::1, "localhost", or the empty string (httplib treats
+/// empty as loopback). Anything else (0.0.0.0, ::, a routable address, a
+/// hostname) is treated as a public bind for the security gate.
+[[nodiscard]] inline bool is_loopback_host(std::string_view host) noexcept {
+  if (host.empty() || host == "localhost") return true;
+  if (host == "::1" || host == "[::1]") return true;
+  // Any 127.x.y.z address is loopback.
+  return host.rfind("127.", 0) == 0;
+}
+
 } // namespace turbo_ocr::server

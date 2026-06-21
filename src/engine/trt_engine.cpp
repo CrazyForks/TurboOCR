@@ -1,4 +1,5 @@
 #include "turbo_ocr/engine/trt_engine.h"
+#include "turbo_ocr/common/cuda_check.h"
 #include "turbo_ocr/common/errors.h"
 
 #include <cstdlib>
@@ -220,7 +221,14 @@ bool TrtEngine::infer_dynamic(const nvinfer1::Dims &input_dims,
   if (!context_->allInputDimensionsSpecified()) [[unlikely]]
     throw turbo_ocr::InferenceError(
         "input dimensions not all set before enqueueV3 (" + model_path_ + ")");
-  return context_->enqueueV3(stream);
+  if (!context_->enqueueV3(stream)) [[unlikely]] {
+    // A sticky fault here (illegal address, ECC, launch failure, …) has
+    // poisoned the context for every pipeline in the process — fail-fast
+    // rather than serve garbage. Recoverable faults fall through to false.
+    turbo_ocr::abort_on_sticky_cuda_fault("TrtEngine::infer_dynamic enqueueV3");
+    return false;
+  }
+  return true;
 }
 
 void TrtEngine::select_profile(int profile_idx, cudaStream_t stream) {
@@ -281,7 +289,14 @@ bool TrtEngine::execute(cudaStream_t stream) {
   if (!context_->allInputDimensionsSpecified()) [[unlikely]]
     throw turbo_ocr::InferenceError(
         "input dimensions not all set before enqueueV3 (" + model_path_ + ")");
-  return context_->enqueueV3(stream);
+  if (!context_->enqueueV3(stream)) [[unlikely]] {
+    // A sticky fault here (illegal address, ECC, launch failure, …) has
+    // poisoned the context for every pipeline in the process — fail-fast
+    // rather than serve garbage. Recoverable faults fall through to false.
+    turbo_ocr::abort_on_sticky_cuda_fault("TrtEngine::execute enqueueV3");
+    return false;
+  }
+  return true;
 }
 
 nvinfer1::Dims TrtEngine::tensor_shape(const std::string &name) const {

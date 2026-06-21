@@ -13,7 +13,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CACHE_DIR="${TRT_ENGINE_CACHE:-${HOME}/.cache/turbo-ocr}"
 SERVER_BIN="${REPO_ROOT}/build/turboocr-server"
-VENV_PY="${VENV_PY:-/workspace/turboocr/.venv-modelopt/bin/python}"
+# Repo-relative modelopt venv; override VENV_PY for a venv elsewhere.
+VENV_PY="${VENV_PY:-${REPO_ROOT}/.venv-modelopt/bin/python}"
 DEADLINE_SECONDS="${DEADLINE_SECONDS:-600}"
 
 log()  { printf '[int8] %s\n' "$*"; }

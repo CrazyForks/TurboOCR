@@ -104,6 +104,62 @@ public:
     gpu_vram_total_.store(bytes, std::memory_order_relaxed);
   }
 
+  // ── Saturation gauges ──────────────────────────────────────────────────
+  // These are point-in-time depths; the scrape handler is expected to call
+  // record_saturation() just before serialize() so the values reflect the
+  // moment of the scrape rather than the last request.
+
+  void set_workpool_queue_depth(size_t depth) {
+    workpool_queue_depth_.store(depth, std::memory_order_relaxed);
+  }
+
+  void set_workpool_inflight(size_t n) {
+    workpool_inflight_.store(n, std::memory_order_relaxed);
+  }
+
+  void set_workpool_max_depth(size_t depth) {
+    workpool_max_depth_.store(depth, std::memory_order_relaxed);
+  }
+
+  /// Downstream GPU/pipeline queue depth (the PipelineDispatcher bound that
+  /// actually triggers 503s). Setter-only so the pipeline owns the value.
+  void set_dispatcher_queue_depth(size_t depth) {
+    dispatcher_queue_depth_.store(depth, std::memory_order_relaxed);
+  }
+
+  /// Convenience hook for the /metrics scrape handler: snapshot the WorkPool
+  /// saturation in one call. Pass max_depth so the gauge ceiling stays in
+  /// sync with the pool's configured bound.
+  void record_saturation(size_t queue_depth, size_t inflight, size_t max_depth) {
+    set_workpool_queue_depth(queue_depth);
+    set_workpool_inflight(inflight);
+    set_workpool_max_depth(max_depth);
+  }
+
+  // ── Per-stage timing ───────────────────────────────────────────────────
+
+  enum Stage : int { kDet = 0, kRec, kCls, kLayout, kStageCount };
+
+  static constexpr const char *stage_name(Stage s) {
+    constexpr const char *names[] = {"det", "rec", "cls", "layout"};
+    return names[s];
+  }
+
+  /// Record one stage execution. Pipeline calls this per det/rec/cls/layout
+  /// pass; no-op cost is a few relaxed atomics so it is safe on the hot path.
+  void record_stage(Stage stage, double duration_s) {
+    auto &s = stages_[stage];
+    s.hist_count.fetch_add(1, std::memory_order_relaxed);
+    s.hist_sum.fetch_add(
+        static_cast<uint64_t>(duration_s * 1e6), std::memory_order_relaxed);
+    for (size_t i = 0; i < kNumBuckets; ++i) {
+      if (duration_s <= kBuckets[i]) {
+        s.hist_buckets[i].fetch_add(1, std::memory_order_release);
+        break;
+      }
+    }
+  }
+
   // ── Prometheus text exposition ─────────────────────────────────────────
 
   [[nodiscard]] std::string serialize() const {
@@ -162,15 +218,61 @@ public:
                   pool_size_.load(std::memory_order_relaxed));
     out += buf;
 
-    // GPU VRAM
+    // Saturation gauges (snapshot at scrape time via record_saturation()).
+    out += "# HELP turbo_ocr_workpool_queue_depth Tasks waiting in the WorkPool queue.\n";
+    out += "# TYPE turbo_ocr_workpool_queue_depth gauge\n";
+    std::snprintf(buf, sizeof(buf), "turbo_ocr_workpool_queue_depth %zu\n",
+                  workpool_queue_depth_.load(std::memory_order_relaxed));
+    out += buf;
+    out += "# HELP turbo_ocr_workpool_inflight Tasks currently executing on WorkPool threads.\n";
+    out += "# TYPE turbo_ocr_workpool_inflight gauge\n";
+    std::snprintf(buf, sizeof(buf), "turbo_ocr_workpool_inflight %zu\n",
+                  workpool_inflight_.load(std::memory_order_relaxed));
+    out += buf;
+    size_t wp_max = workpool_max_depth_.load(std::memory_order_relaxed);
+    if (wp_max > 0) {
+      out += "# HELP turbo_ocr_workpool_max_depth Configured WorkPool queue ceiling (503 above this).\n";
+      out += "# TYPE turbo_ocr_workpool_max_depth gauge\n";
+      std::snprintf(buf, sizeof(buf), "turbo_ocr_workpool_max_depth %zu\n", wp_max);
+      out += buf;
+    }
+    out += "# HELP turbo_ocr_dispatcher_queue_depth Requests queued for the GPU pipeline dispatcher.\n";
+    out += "# TYPE turbo_ocr_dispatcher_queue_depth gauge\n";
+    std::snprintf(buf, sizeof(buf), "turbo_ocr_dispatcher_queue_depth %zu\n",
+                  dispatcher_queue_depth_.load(std::memory_order_relaxed));
+    out += buf;
+
+    // Per-stage timing histograms (det/rec/cls/layout).
+    out += "# HELP turbo_ocr_stage_duration_seconds Per-stage inference latency histogram.\n";
+    out += "# TYPE turbo_ocr_stage_duration_seconds histogram\n";
+    for (int i = 0; i < kStageCount; ++i) {
+      auto &s = stages_[i];
+      auto name = stage_name(static_cast<Stage>(i));
+      uint64_t cumulative = 0;
+      for (size_t b = 0; b < kNumBuckets; ++b) {
+        cumulative += s.hist_buckets[b].load(std::memory_order_acquire);
+        char le_buf[32];
+        std::snprintf(le_buf, sizeof(le_buf), "%.3f", kBuckets[b]);
+        append_stage_bucket(out, name, le_buf, cumulative);
+      }
+      uint64_t count = s.hist_count.load(std::memory_order_relaxed);
+      append_stage_bucket(out, name, "+Inf", count);
+      double sum = static_cast<double>(
+          s.hist_sum.load(std::memory_order_relaxed)) / 1e6;
+      append_stage_summary(out, name, sum, count);
+    }
+
+    // GPU VRAM. NOTE: cudaMemGetInfo (the scrape handler's source) reports
+    // whole-device occupancy, not this process's footprint — on a shared GPU
+    // these numbers include every other tenant. See the per-metric HELP below.
     size_t vram_used = gpu_vram_used_.load(std::memory_order_relaxed);
     size_t vram_total = gpu_vram_total_.load(std::memory_order_relaxed);
     if (vram_total > 0) {
-      out += "# HELP turbo_ocr_gpu_vram_used_bytes GPU memory currently in use.\n";
+      out += "# HELP turbo_ocr_gpu_vram_used_bytes Whole-device GPU memory in use (all processes, not just this server) per cudaMemGetInfo.\n";
       out += "# TYPE turbo_ocr_gpu_vram_used_bytes gauge\n";
       std::snprintf(buf, sizeof(buf), "turbo_ocr_gpu_vram_used_bytes %zu\n", vram_used);
       out += buf;
-      out += "# HELP turbo_ocr_gpu_vram_total_bytes Total GPU memory.\n";
+      out += "# HELP turbo_ocr_gpu_vram_total_bytes Total GPU device memory (shared across all processes).\n";
       out += "# TYPE turbo_ocr_gpu_vram_total_bytes gauge\n";
       std::snprintf(buf, sizeof(buf), "turbo_ocr_gpu_vram_total_bytes %zu\n", vram_total);
       out += buf;
@@ -215,9 +317,20 @@ private:
     std::atomic<uint64_t> hist_count{0};
   };
 
+  struct StageMetrics {
+    std::array<std::atomic<uint64_t>, kNumBuckets> hist_buckets{};
+    std::atomic<uint64_t> hist_sum{0};   // microseconds
+    std::atomic<uint64_t> hist_count{0};
+  };
+
   std::array<RouteMetrics, kRouteCount> routes_{};
+  std::array<StageMetrics, kStageCount> stages_{};
   std::atomic<uint64_t> pool_exhaustions_{0};
   std::atomic<int> pool_size_{0};
+  std::atomic<size_t> workpool_queue_depth_{0};
+  std::atomic<size_t> workpool_inflight_{0};
+  std::atomic<size_t> workpool_max_depth_{0};
+  std::atomic<size_t> dispatcher_queue_depth_{0};
   std::atomic<size_t> gpu_vram_used_{0};
   std::atomic<size_t> gpu_vram_total_{0};
   std::atomic<uint64_t> request_bytes_total_{0};
@@ -255,6 +368,28 @@ private:
         route, count);
     out += buf;
   }
+
+  static void append_stage_bucket(std::string &out, const char *stage,
+                                  const char *le, uint64_t cumulative) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "turbo_ocr_stage_duration_seconds_bucket{stage=\"%s\",le=\"%s\"} %" PRIu64 "\n",
+        stage, le, cumulative);
+    out += buf;
+  }
+
+  static void append_stage_summary(std::string &out, const char *stage,
+                                   double sum, uint64_t count) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "turbo_ocr_stage_duration_seconds_sum{stage=\"%s\"} %.6f\n",
+        stage, sum);
+    out += buf;
+    std::snprintf(buf, sizeof(buf),
+        "turbo_ocr_stage_duration_seconds_count{stage=\"%s\"} %" PRIu64 "\n",
+        stage, count);
+    out += buf;
+  }
 };
 
 /// Register the /metrics endpoint and automatic per-request recording.
@@ -266,6 +401,10 @@ inline void register_metrics_route() {
       [](const drogon::HttpRequestPtr &,
          std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 #ifndef USE_CPU_ONLY
+        // cudaMemGetInfo is process-global on a shared GPU: free/total reflect
+        // the whole device (every tenant), not this server's footprint. The
+        // exported gauges' HELP strings carry the same caveat so leak hunts
+        // aren't misled.
         size_t free_mem = 0, total_mem = 0;
         if (cudaMemGetInfo(&free_mem, &total_mem) == 0) {
           Metrics::instance().set_gpu_vram_used_bytes(total_mem - free_mem);

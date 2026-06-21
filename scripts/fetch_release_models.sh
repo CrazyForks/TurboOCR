@@ -18,21 +18,48 @@
 
 set -euo pipefail
 
+# The whole cold-start self-heal depends on this release base being reachable.
+# MODELS_RELEASE_URL is the primary (override to point at any HTTP mirror that
+# hosts the same asset names + SHA256SUMS.txt). MODELS_RELEASE_URL_FALLBACK is
+# tried per-asset when the primary download fails, so a mirror can stand in if
+# the GitHub release vanishes or rate-limits. Empty fallback = primary only.
 MODELS_RELEASE_URL="${MODELS_RELEASE_URL:-https://github.com/aiptimizer/TurboOCR/releases/download/models-v3.0.0-ppocrv6}"
+MODELS_RELEASE_URL_FALLBACK="${MODELS_RELEASE_URL_FALLBACK:-}"
 OUT="${OUT:-models}"
 
 mkdir -p "$OUT"
 echo "[fetch_release_models] base=$MODELS_RELEASE_URL  out=$OUT"
+[[ -n "$MODELS_RELEASE_URL_FALLBACK" ]] && \
+  echo "[fetch_release_models] mirror=$MODELS_RELEASE_URL_FALLBACK"
+
+# Download $1 (asset path) to $2, trying a primary base ($3, default
+# MODELS_RELEASE_URL) then an optional mirror ($4, default
+# MODELS_RELEASE_URL_FALLBACK). Hard-fails (exit 1) if neither serves it.
+fetch_asset() {
+  local asset=$1 dest=$2
+  local base="${3:-$MODELS_RELEASE_URL}" mirror="${4:-$MODELS_RELEASE_URL_FALLBACK}"
+  if wget --tries=3 --timeout=60 --retry-connrefused -nv \
+      "${base}/${asset}" -O "$dest"; then
+    return 0
+  fi
+  if [[ -n "$mirror" ]]; then
+    echo "    primary failed for $asset, trying mirror" >&2
+    if wget --tries=3 --timeout=60 --retry-connrefused -nv \
+        "${mirror}/${asset}" -O "$dest"; then
+      return 0
+    fi
+  fi
+  echo "    ERROR: could not download $asset from primary or mirror" >&2
+  return 1
+}
 
 SUMS_FILE="$OUT/SHA256SUMS.release.txt"
-wget --tries=3 --timeout=30 --retry-connrefused -nv \
-  "${MODELS_RELEASE_URL}/SHA256SUMS.txt" -O "$SUMS_FILE"
+fetch_asset "SHA256SUMS.txt" "$SUMS_FILE"
 
 fetch_verified() {
   local asset=$1 target=$2
   echo "  $asset -> $target"
-  wget --tries=3 --timeout=60 --retry-connrefused -nv \
-    "${MODELS_RELEASE_URL}/${asset}" -O "${target}.part"
+  fetch_asset "$asset" "${target}.part"
   local expected
   expected=$(awk -v a="$asset" '$2 == a {print $1}' "$SUMS_FILE")
   [[ -z "$expected" ]] && { echo "    ERROR: no SHA entry for $asset" >&2; exit 1; }
@@ -79,10 +106,11 @@ done
 # pdf-page-images variant models release, not the base bundle; sha pinned here
 # so the asset can't change under us. Recipe: scripts/export_doc_ori.py.
 DOC_ORI_RELEASE_URL="${DOC_ORI_RELEASE_URL:-https://github.com/aiptimizer/TurboOCR/releases/download/models-v2.4.0-pdf-page-images}"
+DOC_ORI_RELEASE_URL_FALLBACK="${DOC_ORI_RELEASE_URL_FALLBACK:-}"
 DOC_ORI_SHA256="96e898f047a0e460ba0652e9afb8c874e53872821cfd7a3fec53a5ab62df92f0"
 echo "  doc_ori.onnx -> $OUT/doc_ori.onnx"
-wget --tries=3 --timeout=60 --retry-connrefused -nv \
-  "${DOC_ORI_RELEASE_URL}/doc_ori.onnx" -O "$OUT/doc_ori.onnx.part"
+fetch_asset "doc_ori.onnx" "$OUT/doc_ori.onnx.part" \
+  "$DOC_ORI_RELEASE_URL" "$DOC_ORI_RELEASE_URL_FALLBACK"
 if [[ "$(sha256sum "$OUT/doc_ori.onnx.part" | awk '{print $1}')" != "$DOC_ORI_SHA256" ]]; then
   echo "    ERROR: sha256 mismatch for doc_ori.onnx" >&2
   rm -f "$OUT/doc_ori.onnx.part"

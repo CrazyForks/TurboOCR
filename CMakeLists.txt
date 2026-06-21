@@ -119,6 +119,9 @@ endif()
 option(USE_CPU_ONLY "Build CPU-only mode with ONNX Runtime" OFF)
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+# When the fetched ONNX Runtime tarball has no pinned SHA256 (the aarch64 case),
+# the build fails closed. Set this to fetch unverified anyway (CI/dev only).
+option(ALLOW_UNVERIFIED_ORT "Allow fetching ONNX Runtime without SHA256 verification" OFF)
 # Native builds have nothing in models/ (repo excludes the binaries), so
 # fetch the PP-OCRv6 bundle from the pinned GitHub Release after build.
 # Off-by-default for Docker, where fetch_release_models.sh runs as its own
@@ -256,8 +259,10 @@ if(USE_CPU_ONLY)
         include(FetchContent)
         set(ORT_VERSION "1.22.0" CACHE STRING "ONNX Runtime version to fetch")
         # SHA256 of onnxruntime-linux-<arch>-${ORT_VERSION}.tgz. The x64 hash is
-        # pinned; the aarch64 tarball has a different hash per release, so pass
-        # -DORT_SHA256=... in the aarch64 build/CI (empty = fetch without check).
+        # pinned; the aarch64 tarball has a different hash per release. We do not
+        # ship a verified default aarch64 hash, so the aarch64 build/CI must pass
+        # -DORT_SHA256=... to pin it. An empty hash is a hard error rather than a
+        # silent unverified download — set ALLOW_UNVERIFIED_ORT=ON to override.
         if(TURBO_ARCH STREQUAL "x64")
             set(ORT_SHA256 "8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3"
                 CACHE STRING "ONNX Runtime tarball SHA256")
@@ -267,7 +272,14 @@ if(USE_CPU_ONLY)
         set(_ort_url "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${TURBO_ORT_URL_ARCH}-${ORT_VERSION}.tgz")
         message(STATUS "ONNX Runtime not found; fetching v${ORT_VERSION} (${TURBO_ORT_URL_ARCH})")
         if(ORT_SHA256 STREQUAL "")
-            message(WARNING "ORT_SHA256 unset for ${TURBO_ARCH}; fetching ONNX Runtime without hash verification")
+            if(NOT ALLOW_UNVERIFIED_ORT)
+                message(FATAL_ERROR
+                    "ORT_SHA256 unset for ${TURBO_ARCH}: refusing to fetch ONNX Runtime "
+                    "without hash verification. Pin the tarball hash with -DORT_SHA256=<sha256> "
+                    "(see third_party/VERSIONS.md), or pass -DALLOW_UNVERIFIED_ORT=ON to "
+                    "explicitly accept an unverified download.")
+            endif()
+            message(WARNING "ALLOW_UNVERIFIED_ORT set; fetching ONNX Runtime for ${TURBO_ARCH} without hash verification")
             FetchContent_Declare(onnxruntime_prebuilt
                 URL "${_ort_url}"
                 SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/onnxruntime)

@@ -142,5 +142,10 @@ RUN useradd -m -s /bin/bash ocr \
 RUN bash scripts/fetch_release_models.sh \
     && chown -R ocr:ocr /app /home/ocr/.cache
 
+# nginx fronts the app on 8000; /health is GPU-free liveness.
+# start-period covers cold-start TRT engine build from ONNX (~90s).
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD curl -sf http://localhost:8000/health || exit 1
+
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
 CMD ["./build/paddle_highspeed_cpp"]

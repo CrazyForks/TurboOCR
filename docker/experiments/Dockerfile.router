@@ -6,8 +6,8 @@ FROM turboocr:pool AS builder
 
 USER root
 
-COPY docker/router_patch/router_types.h /app/include/turbo_ocr/router/router_types.h
-COPY docker/router_patch/cua_router.cpp /app/src/router/cua_router.cpp
+COPY docker/experiments/router_patch/router_types.h /app/include/turbo_ocr/router/router_types.h
+COPY docker/experiments/router_patch/cua_router.cpp /app/src/router/cua_router.cpp
 
 RUN cd /app/build && \
     cmake .. -DTENSORRT_DIR=/usr/lib/x86_64-linux-gnu -DFETCH_MODELS=OFF && \
@@ -16,7 +16,7 @@ RUN cd /app/build && \
 FROM turboocr:pool
 USER root
 COPY --from=builder /app/build/turboocr-server /app/build/turboocr-server
-COPY docker/router_patch/nginx.conf.template /app/docker/nginx.conf.template
+COPY docker/experiments/router_patch/nginx.conf.template /app/docker/nginx.conf.template
 RUN chown ocr:ocr /app/build/turboocr-server
 
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]

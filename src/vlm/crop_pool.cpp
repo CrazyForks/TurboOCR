@@ -243,7 +243,10 @@ void VLMCropPool::try_dispatch() {
             continue;
         }
 
-        auto *ctx       = new HandleCtx();
+        // Own the ctx until it is successfully handed off to curl_multi;
+        // any early-exit path below frees it deterministically and resolves
+        // the promise, so the caller's future never hangs.
+        auto ctx        = std::make_unique<HandleCtx>();
         ctx->post_body  = std::move(json_body);
         ctx->result     = std::move(req->result);
         ctx->pool       = this;
@@ -252,7 +255,6 @@ void VLMCropPool::try_dispatch() {
         if (!easy) {
             std::cerr << "[VLMCropPool] curl_easy_init() failed\n";
             try { ctx->result.set_value({}); } catch (...) {}
-            delete ctx;
             continue;
         }
         ctx->easy = easy;
@@ -272,13 +274,24 @@ void VLMCropPool::try_dispatch() {
         curl_easy_setopt(easy, CURLOPT_TIMEOUT,       (long)req->timeout_s);
         curl_easy_setopt(easy, CURLOPT_NOSIGNAL,      1L);
         curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_cb);
-        curl_easy_setopt(easy, CURLOPT_WRITEDATA,     ctx);
-        curl_easy_setopt(easy, CURLOPT_PRIVATE,       ctx);
+        curl_easy_setopt(easy, CURLOPT_WRITEDATA,     ctx.get());
+        curl_easy_setopt(easy, CURLOPT_PRIVATE,       ctx.get());
         curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
         // HTTP/1.1 keep-alive is enough for loopback.
         curl_easy_setopt(easy, CURLOPT_HTTP_VERSION,  CURL_HTTP_VERSION_1_1);
 
-        curl_multi_add_handle(multi_, easy);
+        CURLMcode mc = curl_multi_add_handle(multi_, easy);
+        if (mc != CURLM_OK) {
+            std::cerr << "[VLMCropPool] curl_multi_add_handle error: "
+                      << curl_multi_strerror(mc) << '\n';
+            try { ctx->result.set_value({}); } catch (...) {}
+            curl_slist_free_all(ctx->headers);
+            curl_easy_cleanup(easy);
+            continue;  // ctx freed by unique_ptr; in_flight_ unchanged
+        }
+        // Ownership transferred to curl (recovered in complete_handle via
+        // CURLINFO_PRIVATE, then deleted there).
+        ctx.release();
         in_flight_.fetch_add(1, std::memory_order_relaxed);
     }
 }

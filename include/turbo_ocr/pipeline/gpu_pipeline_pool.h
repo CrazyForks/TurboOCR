@@ -4,6 +4,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "turbo_ocr/pipeline/ocr_pipeline.h"
@@ -12,7 +13,39 @@
 #include "turbo_ocr/common/errors.h"
 #include "turbo_ocr/decode/nvjpeg_decoder.h"
 
+namespace turbo_ocr {
+
+// A blocking wait (e.g. dispatcher.submit().get()) exceeded its per-request
+// deadline. Mirrors PoolExhaustedError so routes/gRPC can map it to a stable
+// timeout status (504 / DEADLINE_EXCEEDED). Defined here rather than in
+// errors.h to keep the pipeline timeout surface self-contained.
+class TimeoutError : public OcrError {
+public:
+  TimeoutError() : OcrError("Inference timed out") {}
+  explicit TimeoutError(const std::string &msg) : OcrError(msg) {}
+};
+
+} // namespace turbo_ocr
+
 namespace turbo_ocr::pipeline {
+
+// Immutable recipe for (re)building one GpuPipelineEntry. Captured once at
+// pool construction so a watchdog can rebuild a wedged entry without threading
+// every model path back through the call site. All fields are owned by value
+// so the spec safely outlives the request that triggered the rebuild.
+struct PipelineBuildSpec {
+  std::string det_model;
+  std::string rec_model;
+  std::string rec_dict;
+  std::string cls_model;
+  std::string layout_model;
+  int pdf_only_batch = 0;
+  int pdf_only_page_h = 0;
+  int pdf_only_page_w = 0;
+  std::string doc_ori_model;
+  DetInferConfig det_cfg{turbo_ocr::detection::kDetResizeDefault,
+                         turbo_ocr::detection::kDbDefaults};
+};
 
 /// OcrPipeline + its dedicated CUDA stream + its own nvJPEG decoder, managed
 /// as a single poolable unit. One per dispatcher worker thread.
@@ -37,6 +70,41 @@ struct GpuPipelineEntry {
   decode::NvJpegDecoder &get_nvjpeg() {
     if (!nvjpeg) nvjpeg = std::make_unique<decode::NvJpegDecoder>();
     return *nvjpeg;
+  }
+
+  // Rebuild a wedged entry in place: tear down the old pipeline, stream, and
+  // nvJPEG handle, then construct a fresh OcrPipeline + stream from `spec` and
+  // re-warm it. Must run on the worker thread that owns this entry (so the new
+  // CUDA resources bind to that thread's primary context, like get_nvjpeg).
+  // Throws on init/load failure, leaving the entry in a torn-down (pipeline ==
+  // nullptr) state; the caller treats that as a still-dead slot. A wedged
+  // stream may refuse cudaStreamDestroy with a sticky error — that's tolerated
+  // here (the GPU context itself is poisoned by then, handled separately).
+  void recycle(const PipelineBuildSpec &spec) {
+    nvjpeg.reset();
+    pipeline.reset();
+    if (stream) {
+      cudaStreamDestroy(stream); // best effort: may fail on a poisoned context
+      stream = nullptr;
+    }
+
+    auto fresh = std::make_unique<OcrPipeline>();
+    if (!fresh->init(spec.det_model, spec.rec_model, spec.rec_dict,
+                     spec.cls_model, spec.det_cfg))
+      throw turbo_ocr::ModelLoadError("[Recycle] Failed to re-init GPU pipeline");
+    if (spec.pdf_only_batch > 0)
+      fresh->enable_pdf_only_mode(spec.pdf_only_batch, spec.pdf_only_page_h,
+                                  spec.pdf_only_page_w);
+    if (!spec.layout_model.empty() && !fresh->load_layout_model(spec.layout_model))
+      throw turbo_ocr::ModelLoadError("[Recycle] Failed to reload layout model");
+    if (!spec.doc_ori_model.empty())
+      (void)fresh->load_doc_ori_model(spec.doc_ori_model); // soft-disable on fail
+
+    cudaStream_t fresh_stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&fresh_stream, cudaStreamNonBlocking));
+    pipeline = std::move(fresh);
+    stream = fresh_stream;
+    pipeline->warmup_gpu(stream);
   }
 
   GpuPipelineEntry(GpuPipelineEntry &&o) noexcept

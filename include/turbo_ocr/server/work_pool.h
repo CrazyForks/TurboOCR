@@ -98,6 +98,23 @@ public:
     cv_.notify_one();
   }
 
+  /// Saturation snapshot for /metrics. Both reads take the same mutex as
+  /// submit()/the worker loop so the values are consistent (no torn reads of
+  /// inflight_/queue_, which are guarded by mutex_, not atomic).
+  [[nodiscard]] size_t queue_depth() const {
+    std::lock_guard lock(mutex_);
+    return queue_.size();
+  }
+
+  [[nodiscard]] size_t inflight() const {
+    std::lock_guard lock(mutex_);
+    return inflight_;
+  }
+
+  /// Configured ceiling for queue_depth() (the point at which submit()
+  /// rejects with PoolExhaustedError).
+  [[nodiscard]] size_t max_depth() const { return max_depth_; }
+
   /// Block until queue is empty and no task is in flight, OR timeout
   /// elapses. Returns true on full drain, false on timeout. Used by the
   /// graceful-shutdown path: caller stops admitting new work first, then
@@ -112,7 +129,7 @@ public:
 private:
   std::vector<std::thread> workers_;
   std::queue<std::function<void()>> queue_;
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::condition_variable drain_cv_;
   bool stop_{false};        // guarded by mutex_

@@ -11,6 +11,8 @@ endif()
 
 project(turbo_ocr VERSION 1.0.0 LANGUAGES CXX)
 
+enable_testing()
+
 # /opt/cuda ships its own protobuf cmake config. When gRPC's
 # find_dependency(Protobuf) resolves to it instead of the system install, its
 # protobuf-targets.cmake tries to redefine targets the system FindProtobuf
@@ -40,12 +42,24 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Per-target optimization flags (applied below instead of global CMAKE_CXX_FLAGS)
-option(NATIVE_ARCH "Use -march=native (faster but not portable)" ON)
+#
+# Default OFF: -march=native tunes to the BUILD host CPU, so an image built on a
+# host with newer ISA (e.g. AVX-512) SIGILLs on an older deploy CPU. Off ships a
+# portable baseline — x86-64-v3 still guarantees AVX2/FMA, so the hand-written
+# AVX2 in ctc_decode.cpp stays valid. Turn ON only when build host == deploy host.
+option(NATIVE_ARCH "Use -march=native (fastest, but only when build host CPU == deploy host CPU)" OFF)
 if(NATIVE_ARCH)
-  set(TURBO_OCR_CXX_FLAGS -O3 -march=native -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+  set(_turbo_arch_flag -march=native)
 else()
-  set(TURBO_OCR_CXX_FLAGS -O3 -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+  string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _turbo_baseline_proc)
+  if(_turbo_baseline_proc MATCHES "aarch64|arm64")
+    set(_turbo_arch_flag -march=armv8.2-a)
+  else()
+    set(_turbo_arch_flag -march=x86-64-v3)
+  endif()
 endif()
+set(TURBO_OCR_CXX_FLAGS -O3 ${_turbo_arch_flag} -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+message(STATUS "Turbo OCR arch flags: ${_turbo_arch_flag} (NATIVE_ARCH=${NATIVE_ARCH})")
 
 # --- Target architecture detection (x86_64 / aarch64) ----------------------
 # The binaries vendored in third_party/ (ONNX Runtime, PDFium) and bin/
@@ -211,6 +225,12 @@ target_include_directories(turbo_ocr_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/cli11
 )
 target_compile_options(turbo_ocr_tests PRIVATE ${TURBO_OCR_CXX_FLAGS})
+
+# Register with CTest so `ctest` (and run_all.py --suite cpp) actually runs the
+# suite. Without this, ctest finds no tests and exits 0 — green while testing
+# nothing. Catch2's amalgamated runner returns non-zero on any failure, so a
+# single add_test gates correctly. `ctest --no-tests=error` guards an empty suite.
+add_test(NAME turbo_ocr_unit COMMAND turbo_ocr_tests)
 
 if(USE_CPU_ONLY)
     message(STATUS "Building CPU-ONLY mode (ONNX Runtime backend)")

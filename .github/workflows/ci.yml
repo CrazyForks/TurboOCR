@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # CPU build + the C++ unit suite. GitHub runners have no GPU, so the GPU
+  # build (TRT/CUDA) cannot run here — this gate covers the portable CPU path
+  # and every CPU-testable unit (det postprocess, CTC, server config, dict/lang
+  # resolution, doc-assembly, etc.). Until this exists the suite never ran.
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build libopencv-dev
+      - name: Configure (portable baseline, no native arch)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNATIVE_ARCH=OFF
+      - name: Build unit tests
+        run: cmake --build build --target turbo_ocr_tests -j"$(nproc)"
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+  # CPU server smoke: boot paddle_cpu_server and curl the endpoint matrix.
+  # Requires the model bundle, so it is gated on MODELS_RELEASE_URL being set
+  # (the canonical models GitHub release). Skipped cleanly when unset so forks
+  # without release access still get the build-and-test gate.
+  cpu-smoke:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: ${{ vars.MODELS_RELEASE_URL != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build + runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build libopencv-dev curl python3
+      - name: Fetch models
+        env:
+          MODELS_RELEASE_URL: ${{ vars.MODELS_RELEASE_URL }}
+        run: bash scripts/fetch_release_models.sh
+      - name: Build CPU server
+        run: |
+          cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DNATIVE_ARCH=OFF -DUSE_CPU_ONLY=ON
+          cmake --build build-cpu --target paddle_cpu_server -j"$(nproc)"
+      - name: Endpoint matrix smoke test
+        run: |
+          HTTP_PORT=18080 GRPC_PORT=18051 HOST=127.0.0.1 OCR_MODEL=tiny \
+            ./build-cpu/paddle_cpu_server &
+          SERVER_PID=$!
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:18080/health && break || sleep 1
+          done
+          python3 tests/docker_endpoint_matrix.py --base-url http://127.0.0.1:18080
+          kill "$SERVER_PID" 2>/dev/null || true
+
+  # Static analysis: clang-tidy on app code (cert-/bugprone- are the signal;
+  # the .clang-tidy HeaderFilterRegex already scopes headers). Report-only for
+  # now — flip to a hard gate once the existing findings are triaged.
+  static-analysis:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build libopencv-dev clang-tidy cppcheck
+      - name: Configure (for compile_commands.json)
+        run: cmake -S . -B build -G Ninja -DNATIVE_ARCH=OFF
+      - name: cppcheck (dead code + quality, excluding third_party)
+        run: |
+          cppcheck --enable=all --inconclusive --std=c++20 \
+            --suppress=missingIncludeSystem --suppress=missingInclude \
+            -i third_party -I include src include 2>cppcheck.txt || true
+          echo "::group::cppcheck summary"; grep -E "\(error\)|unusedFunction" cppcheck.txt || echo "no error-severity / dead-code findings"; echo "::endgroup::"
+      - name: Docker (CPU) image builds
+        run: docker build -f docker/Dockerfile.cpu -t turboocr-cpu:ci . || true

@@ -19,8 +19,8 @@ enum class ModelFamily { V6, V5Lang };
 // model's detector (resize policy + DB post-processing). Env vars still override
 // each field at read time (read_det_resize/read_db_params).
 struct DetInferConfig {
-  DetResizeParams resize;
-  DbParams db;
+  DetResizeParams resize{};
+  DbParams db{};
 };
 
 // Official PaddleOCR det config for the PP-OCRv6 tiers whose box_thresh is 0.45
@@ -48,8 +48,8 @@ struct ModelEntry {
   std::string_view rec_path;
   std::string_view dict_path;
   std::string_view det_path;  // empty => kDefaultDet
-  ModelFamily family;
-  DetInferConfig det_cfg;
+  ModelFamily family = ModelFamily::V6;
+  DetInferConfig det_cfg{};
 };
 
 inline constexpr std::string_view kDefaultDet = "models/det.onnx";

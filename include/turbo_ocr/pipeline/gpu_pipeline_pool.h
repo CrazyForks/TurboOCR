@@ -48,20 +48,33 @@ inline void maybe_load_router_models(OcrPipeline &pipeline) {
     const char *v = std::getenv(k);
     return std::string(v ? v : "");
   };
-  const std::string table_struct_onnx = env("TABLE_STRUCT_ONNX");
-  const bool want_router = std::getenv("FORMULA_BACKEND") != nullptr ||
+  const bool want_router = std::getenv("TURBO_ROUTING_CONFIG") != nullptr ||
+                           std::getenv("FORMULA_BACKEND") != nullptr ||
                            !env("FORMULA_ONNX").empty() ||
+                           std::getenv("TABLE_BACKEND") != nullptr ||
                            !env("TABLE_CLS_TRT").empty() ||
-                           !table_struct_onnx.empty();
+                           !env("TABLE_STRUCT_ONNX").empty() ||
+                           !env("TABLE_SLANEXT_ENCODER_ONNX").empty() ||
+                           !env("VLLM_TABLE_BASE_URL").empty();
   if (!want_router) return;
-  (void)pipeline.load_router_models(
-      env("TABLE_CLS_TRT"), env("TABLE_CELL_WIRED_TRT"),
-      env("TABLE_CELL_WIRELESS_TRT"), env("TABLE_SLANEXT_WIRED_TRT"),
-      env("TABLE_SLANEXT_WIRELESS_TRT"), env("FORMULA_ONNX"),
-      env("FORMULA_TOKENIZER"));
-  // Single-pass Nemotron table-structure backend (TRT FP16), built from ONNX.
-  if (!table_struct_onnx.empty())
-    (void)pipeline.load_table_struct_model(table_struct_onnx);
+  // Router (CuaRouter) + formula stage (+ legacy cell-det TableStage). A
+  // CONFIGURED backend that fails to load (out-of-memory / bad model) ABORTS
+  // boot — we never start a server that silently produces no formulas/tables.
+  if (!pipeline.load_router_models(
+          env("TABLE_CLS_TRT"), env("TABLE_CELL_WIRED_TRT"),
+          env("TABLE_CELL_WIRELESS_TRT"), env("TABLE_SLANEXT_WIRED_TRT"),
+          env("TABLE_SLANEXT_WIRELESS_TRT"), env("FORMULA_ONNX"),
+          env("FORMULA_TOKENIZER")))
+    throw turbo_ocr::ModelLoadError(
+        "configured formula backend failed to load (out-of-memory or bad model); "
+        "refusing to start with formulas silently disabled — lower "
+        "PIPELINE_POOL_SIZE, fix FORMULA_ONNX, or free VRAM");
+  // Pluggable table backend (TABLE_BACKEND -> slanext|vlm; inferred from env).
+  if (!pipeline.load_table_backend())
+    throw turbo_ocr::ModelLoadError(
+        "configured table backend failed to load (out-of-memory or bad model); "
+        "refusing to start with tables silently disabled — lower "
+        "PIPELINE_POOL_SIZE, fix the table model, or free VRAM");
 }
 
 /// OcrPipeline + its dedicated CUDA stream + its own nvJPEG decoder, managed

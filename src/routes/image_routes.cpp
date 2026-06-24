@@ -8,8 +8,11 @@
 #include <json/json.h>
 
 #include <format>
+#include <optional>
 
+#include "turbo_ocr/common/backend_error.h"
 #include "turbo_ocr/common/errors.h"
+#include "turbo_ocr/routing/routing_config.h"
 #include "turbo_ocr/common/logger.h"
 #include "turbo_ocr/common/serialization.h"
 #include "turbo_ocr/decode/image_dims.h"
@@ -18,10 +21,6 @@
 #include "turbo_ocr/server/env_utils.h"
 #include "turbo_ocr/server/error_codes.h"
 
-using turbo_ocr::OCRResultItem;
-using turbo_ocr::base64_decode;
-using turbo_ocr::results_to_json;
-using turbo_ocr::emit_results_json;
 using turbo_ocr::decode::NvJpegDecoder;
 
 namespace turbo_ocr::routes {
@@ -81,9 +80,17 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
                                  const server::ImageDecoder &decode,
                                  bool nvjpeg_available,
                                  bool layout_available) {
+  // Per-request routing override (Tier-A) validation set: computed ONCE from
+  // the same routing config the pipeline loaded, so route-layer validation and
+  // the pipeline's recognizer registry never drift (both via
+  // routing::routable_backend_names). Captured by value into the handler.
+  const auto rtbl = routing::load_routing_config();
+  const std::set<std::string> valid_table   = routing::routable_backend_names(rtbl, "table");
+  const std::set<std::string> valid_formula = routing::routable_backend_names(rtbl, "formula");
   drogon::app().registerHandler(
       "/ocr/raw",
-      [&pool, &dispatcher, &decode, nvjpeg_available, layout_available](
+      [&pool, &dispatcher, &decode, nvjpeg_available, layout_available,
+       valid_table, valid_formula](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
@@ -99,8 +106,19 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
                                        r.error_code.c_str(), r.error));
       return;
     }
+    // Tier-A: ?route_table=NAME&route_formula=NAME — validate against the
+    // registered backend names; unknown => 400. Empty => route default.
+    if (auto r = server::validate_routing_override(
+            req->getParameter("route_table"), req->getParameter("route_formula"),
+            valid_table, valid_formula, &opts.routing_override);
+        !r.error.empty()) {
+      callback(server::error_response(drogon::k400BadRequest,
+                                       r.error_code.c_str(), r.error));
+      return;
+    }
     if (reject_unknown_query_params(
-            req, {"layout", "reading_order", "as_blocks"}, callback))
+            req, {"layout", "reading_order", "as_blocks",
+                  "route_table", "route_formula"}, callback))
       return;
 
     server::submit_work(pool, std::move(callback),
@@ -151,10 +169,18 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
               if (nvjpeg.decode_to_gpu(data, len, d_buf, pitch, w, h, e.stream)) {
                 turbo_ocr::GpuImage gpu_img{.data = d_buf, .step = pitch, .rows = h, .cols = w};
                 try {
+                  // defer_external=true: remote formula/table crops are
+                  // submitted non-blocking here (GPU worker), awaited later in
+                  // finalize_deferred() off the worker. Local backends ignore it.
                   return e.pipeline->run_with_layout(gpu_img, e.stream,
                                                      opts.want_layout,
-                                                     opts.want_reading_order);
-                } catch (const std::exception &) {}
+                                                     opts.want_reading_order,
+                                                     opts.routing_override,
+                                                     /*defer_external=*/true);
+                } catch (const std::exception &) {
+                  // GPU fast path failed (e.g. layout/pipeline error); fall
+                  // through to the CPU decode + standard path below.
+                }
               }
             }
             cv::Mat img = nvjpeg.decode(data, len);
@@ -177,12 +203,17 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
                   img.cols, img.rows, kMaxImageDim, kMaxImageDim));
             return e.pipeline->run_with_layout(img, e.stream,
                                                opts.want_layout,
-                                               opts.want_reading_order);
+                                               opts.want_reading_order,
+                                               opts.routing_override,
+                                               /*defer_external=*/true);
           });
           } catch (const turbo_ocr::TimeoutError &) {
             cb(timeout_response());
             return;
           }
+          // Await + assemble any deferred VLM crops OFF the GPU worker (here on
+          // the work-pool thread). No-op when nothing was deferred.
+          pipeline::finalize_deferred(out);
           cb(server::json_response(emit_pipeline_result_json(out, opts.want_blocks)));
           return;
         }
@@ -206,12 +237,15 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
           out = dispatcher.submit_for_default([img, opts](auto &e) {
             return e.pipeline->run_with_layout(img, e.stream,
                                                 opts.want_layout,
-                                                opts.want_reading_order);
+                                                opts.want_reading_order,
+                                                opts.routing_override,
+                                                /*defer_external=*/true);
           });
         } catch (const turbo_ocr::TimeoutError &) {
           cb(timeout_response());
           return;
         }
+        pipeline::finalize_deferred(out);
         cb(server::json_response(emit_pipeline_result_json(out, opts.want_blocks)));
       });
     });
@@ -700,6 +734,137 @@ void register_ocr_pixels_route_gpu(server::WorkPool &pool,
   }, {drogon::Post});
 }
 
+// --- POST /infer (Tier-B): run ONE crop through a chosen backend ----------
+// Body JSON: { "image": "<base64>", "modality": "table"|"formula",
+//              "backend": "<registry-name>"  |  { inline BackendSpec } }
+// Inline kind:openai (operator-supplied base_url => SSRF surface) is REJECTED
+// unless TURBO_ALLOW_ADHOC_BACKENDS=1. Additive: touches no existing route.
+void register_infer_route_gpu(server::WorkPool &pool,
+                              pipeline::PipelineDispatcher &dispatcher,
+                              const server::ImageDecoder &decode) {
+  const auto rtbl = routing::load_routing_config();
+  const std::set<std::string> valid_table   = routing::routable_backend_names(rtbl, "table");
+  const std::set<std::string> valid_formula = routing::routable_backend_names(rtbl, "formula");
+  drogon::app().registerHandler(
+      "/infer",
+      [&pool, &dispatcher, &decode, valid_table, valid_formula](
+          const drogon::HttpRequestPtr &req,
+          std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
+        auto json = req->getJsonObject();
+        if (!json) {
+          callback(server::error_response(drogon::k400BadRequest, "INVALID_JSON", "Invalid JSON body"));
+          return;
+        }
+        if (!json->isMember("image") || !(*json)["image"].isString() ||
+            (*json)["image"].asString().empty()) {
+          callback(server::error_response(drogon::k400BadRequest, "MISSING_IMAGE", "Missing 'image' (base64)"));
+          return;
+        }
+        if (json->isMember("modality") && !(*json)["modality"].isString()) {
+          callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+              "'modality' must be a string ('table' or 'formula')"));
+          return;
+        }
+        const std::string modality =
+            json->isMember("modality") ? (*json)["modality"].asString() : "";
+        if (modality != "table" && modality != "formula") {
+          callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+              "'modality' must be 'table' or 'formula'"));
+          return;
+        }
+        if (!json->isMember("backend")) {
+          callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+              "Missing 'backend' (a registered backend name or an inline spec object)"));
+          return;
+        }
+
+        // Resolve backend: named (registry) or inline spec.
+        std::string backend_name;
+        std::optional<routing::BackendSpec> inline_spec;
+        const auto &be = (*json)["backend"];
+        const auto &valid = (modality == "table") ? valid_table : valid_formula;
+        if (be.isString()) {
+          backend_name = be.asString();
+          if (valid.find(backend_name) == valid.end()) {
+            callback(server::error_response(drogon::k400BadRequest, "ROUTING_UNKNOWN_OVERRIDE",
+                std::format("backend '{}' is not a configured {} backend (see /capabilities)",
+                            backend_name, modality)));
+            return;
+          }
+        } else if (be.isObject()) {
+          // SSRF gate: an inline openai endpoint lets the caller name an
+          // arbitrary base_url. Off by default; the operator opts in per-deploy.
+          if (be.isMember("kind") && be["kind"].isString() &&
+              be["kind"].asString() == "openai" &&
+              !server::env_enabled("TURBO_ALLOW_ADHOC_BACKENDS")) {
+            callback(server::error_response(drogon::k403Forbidden, "ADHOC_BACKENDS_DISABLED",
+                "inline kind:openai backends are disabled; set TURBO_ALLOW_ADHOC_BACKENDS=1 "
+                "to allow operator-supplied endpoint URLs (SSRF surface)"));
+            return;
+          }
+          Json::StreamWriterBuilder w;
+          w["indentation"] = "";
+          const std::string spec_text = Json::writeString(w, be);
+          try {
+            inline_spec = routing::parse_inline_backend(modality, spec_text);
+          } catch (const routing::RoutingConfigError &e) {
+            // .what() begins with the ROUTING_* code; surface it verbatim.
+            std::string msg = e.what();
+            std::string code = "ROUTING_BAD_KIND";
+            if (auto c = msg.find(':'); c != std::string::npos) code = msg.substr(0, c);
+            callback(server::error_response(drogon::k400BadRequest, code.c_str(), msg));
+            return;
+          }
+        } else {
+          callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+              "'backend' must be a string (name) or an object (inline spec)"));
+          return;
+        }
+
+        auto b64 = std::make_shared<std::string>((*json)["image"].asString());
+        server::submit_work(pool, std::move(callback),
+            [b64, &dispatcher, &decode, modality, backend_name, inline_spec](
+                server::DrogonCallback &cb) {
+          server::run_with_error_handling(cb, "/infer", [&] {
+            std::string bytes = turbo_ocr::base64_decode(*b64);
+            if (bytes.empty()) {
+              cb(server::error_response(drogon::k400BadRequest, "BASE64_DECODE_FAILED", "Failed to decode base64"));
+              return;
+            }
+            cv::Mat img = decode(reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size());
+            if (img.empty()) {
+              cb(server::error_response(drogon::k400BadRequest, "IMAGE_DECODE_FAILED", "Failed to decode image"));
+              return;
+            }
+            std::string result;
+            try {
+              // Capture inline_spec by value into the GPU task; pass its address
+              // (the worker builds the transient recognizer in its own context).
+              result = dispatcher.submit_for_default(
+                  [img, modality, backend_name, inline_spec](auto &e) {
+                    return e.pipeline->infer_one(
+                        img, e.stream, modality, backend_name,
+                        inline_spec ? &*inline_spec : nullptr);
+                  });
+            } catch (const turbo_ocr::TimeoutError &) {
+              cb(timeout_response());
+              return;
+            } catch (const turbo_ocr::BackendUnavailableError &e) {
+              cb(server::error_response(drogon::k503ServiceUnavailable,
+                                        "BACKEND_UNAVAILABLE", e.what()));
+              return;
+            }
+            const char *key = (modality == "table") ? "html" : "latex";
+            std::string body = "{\"modality\":\"" + modality + "\",\"" + key + "\":\"";
+            turbo_ocr::detail::append_escaped_string(body, result);
+            body += "\"}";
+            cb(server::json_response(body));
+          });
+        });
+      },
+      {drogon::Post});
+}
+
 } // namespace
 
 void register_image_routes(server::WorkPool &pool,
@@ -712,6 +877,7 @@ void register_image_routes(server::WorkPool &pool,
   register_ocr_batch_route_gpu(pool, dispatcher, decode, nvjpeg_available, layout_available,
                                max_batch_images);
   register_ocr_pixels_route_gpu(pool, dispatcher, layout_available);
+  register_infer_route_gpu(pool, dispatcher, decode);
 }
 
 } // namespace turbo_ocr::routes

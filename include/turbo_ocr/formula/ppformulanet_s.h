@@ -41,9 +41,11 @@ public:
   run(const GpuImage &page, const std::vector<Box> &boxes,
       cudaStream_t stream) override;
 
-  [[nodiscard]] bool is_ready() const noexcept override {
-    return sidecar_pid_ > 0 && sock_path_.size() > 0;
-  }
+  // Liveness reflects the process-GLOBAL shared sidecar (g_sidecar_pid),
+  // not this instance's local copy: when the shared child dies, ALL
+  // instances must report not-ready, not only the one that hit the failure.
+  // Defined out-of-line so it can probe the global state under g_sidecar_mu.
+  [[nodiscard]] bool is_ready() const noexcept override;
   [[nodiscard]] std::string_view backend_name() const noexcept override {
     return "ppformulanet_s";
   }
@@ -56,10 +58,16 @@ private:
                 const std::vector<int> &widths,
                 const std::vector<int> &heights,
                 std::vector<std::string> &out_latex);
+  // Reap the shared sidecar if it has exited and, if so, clear the GLOBAL
+  // pid/sock state so is_ready() reports false for every instance. Also
+  // drops this instance's local copy. Acquires g_sidecar_mu internally;
+  // call only while holding rpc_mu_ (RPC failure path) to keep lock order
+  // rpc_mu_ -> g_sidecar_mu.
+  void reap_if_dead();
 
   std::string sock_path_;
   pid_t       sidecar_pid_ = -1;
-  std::mutex  rpc_mu_;
+  std::mutex rpc_mu_;
   // Host page buffer (grow-only) for the per-call D2H copy of `page`.
   std::vector<uint8_t> host_page_;
 };

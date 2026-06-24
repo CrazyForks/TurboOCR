@@ -41,7 +41,7 @@ using turbo_ocr::render::PdfRenderer;
 
 namespace bootstrap = turbo_ocr::server::bootstrap;
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv) try {
   const auto cfg = turbo_ocr::server::ServerConfig::load_or_die(argc, argv);
   cfg.log_effective();
   bootstrap::g_shutdown_grace_seconds.store(cfg.shutdown_grace_seconds,
@@ -267,10 +267,11 @@ int main(int argc, char **argv) {
     // run_with_error_handling maps it to HTTP 504 (INFERENCE_TIMEOUT).
     const bool want_layout = opts.want_layout;
     const bool want_reading_order = opts.want_reading_order;
+    const auto routing_override = opts.routing_override;  // by-value (timeout-safe)
     auto out = dispatcher->submit_for_default(
-        [img, want_layout, want_reading_order](auto &e) {
+        [img, want_layout, want_reading_order, routing_override](auto &e) {
           return e.pipeline->run_with_layout(img, e.stream, want_layout,
-                                             want_reading_order);
+                                             want_reading_order, routing_override);
         });
     return turbo_ocr::server::InferResult{
         .results       = std::move(out.results),
@@ -391,6 +392,10 @@ int main(int argc, char **argv) {
   // gRPC
   auto grpc_handle = turbo_ocr::server::start_grpc_server(
       *dispatcher, cfg, &pdf_renderer, layout_available, readiness_cached);
+  // Published for the signal-handler drain thread. Not dangling: grpc_handle
+  // owns the server on main()'s stack and is destroyed only after run() returns
+  // (i.e. after the drain has driven app().quit()). See server_bootstrap.h.
+  // cppcheck-suppress danglingLifetime
   bootstrap::g_grpc_server_for_drain = grpc_handle.server.get();
 
   // HTTP (Drogon) — behind nginx (port 8000), direct access on 8080
@@ -438,4 +443,13 @@ int main(int argc, char **argv) {
   readiness_refresher.join();
   bootstrap::shutdown_grpc_after_run(grpc_handle.server.get());
   return 0;
+} catch (const std::exception &e) {
+  // Function-try-block on main(): any exception escaping startup (config,
+  // engine build, CUDA/TRT init, listener bind) becomes a clean non-zero exit
+  // with a logged reason instead of std::terminate + a useless core dump.
+  TOCR_LOG_ERROR("Fatal error during startup", "error", std::string_view(e.what()));
+  return 1;
+} catch (...) {
+  TOCR_LOG_ERROR("Fatal error during startup: unknown exception");
+  return 1;
 }

@@ -72,10 +72,10 @@ enum class GrpcStatusValue : int {
 };
 
 struct ErrorCodeEntry {
-  ErrorCode      code;
+  ErrorCode      code = ErrorCode::kInferenceError;
   std::string_view name;   // wire string ("MISSING_IMAGE", …)
-  int            http_status;     // HTTP status code (e.g. 400, 503, 504)
-  GrpcStatusValue grpc_status;
+  int            http_status = 500;   // HTTP status code (e.g. 400, 503, 504)
+  GrpcStatusValue grpc_status = GrpcStatusValue::kInternal;
 };
 
 // One row per ErrorCode, declaration order matching the enum so an index lookup

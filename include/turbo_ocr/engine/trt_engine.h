@@ -114,9 +114,10 @@ private:
   void destroy_graphs() noexcept;
 
   std::string model_path_;
-  Logger logger_;
-  std::unique_ptr<nvinfer1::IRuntime> runtime_;
-  std::unique_ptr<nvinfer1::ICudaEngine> engine_;
+  // Shared, process-global engine (deserialized once per .trt path via the
+  // engine cache). The shared_ptr keeps the engine alive for as long as this
+  // instance — and its per-instance contexts/baked graphs — exist.
+  std::shared_ptr<nvinfer1::ICudaEngine> engine_;
 
   std::vector<BakedGraph> baked_;
 

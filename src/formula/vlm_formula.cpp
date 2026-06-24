@@ -446,6 +446,40 @@ VLMFormula::submit_async(const std::vector<uint8_t> &host_page,
 }
 
 // ---------------------------------------------------------------------------
+// IFormulaRecognizer async decouple — D2H on the GPU worker, then non-blocking
+// submit. The expensive HTTP await happens later, off the GPU worker, when the
+// caller resolves the futures + calls parse_async_result.
+// ---------------------------------------------------------------------------
+
+bool VLMFormula::supports_async() const noexcept {
+  return ready_ && use_pool_backend();
+}
+
+std::vector<std::future<std::string>>
+VLMFormula::submit_async(const GpuImage &page, const std::vector<Box> &boxes,
+                         cudaStream_t stream) {
+  std::vector<std::future<std::string>> futs;
+  if (boxes.empty() || page.empty() || !ready_) return futs;
+
+  // D2H the page once (same as run()); the PNG-encode + pool submit then
+  // reference only this host copy + pool-owned bytes — gpu_img can be freed
+  // by the caller immediately after this returns.
+  const size_t need = static_cast<size_t>(page.rows) * page.step;
+  std::vector<uint8_t> host_page(need);
+  if (cudaSuccess != cudaMemcpyAsync(host_page.data(), page.data, need,
+                                     cudaMemcpyDeviceToHost, stream)) {
+    std::cerr << "[VLMFormula] async page D2H failed\n";
+    return futs;
+  }
+  cudaStreamSynchronize(stream);
+  return submit_async(host_page, page, boxes);
+}
+
+std::string VLMFormula::parse_async_result(const std::string &raw) const {
+  return extract_latex(raw);
+}
+
+// ---------------------------------------------------------------------------
 // run() — legacy backend (original code, no call_mu_ on outer scope)
 // ---------------------------------------------------------------------------
 
@@ -471,7 +505,7 @@ VLMFormula::run_legacy(const std::vector<uint8_t> &host_page,
   }
 
   struct Job {
-    size_t off;
+    size_t off = 0;
     std::vector<std::vector<uint8_t>> chunk;
     std::vector<std::string> results;
   };

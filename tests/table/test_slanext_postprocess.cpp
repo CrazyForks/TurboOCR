@@ -93,5 +93,7 @@ TEST_CASE("structure score is mean of kept tokens", "[slanext_postprocess]") {
     auto r = decode_structure(probs.data(), loc.data(), 4, v, dict, 488, 488,
                               244, 244);
     REQUIRE(std::fabs(r.structure_score - 0.7f) < 1e-5f);
-    REQUIRE(r.cells.size() == 2);
+    // Both quads are all-zero (blank); RapidAI filter_blank_bbox drops them,
+    // while the structure tokens still count toward the score.
+    REQUIRE(r.cells.empty());
 }

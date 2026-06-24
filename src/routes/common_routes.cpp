@@ -2,6 +2,7 @@
 #include "turbo_ocr/decode/image_config.h"
 #include "turbo_ocr/decode/image_dims.h"
 #include "turbo_ocr/server/env_utils.h"
+#include "turbo_ocr/routing/routing_config.h"
 
 #include <drogon/HttpAppFramework.h>
 #include <json/json.h>
@@ -114,7 +115,35 @@ void register_capabilities_route(const CapabilitiesInfo &info) {
           R"("/metrics","/capabilities","/ocr","/ocr/raw","/ocr/batch",)"
           R"("/ocr/pixels","/ocr/pdf")";
   if (info.profile_endpoint) body += R"(,"/profile")";
-  body += "]}";
+  body += "]";
+
+  // Resolved routing table for operator introspection. NAMES + kinds only —
+  // never base_url/api_key/model: secrets must not serialize (verify audit).
+  // Read-only; load_routing_config() already succeeded at pipeline load by the
+  // time this registers, but guard anyway so a bad config can't crash startup.
+  body += R"(,"routing":)";
+  try {
+    const auto tbl = routing::load_routing_config();
+    body += R"({"routes":{)";
+    bool first = true;
+    for (const auto &kv : tbl.routes) {
+      if (!first) body += ",";
+      first = false;
+      body += "\"" + kv.first + "\":\"" + kv.second + "\"";
+    }
+    body += R"(},"backends":{)";
+    first = true;
+    for (const auto &kv : tbl.backends) {
+      if (!first) body += ",";
+      first = false;
+      body += "\"" + kv.first + R"(":{"kind":")" +
+              std::string(routing::kind_name(kv.second.kind)) + "\"}";
+    }
+    body += "}}";
+  } catch (const std::exception &) {
+    body += R"({"error":"invalid"})";
+  }
+  body += "}";
 
   auto shared = std::make_shared<std::string>(std::move(body));
   drogon::app().registerHandler(
@@ -171,9 +200,14 @@ void register_ocr_base64_route(server::WorkPool &pool,
                                 const server::InferFunc &infer,
                                 const server::ImageDecoder &decode,
                                 bool layout_available) {
+  // Tier-A override validation set (see register_ocr_raw_route_gpu); computed
+  // once from the same routing config the pipeline loaded.
+  const auto rtbl = routing::load_routing_config();
+  const std::set<std::string> valid_table   = routing::routable_backend_names(rtbl, "table");
+  const std::set<std::string> valid_formula = routing::routable_backend_names(rtbl, "formula");
   drogon::app().registerHandler(
       "/ocr",
-      [&pool, &infer, &decode, layout_available](
+      [&pool, &infer, &decode, layout_available, valid_table, valid_formula](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
@@ -197,6 +231,23 @@ void register_ocr_base64_route(server::WorkPool &pool,
             || (*json)["image"].asString().empty()) {
           callback(server::error_response(drogon::k400BadRequest, "MISSING_IMAGE", "Empty or missing image field"));
           return;
+        }
+        // Tier-A: optional JSON `routing:{table,formula}` (backend NAMEs).
+        // Validated against the registered backends; unknown => 400.
+        {
+          std::string rt, rf;
+          if (json->isMember("routing") && (*json)["routing"].isObject()) {
+            const auto &ro = (*json)["routing"];
+            if (ro.isMember("table") && ro["table"].isString())   rt = ro["table"].asString();
+            if (ro.isMember("formula") && ro["formula"].isString()) rf = ro["formula"].asString();
+          }
+          if (auto r = server::validate_routing_override(
+                  rt, rf, valid_table, valid_formula, &opts.routing_override);
+              !r.error.empty()) {
+            callback(server::error_response(drogon::k400BadRequest,
+                                             r.error_code.c_str(), r.error));
+            return;
+          }
         }
 
         auto b64_str = std::make_shared<std::string>((*json)["image"].asString());

@@ -54,6 +54,16 @@ public:
                const GpuImage &page,
                const std::vector<Box> &boxes);
 
+  // IFormulaRecognizer async decouple: D2H the page on `stream` then delegate
+  // to the host_page submit_async above. supports_async() is true only on the
+  // pool backend (the legacy per-page HTTP path can't be decoupled cleanly).
+  [[nodiscard]] bool supports_async() const noexcept override;
+  [[nodiscard]] std::vector<std::future<std::string>>
+  submit_async(const GpuImage &page, const std::vector<Box> &boxes,
+               cudaStream_t stream) override;
+  [[nodiscard]] std::string
+  parse_async_result(const std::string &raw) const override;
+
   [[nodiscard]] bool is_ready() const noexcept override { return ready_; }
   [[nodiscard]] std::string_view backend_name() const noexcept override {
     return "vlm";

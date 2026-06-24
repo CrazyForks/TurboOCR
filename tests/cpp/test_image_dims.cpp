@@ -11,7 +11,6 @@
 #include <cstring>
 #include <vector>
 
-using turbo_ocr::decode::ImageDims;
 using turbo_ocr::decode::peek_image_dimensions;
 using turbo_ocr::decode::peek_jpeg_dims;
 using turbo_ocr::decode::peek_png_dims;

@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -55,6 +56,7 @@ static std::string require_cached(const std::string &onnx, const char *type) {
 }
 
 int main(int argc, char **argv) {
+  try {
   int iters = (argc > 1) ? std::atoi(argv[1]) : 200;
 
   const int B = turbo_ocr::server::env_int("TURBO_OCR_PDF_BATCH",  8,    1,  8);
@@ -153,4 +155,8 @@ int main(int argc, char **argv) {
 
   cudaStreamDestroy(stream);
   return 0;
+  } catch (const std::exception &e) {
+    std::cerr << "[bench] fatal: " << e.what() << '\n';
+    return 1;
+  }
 }

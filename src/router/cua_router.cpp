@@ -290,9 +290,15 @@ void resolve_tie_breakers(
                                 static_cast<float>(ab);
       const float frac_a_in_b = static_cast<float>(inter) /
                                 static_cast<float>(aa);
+      // A table is SUPPOSED to enclose cells/text/captions, so the containment
+      // rule must never demote it — otherwise large tables that contain other
+      // layout regions get dropped to Text and never reach the table
+      // recognizer (class 21 == table).
+      constexpr int kTableClassId = 21;
       if (frac_b_in_a >= 0.80f && aa > ab) {
-        // B contained in A → demote A.
-        if (decisions[i].dest != Destination::Text) {
+        // B contained in A → demote A (unless A is a table).
+        if (decisions[i].dest != Destination::Text &&
+            layout[i].class_id != kTableClassId) {
           decisions[i].dest = Destination::Text;
           decisions[i].wrap = FormulaWrap::None;
           decisions[i].reason = RouterReason::ContainmentLoser;
@@ -300,7 +306,8 @@ void resolve_tie_breakers(
         continue;
       }
       if (frac_a_in_b >= 0.80f && ab > aa) {
-        if (decisions[j].dest != Destination::Text) {
+        if (decisions[j].dest != Destination::Text &&
+            layout[j].class_id != kTableClassId) {
           decisions[j].dest = Destination::Text;
           decisions[j].wrap = FormulaWrap::None;
           decisions[j].reason = RouterReason::ContainmentLoser;

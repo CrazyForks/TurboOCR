@@ -210,6 +210,7 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
     LayoutBox lb;
     lb.class_id = cls;
     lb.score = score;
+    lb.read_order = static_cast<int>(row[6]);
     lb.box[0] = {x0, y0};
     lb.box[1] = {x1, y0};
     lb.box[2] = {x1, y1};
@@ -363,6 +364,7 @@ PaddleLayout::collect_batch(float score_threshold) {
       LayoutBox lb;
       lb.class_id = cls;
       lb.score = score;
+      lb.read_order = static_cast<int>(row[6]);
       lb.box[0] = {x0, y0};
       lb.box[1] = {x1, y0};
       lb.box[2] = {x1, y1};

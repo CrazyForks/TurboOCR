@@ -52,7 +52,8 @@ static int64_t ppm_max_pixels() {
   static const int64_t px = [] {
     const char *e = std::getenv("MAX_PDF_PAGE_PIXELS_MP");
     int mp = 40;
-    if (e) { try { mp = std::clamp(std::stoi(e), 1, 268); } catch (...) {} }
+    // Best-effort env parse: keep the default on any malformed value.
+    if (e) { try { mp = std::clamp(std::stoi(e), 1, 268); } catch (...) { /* keep default on malformed value */ } }
     return static_cast<int64_t>(mp) * 1000000;
   }();
   return px;
@@ -125,10 +126,12 @@ struct TempGuard {
   TempGuard(std::string p, bool dir) : path(std::move(p)), is_dir(dir) {}
   ~TempGuard() noexcept {
     if (path.empty()) return;
+    // Best-effort cleanup from a noexcept destructor: a failed unlink/remove
+    // only leaks a temp file the OS reclaims, and we must not throw here.
     try {
       if (is_dir) std::filesystem::remove_all(path);
       else unlink(path.c_str());
-    } catch (...) {}
+    } catch (...) { /* noexcept dtor: leaked temp is reclaimed by the OS */ }
   }
   void release() { path.clear(); }
   TempGuard(const TempGuard &) = delete;
@@ -509,10 +512,12 @@ std::vector<cv::Mat> PdfRenderer::render(const uint8_t *data, size_t len,
 // finish decoding, otherwise workers will try to open a file that's been
 // unlinked under them.
 void PdfRenderer::StreamHandle::cleanup() noexcept {
+  // Best-effort cleanup from a noexcept path: a failed unlink/remove only
+  // leaks a temp file the OS reclaims later, and we must not throw here.
   try {
     if (!pdf_tmpfile.empty()) ::unlink(pdf_tmpfile.c_str());
     if (!ppm_tmpdir.empty())  std::filesystem::remove_all(ppm_tmpdir);
-  } catch (...) {}
+  } catch (...) { /* noexcept cleanup: leaked temp is reclaimed by the OS */ }
   pdf_tmpfile.clear();
   ppm_tmpdir.clear();
   num_pages = 0;

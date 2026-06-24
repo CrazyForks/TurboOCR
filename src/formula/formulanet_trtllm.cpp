@@ -1,4 +1,5 @@
 #include "formulanet_trtllm.h"
+#include "turbo_ocr/engine/engine_cache.h"
 #include "turbo_ocr/formula/formula_kernels.h"
 
 #include <NvInferRuntime.h>
@@ -42,16 +43,6 @@ class TrtLogger : public nvinfer1::ILogger {
     }                                                                          \
   } while (0)
 
-std::vector<char> slurp(const std::string &p) {
-  std::ifstream f(p, std::ios::binary | std::ios::ate);
-  if (!f.good()) return {};
-  auto n = f.tellg();
-  f.seekg(0);
-  std::vector<char> b(static_cast<std::size_t>(n));
-  f.read(b.data(), n);
-  return b;
-}
-
 int round_up(int v, int a) { return (v + a - 1) / a * a; }
 
 int argmax_row(const float *row, int vocab) {
@@ -94,9 +85,8 @@ struct PackedMaskParamsLayout {
 } // namespace
 
 FormulaNetTrtLlmDecoder::~FormulaNetTrtLlmDecoder() noexcept {
-  ctx_.reset();
+  ctx_.reset();   // per-instance context before releasing the shared engine
   engine_.reset();
-  runtime_.reset();
   for (auto &[name, b] : bufs_) {
     if (!b.owned || b.ptr == nullptr) continue;
     if (b.host) cudaFreeHost(b.ptr);
@@ -149,17 +139,16 @@ bool FormulaNetTrtLlmDecoder::dlopen_plugin_and_kernel(
 }
 
 bool FormulaNetTrtLlmDecoder::deserialize_engine(const std::string &engine_path) {
-  auto blob = slurp(engine_path);
-  if (blob.empty()) {
-    std::fprintf(stderr, "[FormulaTRTLLM] failed to read engine: %s\n",
-                 engine_path.c_str());
-    return false;
-  }
-  runtime_.reset(nvinfer1::createInferRuntime(*logger_));
-  if (!runtime_) return false;
-  engine_.reset(runtime_->deserializeCudaEngine(blob.data(), blob.size()));
+  // Deserialize once per .trt path (process-global cache) and share the engine
+  // across pool workers; only ctx_ below stays per-instance/per-thread. The
+  // TRT-LLM plugins are registered process-globally in
+  // dlopen_plugin_and_kernel() (always called before this), so the engine the
+  // cache deserializes resolves its plugin layers regardless of which instance
+  // wins the race to deserialize first.
+  engine_ = engine::get_or_load_engine(engine_path);
   if (!engine_) {
-    std::fprintf(stderr, "[FormulaTRTLLM] deserializeCudaEngine failed\n");
+    std::fprintf(stderr, "[FormulaTRTLLM] failed to load/deserialize engine: %s\n",
+                 engine_path.c_str());
     return false;
   }
   ctx_.reset(engine_->createExecutionContext());
@@ -567,7 +556,7 @@ bool FormulaNetTrtLlmDecoder::decode(const float *encoder_ctx_fp32, int B,
                           cudaMemcpyHostToDevice, stream));
 
   auto build_packed_mask = [&](int batch, int max_q, int max_kv,
-                               int packed_rows) -> bool {
+                               int /*packed_rows*/) -> bool {
     PackedMaskParamsLayout<bool> p{};
     p.maskInput          = static_cast<const bool *>(bufs_["cross_attention_mask"].ptr);
     p.cuQSeqLens         = nullptr;  // 3D mask layout (we pass [B, max_q=1, max_kv])

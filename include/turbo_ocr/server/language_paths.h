@@ -32,7 +32,7 @@ struct ResolvedModel {
   std::string rec;
   std::string dict;
   std::string det;
-  DetInferConfig det_cfg;
+  DetInferConfig det_cfg{};
 };
 
 namespace detail {

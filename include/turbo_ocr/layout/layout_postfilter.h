@@ -34,11 +34,25 @@ constexpr bool is_formula_class(int cls) {
 }
 
 // Pin the magic class indices used here so a future relabel of kLayoutLabels
-// can't silently break the formula guard or the oversized-"image" filter.
+// can't silently break the formula guard. (kImageClassId, the nestable-child
+// set, and the rest of the pins live in layout_types.h.)
 static_assert(kLayoutLabels[5] == "display_formula" &&
-                  kLayoutLabels[15] == "inline_formula" &&
-                  kLayoutLabels[14] == "image",
+                  kLayoutLabels[15] == "inline_formula",
               "layout class indices drifted — update layout_postfilter.h");
+
+// OPT-IN: when LAYOUT_KEEP_NESTED_CHILDREN is set, the nested-box
+// reconciliation also protects the model's legitimate child classes
+// (figure_title, footnote, formula_number, paragraph_title — see
+// is_nestable_class) from being dropped inside a parent region, the same way
+// formulas are always protected. Default (unset) leaves every merge mode
+// byte-identical to before: only formulas survive nesting.
+inline bool layout_keep_nested_children() {
+  static const bool on = [] {
+    const char *v = std::getenv("LAYOUT_KEEP_NESTED_CHILDREN");
+    return v && v[0] && v[0] != '0';
+  }();
+  return on;
+}
 
 // Shared post-decode cleanup for the GPU and CPU layout paths: NMS, oversized
 // "image" drop, then nested-box reconciliation per LAYOUT_MERGE_MODE.

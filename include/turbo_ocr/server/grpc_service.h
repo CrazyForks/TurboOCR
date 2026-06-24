@@ -159,7 +159,12 @@ grpc_jpeg_decode_and_infer(pipeline::PipelineDispatcher &dispatcher,
               try {
                 return e.pipeline->run_with_layout(
                     gi, e.stream, want_layout, want_reading_order);
-              } catch (const std::exception &) {}
+              } catch (const std::exception &) {
+                // Best-effort GPU zero-copy fast path: if inference on the
+                // nvJPEG-decoded GPU buffer fails, fall through to the CPU
+                // decode + retry below (which re-runs run_with_layout and
+                // surfaces a genuine error there) rather than failing here.
+              }
             }
           }
         }

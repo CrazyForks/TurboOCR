@@ -41,7 +41,7 @@ using turbo_ocr::emit_results_json;
 
 namespace bootstrap = turbo_ocr::server::bootstrap;
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv) try {
   TOCR_LOG_INFO("PaddleOCR CPU-Only Mode (ONNX Runtime)");
 
   const auto cfg = turbo_ocr::server::ServerConfig::load_or_die(argc, argv);
@@ -509,6 +509,10 @@ int main(int argc, char **argv) {
   // gRPC server
   auto grpc_handle = turbo_ocr::server::start_grpc_server(
       infer, cfg, &pdf_renderer, layout_available, readiness);
+  // Published for the signal-handler drain thread. Not dangling: grpc_handle
+  // owns the server on main()'s stack and is destroyed only after run() returns
+  // (i.e. after the drain has driven app().quit()). See server_bootstrap.h.
+  // cppcheck-suppress danglingLifetime
   bootstrap::g_grpc_server_for_drain = grpc_handle.server.get();
 
   // HTTP server (Drogon)
@@ -534,4 +538,13 @@ int main(int argc, char **argv) {
 
   bootstrap::shutdown_grpc_after_run(grpc_handle.server.get());
   return 0;
+} catch (const std::exception &e) {
+  // Function-try-block on main(): any exception escaping startup (config, ORT
+  // model load, pool acquire, listener bind) becomes a clean non-zero exit with
+  // a logged reason instead of std::terminate + a useless core dump.
+  TOCR_LOG_ERROR("Fatal error during startup", "error", std::string_view(e.what()));
+  return 1;
+} catch (...) {
+  TOCR_LOG_ERROR("Fatal error during startup: unknown exception");
+  return 1;
 }

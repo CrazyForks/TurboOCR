@@ -32,7 +32,7 @@ inline constexpr std::array<float, 3> kDocOriStd{0.229f, 0.224f, 0.225f};
 // model input. `bgr` is an 8-bit 3-channel image.
 [[nodiscard]] inline std::vector<float>
 doc_ori_preprocess(const cv::Mat &bgr) {
-  cv::Mat img = bgr;
+  const cv::Mat &img = bgr;
   const int h = img.rows, w = img.cols;
   const double scale =
       static_cast<double>(kDocOriResizeShort) / std::min(h, w);

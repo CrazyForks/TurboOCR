@@ -269,11 +269,15 @@ namespace detail {
 // Shared state every page task writes into. Lives at run_pdf_job scope (which
 // joins all futures before returning), so tasks may hold a reference to it.
 struct PdfPageSink {
+  // Reference members bound at aggregate-init by run_pdf_job (cannot and must
+  // not carry default initializers); cppcheck's uninitMemberVarNoCtor here is
+  // a false positive for references.
+  // cppcheck-suppress uninitMemberVarNoCtor
   std::mutex &results_mutex;
   std::vector<PdfPageResult> &page_results;
-  pdf::PdfDocument *pdf_doc;  // null when no text layer was opened
+  pdf::PdfDocument *pdf_doc = nullptr;  // null when no text layer was opened
   const std::vector<pdf::PdfPageText> &page_text_cache;
-  int dpi;
+  int dpi = 0;
   PdfImageMode image_mode = PdfImageMode::None;
   pdf::EncodeOptions encode_opts{};
   bool autorotate = false;
@@ -542,7 +546,7 @@ inline int run_streamed_render_cpu(
     PdfImageMode image_mode, const pdf::EncodeOptions &encode_opts,
     bool autorotate, const server::OrientFunc &orient_fn) {
   auto stream_handle = pdf_renderer.render_streamed(pdf_data, pdf_len, dpi,
-      [&](int page_idx, std::string ppm_path) noexcept {
+      [&](int page_idx, const std::string &ppm_path) noexcept {
        try {
         if (mode != pdf::PdfMode::Ocr &&
             page_idx < static_cast<int>(need_render.size()) &&
@@ -674,7 +678,10 @@ inline int run_streamed_render_cpu(
           futures_mutex, opts.pdf_only_batch, dropped);
       num_pages = stream_handle.num_pages;
     } catch (const std::exception &e) {
-      for (auto &f : page_futures) { try { f.get(); } catch (...) {} }
+      // Drain in-flight page futures before returning so their worker threads
+      // finish touching the render handle; per-page errors here are secondary
+      // to the primary render failure (e) we report below.
+      for (auto &f : page_futures) { try { f.get(); } catch (...) { /* secondary to (e), see above */ } }
       TOCR_LOG_ERROR("PDF render failed", "route", "/ocr/pdf",
                      "error", std::string_view(e.what()));
       job.status = PdfJobStatus::RenderFailed;

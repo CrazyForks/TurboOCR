@@ -176,7 +176,7 @@ constexpr std::string_view kXcel = "<xcel>";
 enum class OtslTok { Fcel, Ecel, Nl, Lcel, Ucel, Xcel };
 
 struct OtslElement {
-  OtslTok     tok;
+  OtslTok     tok = OtslTok::Ecel;
   std::string text;  // only meaningful for Fcel
 };
 
@@ -342,7 +342,7 @@ bool VLMTable::init() {
   const char *url_env = std::getenv("VLLM_TABLE_BASE_URL");
   base_url_ = (url_env && url_env[0])
                   ? std::string(url_env)
-                  : std::string(get_env("VLLM_BASE_URL", "http://localhost:8003"));
+                  : std::string(get_env("VLLM_BASE_URL", "http://localhost:8000"));
   while (!base_url_.empty() && base_url_.back() == '/') base_url_.pop_back();
 
   const char *model_env = std::getenv("VLLM_TABLE_MODEL");

@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -182,6 +183,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  try {
   auto det_path =
       turbo_ocr::engine::ensure_trt_engine("models/det.onnx", "det");
   if (det_path.empty()) {
@@ -262,4 +264,8 @@ int main(int argc, char **argv) {
 
   cudaStreamDestroy(stream);
   return 0;
+  } catch (const std::exception &e) {
+    fprintf(stderr, "fatal: %s\n", e.what());
+    return 1;
+  }
 }

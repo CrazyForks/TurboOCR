@@ -106,8 +106,21 @@ def render(payload: dict) -> str:
     }
 
     if order:
+        # Fallback: the reading_order array indexes RESULTS (OCR lines) in XY-cut order,
+        # not layout ids. Derive layout-block order = first-encounter layout_id walking
+        # results; append any block with no text line in geometric order so nothing drops.
+        seen: set = set()
+        ordered_ids: list = []
+        for ri in order:
+            if 0 <= ri < len(results):
+                lid = results[ri].get("layout_id")
+                if isinstance(lid, int) and lid not in seen:
+                    seen.add(lid)
+                    ordered_ids.append(lid)
         by_id = {b["id"]: b for b in layout}
-        blocks = [by_id[i] for i in order if i in by_id]
+        blocks = [by_id[i] for i in ordered_ids if i in by_id]
+        blocks += sorted((b for b in layout if b["id"] not in seen),
+                         key=_layout_sort_key)
     else:
         blocks = sorted(layout, key=_layout_sort_key)
 

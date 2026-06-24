@@ -103,7 +103,7 @@ struct ServerConfig {
   // Per-model detection inference config (resize policy + DB params) for the
   // selected model. Threaded into each detector at construction; env per-field
   // overrides are applied there (read_det_resize/read_db_params) so env wins.
-  DetInferConfig det_cfg;
+  DetInferConfig det_cfg{};
 
   // ---- TensorRT / decode tuning (consumed by engine + decode subsystems;
   //      strict-validated here so malformed input fails fast at boot) ----

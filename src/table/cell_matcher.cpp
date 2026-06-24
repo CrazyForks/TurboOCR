@@ -1,6 +1,7 @@
 #include "turbo_ocr/table/cell_matcher.h"
 
 #include <algorithm>
+#include <cmath>
 
 #ifdef __has_include
 #  if __has_include(<boost/geometry.hpp>)
@@ -14,6 +15,13 @@
 #endif
 
 namespace turbo_ocr::table {
+
+namespace {
+// Row-band height for within-cell reading order. Quantizing y into bands of
+// this size yields a TOTAL order over (band, x), which std::sort requires —
+// the raw tolerance comparison is non-transitive (strict-weak-ordering UB).
+constexpr float READING_ORDER_BAND_PX = 8.0f;
+} // namespace
 
 float compute_inter(const std::array<float, 4>& a, const std::array<float, 4>& b) {
     const float x_left = std::max(a[0], b[0]);
@@ -65,6 +73,7 @@ std::vector<MatchedCell> match_cells_to_ocr(
 
     std::vector<MatchedCell> out;
     out.reserve(cells.size());
+    std::vector<char> assigned(ocr.size(), 0);  // global: did this line land in any cell?
     for (const auto& quad : cells) {
         const auto cell_bbox = quad_to_bbox(quad);
         const BBox query(BPoint(cell_bbox[0], cell_bbox[1]),
@@ -75,10 +84,48 @@ std::vector<MatchedCell> match_cells_to_ocr(
             const std::size_t i = it->second;
             if (compute_inter(cell_bbox, ocr[i].bbox) > MATCH_INTER_THRESHOLD) {
                 indices.push_back(i);
+                assigned[i] = 1;
             }
         }
-        std::sort(indices.begin(), indices.end());
+        // Reading order within the cell: top-to-bottom by row band (8px
+        // tolerance), then left-to-right — so multi-line cell text joins correctly
+        // regardless of page-global OCR order.
+        std::sort(indices.begin(), indices.end(),
+                  [&ocr](std::size_t a, std::size_t b) {
+                      const auto& ba = ocr[a].bbox; const auto& bb = ocr[b].bbox;
+                      const int ra = static_cast<int>(std::floor(ba[1] / READING_ORDER_BAND_PX));
+                      const int rb = static_cast<int>(std::floor(bb[1] / READING_ORDER_BAND_PX));
+                      if (ra != rb) return ra < rb;
+                      return ba[0] < bb[0];
+                  });
         out.push_back(MatchedCell{cell_bbox, std::move(indices)});
+    }
+    // Fallback: never silently drop a detected OCR line. A line straddling cell
+    // boundaries (dense numeric grids) can miss the threshold for every cell — assign
+    // each still-unassigned line to the cell whose quad it overlaps most.
+    auto cell_order = [&ocr](std::size_t a, std::size_t b) {
+        const auto& ba = ocr[a].bbox; const auto& bb = ocr[b].bbox;
+        const int ra = static_cast<int>(std::floor(ba[1] / READING_ORDER_BAND_PX));
+        const int rb = static_cast<int>(std::floor(bb[1] / READING_ORDER_BAND_PX));
+        if (ra != rb) return ra < rb;
+        return ba[0] < bb[0];
+    };
+    for (std::size_t i = 0; i < ocr.size(); ++i) {
+        if (assigned[i]) continue;
+        float best = 0.0f;
+        std::size_t bestc = out.size();
+        for (std::size_t c = 0; c < out.size(); ++c) {
+            const float r = compute_inter(out[c].bbox, ocr[i].bbox);
+            if (r > best) { best = r; bestc = c; }
+        }
+        // Only rescue lines genuinely straddling internal cell boundaries (>=15% of
+        // the line in its best cell); a line mostly outside the table stays unassigned.
+        if (bestc < out.size() && best > 0.15f) {
+            out[bestc].ocr_indices.push_back(i);
+            std::sort(out[bestc].ocr_indices.begin(),
+                      out[bestc].ocr_indices.end(), cell_order);
+            assigned[i] = 1;
+        }
     }
     return out;
 }
@@ -142,6 +189,7 @@ std::vector<MatchedCell> match_cells_to_ocr(
 
     std::vector<MatchedCell> out;
     out.reserve(cells.size());
+    std::vector<char> assigned(ocr.size(), 0);  // global: did this line land in any cell?
     for (const auto& quad : cells) {
         const auto cell_bbox = quad_to_bbox(quad);
         std::vector<std::size_t> indices;
@@ -159,12 +207,48 @@ std::vector<MatchedCell> match_cells_to_ocr(
                     seen[i] = 1;
                     if (compute_inter(cell_bbox, ocr[i].bbox) > MATCH_INTER_THRESHOLD) {
                         indices.push_back(i);
+                        assigned[i] = 1;
                     }
                 }
             }
         }
-        std::sort(indices.begin(), indices.end());
+        // Reading order within the cell: top-to-bottom by row band (8px
+        // tolerance), then left-to-right — so multi-line cell text joins correctly
+        // regardless of page-global OCR order.
+        std::sort(indices.begin(), indices.end(),
+                  [&ocr](std::size_t a, std::size_t b) {
+                      const auto& ba = ocr[a].bbox; const auto& bb = ocr[b].bbox;
+                      const int ra = static_cast<int>(std::floor(ba[1] / READING_ORDER_BAND_PX));
+                      const int rb = static_cast<int>(std::floor(bb[1] / READING_ORDER_BAND_PX));
+                      if (ra != rb) return ra < rb;
+                      return ba[0] < bb[0];
+                  });
         out.push_back(MatchedCell{cell_bbox, std::move(indices)});
+    }
+    // Fallback: never silently drop a detected OCR line (see rtree variant above).
+    auto cell_order = [&ocr](std::size_t a, std::size_t b) {
+        const auto& ba = ocr[a].bbox; const auto& bb = ocr[b].bbox;
+        const int ra = static_cast<int>(std::floor(ba[1] / READING_ORDER_BAND_PX));
+        const int rb = static_cast<int>(std::floor(bb[1] / READING_ORDER_BAND_PX));
+        if (ra != rb) return ra < rb;
+        return ba[0] < bb[0];
+    };
+    for (std::size_t i = 0; i < ocr.size(); ++i) {
+        if (assigned[i]) continue;
+        float best = 0.0f;
+        std::size_t bestc = out.size();
+        for (std::size_t c = 0; c < out.size(); ++c) {
+            const float r = compute_inter(out[c].bbox, ocr[i].bbox);
+            if (r > best) { best = r; bestc = c; }
+        }
+        // Only rescue lines genuinely straddling internal cell boundaries (>=15% of
+        // the line in its best cell); a line mostly outside the table stays unassigned.
+        if (bestc < out.size() && best > 0.15f) {
+            out[bestc].ocr_indices.push_back(i);
+            std::sort(out[bestc].ocr_indices.begin(),
+                      out[bestc].ocr_indices.end(), cell_order);
+            assigned[i] = 1;
+        }
     }
     return out;
 }

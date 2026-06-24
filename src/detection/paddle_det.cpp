@@ -501,8 +501,12 @@ PaddleDet::run_batch(const std::vector<GpuImage> &gpu_imgs,
     for (int i = 0; i < batch_size; ++i) {
       // Real input dims for slots 0..min(n,batch_size)-1; pad slots
       // beyond use slot 0's dims (the result is discarded later).
+      // src is always in [0, n): n >= 1 here (n==0 returned above) and i >= 0,
+      // so the ternary yields either i (when i < n) or 0 — never negative.
       int src = (i < n) ? i : 0;
+      // cppcheck-suppress negativeContainerIndex // src in [0,n), see above
       int h = orig_dims[src].first;
+      // cppcheck-suppress negativeContainerIndex // src in [0,n), see above
       int w = orig_dims[src].second;
       float ratio = std::min(static_cast<float>(resize_h) / h,
                               static_cast<float>(resize_w) / w);
@@ -538,10 +542,17 @@ PaddleDet::run_batch(const std::vector<GpuImage> &gpu_imgs,
   // GpuImage so the resize kernel has a valid src — the output for
   // padded slots is discarded in the post-processing loop below.
   for (int i = 0; i < batch_size; i++) {
+    // src in [0, n): n >= 1 (n==0 returned above), i >= 0, so the ternary is
+    // never negative; gpu_imgs has size n == orig_dims.size() (caller builds
+    // both in lockstep). The negativeContainerIndex below is a false positive.
     int src = (i < n) ? i : 0;
+    // cppcheck-suppress negativeContainerIndex // src in [0,n), see above
     h_batch_src_ptrs_.get()[i]    = gpu_imgs[src].data;
+    // cppcheck-suppress negativeContainerIndex // src in [0,n), see above
     h_batch_src_steps_.get()[i]   = static_cast<int>(gpu_imgs[src].step);
+    // cppcheck-suppress negativeContainerIndex // src in [0,n), see above
     h_batch_src_heights_.get()[i] = gpu_imgs[src].rows;
+    // cppcheck-suppress negativeContainerIndex // src in [0,n), see above
     h_batch_src_widths_.get()[i]  = gpu_imgs[src].cols;
   }
 

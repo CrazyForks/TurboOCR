@@ -216,15 +216,14 @@ void cuda_fused_slanext_pre(const GpuImage& src,
   CUDA_CHECK(cudaGetLastError());
 }
 
-// =================================================================
-// Nemotron table-structure (YOLOX) preprocess: letterbox the sub-rect to a
-// 1024×1024 canvas (resize-by-long-side, top-left, pad 114), RAW 0-255 BGR
-// values (YOLOX takes unnormalized input), CHW. The top-left letterbox with
-// scale = 1024/max(w,h) is exactly what decode_nemotron inverts via
-// ratio = min(1024/h, 1024/w).
-// =================================================================
+// SLANeXt encoder-split preprocess: same 488 letterbox but RGB channel order
+// (PaddleOCR DecodeImage img_mode=RGB for table) + ImageNet norm + pad with 0
+// in normalized space (PaddingTableImage pads the normalized image with 0).
+// Source GpuImage is BGR; bilinear_sample_norm yields (b,g,r) = (Blue,Green,Red)
+// normalized with the means passed; we feed per-channel means so Red gets
+// 0.485/0.229, Green 0.456/0.224, Blue 0.406/0.225, then write R,G,B to planes.
 __global__ __launch_bounds__(256)
-void nemotron_pre_kernel(
+void slanext_pre_rgb_kernel(
     const unsigned char* __restrict__ src, int src_step,
     int rect_x, int rect_y, int rect_w, int rect_h,
     float* __restrict__ dst_chw, int dst,
@@ -237,25 +236,26 @@ void nemotron_pre_kernel(
   if (dx < new_w && dy < new_h) {
     float sx_rel = (dx + 0.5f) * scale - 0.5f;
     float sy_rel = (dy + 0.5f) * scale - 0.5f;
-    float b, g, r;
+    float b, g, r;  // b=(Blue-0.406)/0.225, g=(Green-0.456)/0.224, r=(Red-0.485)/0.229
     bilinear_sample_norm(src, src_step, rect_x, rect_y, rect_w, rect_h,
                          sx_rel, sy_rel,
-                         0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f,
-                         b, g, r);
-    dst_chw[0 * plane + idx] = b;
-    dst_chw[1 * plane + idx] = g;
-    dst_chw[2 * plane + idx] = r;
+                         0.406f, 0.456f, 0.485f,
+                         1.0f / 0.225f, 1.0f / 0.224f, 1.0f / 0.229f,
+                         1.0f / 255.0f, b, g, r);
+    dst_chw[0 * plane + idx] = r;  // R
+    dst_chw[1 * plane + idx] = g;  // G
+    dst_chw[2 * plane + idx] = b;  // B
   } else {
-    dst_chw[0 * plane + idx] = 114.0f;
-    dst_chw[1 * plane + idx] = 114.0f;
-    dst_chw[2 * plane + idx] = 114.0f;
+    dst_chw[0 * plane + idx] = 0.0f;  // PaddingTableImage pads normalized 0
+    dst_chw[1 * plane + idx] = 0.0f;
+    dst_chw[2 * plane + idx] = 0.0f;
   }
 }
 
-void cuda_fused_nemotron_pre(const GpuImage& src,
-                             int rect_x, int rect_y, int rect_w, int rect_h,
-                             float* dst_chw, cudaStream_t stream) {
-  constexpr int DST = 1024;
+void cuda_fused_slanext_pre_rgb(const GpuImage& src,
+                                int rect_x, int rect_y, int rect_w, int rect_h,
+                                float* dst_chw, cudaStream_t stream) {
+  constexpr int DST = 488;
   float long_side = (float)::max(rect_w, rect_h);
   float s = (float)DST / long_side;
   int new_w = (int)lroundf((float)rect_w * s);
@@ -264,11 +264,11 @@ void cuda_fused_nemotron_pre(const GpuImage& src,
   if (new_h > DST) new_h = DST;
   if (new_w < 1) new_w = 1;
   if (new_h < 1) new_h = 1;
-  float scale = 1.0f / s;                          // src px per resized px
+  float scale = 1.0f / s;
 
   dim3 block(32, 8);
   dim3 grid((DST + block.x - 1) / block.x, (DST + block.y - 1) / block.y);
-  nemotron_pre_kernel<<<grid, block, 0, stream>>>(
+  slanext_pre_rgb_kernel<<<grid, block, 0, stream>>>(
       (const unsigned char*)src.data, (int)src.step,
       rect_x, rect_y, rect_w, rect_h,
       dst_chw, DST, new_w, new_h, scale);

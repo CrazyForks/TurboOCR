@@ -1,6 +1,9 @@
 #pragma once
 
+#include <map>
 #include <memory>
+#include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -15,9 +18,10 @@
 #include "turbo_ocr/pipeline/pipeline_result.h"
 #include "turbo_ocr/recognition/paddle_rec.h"
 #include "turbo_ocr/router/routing_plan.h"
+#include "turbo_ocr/routing/routing_config.h"
 
 namespace turbo_ocr::router  { class CuaRouter; }
-namespace turbo_ocr::table   { class TableStage; class NemotronTableStruct; }
+namespace turbo_ocr::table   { class TableStage; class ITableRecognizer; }
 namespace turbo_ocr::formula { class IFormulaRecognizer; }
 
 namespace turbo_ocr::pipeline {
@@ -41,10 +45,11 @@ public:
   // discarded to keep a stable API for non-layout callers).
   [[nodiscard]] bool load_layout_model(const std::string &layout_trt_path);
 
-  // Single-pass Nemotron table-structure backend (builds a TRT FP16 engine
-  // from the ONNX). When loaded, table regions are recognized by this model
-  // and cells are filled from the page's text-OCR results.
-  [[nodiscard]] bool load_table_struct_model(const std::string &onnx_path);
+  // Pluggable table backend. TABLE_BACKEND selects slanext|vlm;
+  // each backend reads its own env (TABLE_SLANEXT_*,
+  // VLLM_TABLE_*) in load() and self-skips when unconfigured. When loaded,
+  // detected table regions are recognized by this one ITableRecognizer.
+  [[nodiscard]] bool load_table_backend();
 
   // Load the CUA router + table-stage + formula engines in one call.
   // Pass an empty path for any optional component (e.g. wireless table
@@ -77,6 +82,38 @@ public:
   [[nodiscard]] bool load_doc_ori_model(const std::string &doc_ori_trt_path);
   [[nodiscard]] bool has_doc_ori() const noexcept { return use_doc_ori_; }
 
+  // --- Per-request routing (Tier-A/B) introspection + ad-hoc inference -----
+
+  // True when `name` is a registered table/formula backend (i.e. a legal
+  // per-request override target). Used by Tier-B /infer; Tier-A route-layer
+  // validation uses routing::routable_backend_names (same set, no pipeline
+  // round-trip needed).
+  [[nodiscard]] bool has_table_backend(const std::string &name) const {
+    return table_registry_.find(name) != table_registry_.end();
+  }
+  [[nodiscard]] bool has_formula_backend(const std::string &name) const {
+    return formula_registry_.find(name) != formula_registry_.end();
+  }
+
+  // Tier-B: run ONE crop (the whole image is the region) through a backend for
+  // `modality` ("table"|"formula") and return the raw recognized string (HTML
+  // for table, LaTeX/text for formula). Empty string for the legitimately-empty
+  // result (recognizer ran, produced nothing) or an empty/undecodable crop.
+  //   - inline_spec == nullptr -> use the NAMED registry backend `backend_name`
+  //     (or the route default when empty).
+  //   - inline_spec != nullptr -> build a TRANSIENT recognizer from that spec
+  //     ON THIS WORKER THREAD (so any TRT build binds to the worker's CUDA
+  //     context), run it once, and discard it. `backend_name` is ignored.
+  // Throws RoutingConfigError if an inline spec names an engine invalid for the
+  // modality (the route maps that to a 400).
+  // Throws BackendUnavailableError when the EXPLICITLY requested backend (named
+  // pick or inline spec) is null or not ready — so a failed-to-load backend
+  // can't masquerade as an empty-but-successful result (route -> 503).
+  [[nodiscard]] std::string
+  infer_one(const cv::Mat &img, cudaStream_t stream, const std::string &modality,
+            const std::string &backend_name,
+            const routing::BackendSpec *inline_spec = nullptr);
+
   // Detect a rendered page's clockwise rotation (0/90/180/270). Returns 0 when
   // the model isn't loaded or confidence is low. Used by the autorotate path
   // to de-rotate the page before OCR + image encode.
@@ -107,14 +144,32 @@ public:
   // is loaded. When the pipeline has no layout model, the flag has no
   // effect (the output `.layout` is always empty). Callers (HTTP/gRPC
   // routes) parse `?layout=1` from the request and pass it through.
+  // `routing` is an OPTIONAL per-request backend override (Tier-A). Defaulted
+  // empty so existing callers are unchanged; when a modality's name is set, the
+  // table/formula regions of THIS request are dispatched to that named registry
+  // backend instead of the configured route default. An unknown name falls back
+  // to the default (route-layer validation rejects unknown names with a 400
+  // before they ever reach here).
+  // `defer_external`: when true AND the resolved formula/table backend is a
+  // remote async-capable one (supports_async()), this call does all GPU work +
+  // a NON-BLOCKING crop submit and returns immediately with the pending futures
+  // stashed in result.pending — freeing the GPU pipeline slot during the VL
+  // network round-trip. The caller MUST then call finalize_deferred() (off the
+  // GPU worker) to await + assemble. Defaulted false → fully synchronous, so
+  // gRPC / PDF / batch / cpu_main callers are byte-identical. Only /ocr/raw
+  // (single-image, the throughput path) opts in today.
   [[nodiscard]] OcrPipelineResult run_with_layout(const cv::Mat &img,
                                                    cudaStream_t stream,
                                                    bool want_layout = false,
-                                                   bool want_reading_order = false);
+                                                   bool want_reading_order = false,
+                                                   const routing::RequestRouting &routing = {},
+                                                   bool defer_external = false);
   [[nodiscard]] OcrPipelineResult run_with_layout(GpuImage gpu_img,
                                                    cudaStream_t stream = 0,
                                                    bool want_layout = false,
-                                                   bool want_reading_order = false);
+                                                   bool want_reading_order = false,
+                                                   const routing::RequestRouting &routing = {},
+                                                   bool defer_external = false);
 
   // Layout-only path: upload the image, run the PP-DocLayoutV3 inference,
   // collect the boxes, and return. Skips detection, angle classification,
@@ -238,14 +293,31 @@ private:
 
   // ---- CUA router + table/formula stages (lazy-allocated) ----------------
   std::unique_ptr<router::CuaRouter>   router_;
-  std::unique_ptr<table::TableStage>   table_stage_;
-  std::unique_ptr<table::NemotronTableStruct> table_struct_;
-  std::unique_ptr<formula::IFormulaRecognizer> formula_;
+  std::unique_ptr<table::TableStage>       table_stage_;       // legacy cell-det path (built by load_router_models; unused in dispatch)
+
+  // Per-modality recognizer registry: backend NAME -> recognizer. The registry
+  // OWNS every per-request-routable backend (the route default + all kind:openai
+  // backends, per routing::routable_backend_names). In zero-config / env-synth
+  // mode there is exactly one entry per modality, so this is byte-identical to a
+  // single recognizer and costs zero extra VRAM. table_recognizer_ / formula_
+  // are NON-OWNING pointers to the route-default entry, keeping the hot path a
+  // plain pointer pick.
+  std::map<std::string, std::unique_ptr<table::ITableRecognizer>>   table_registry_;
+  std::map<std::string, std::unique_ptr<formula::IFormulaRecognizer>> formula_registry_;
+  table::ITableRecognizer       *table_recognizer_ = nullptr;     // default entry (registry-owned)
+  formula::IFormulaRecognizer   *formula_          = nullptr;     // default entry (registry-owned)
 
   cudaStream_t table_stream_       = nullptr;
   cudaStream_t formula_stream_     = nullptr;
   cudaEvent_t  table_done_event_   = nullptr;
   cudaEvent_t  formula_done_event_ = nullptr;
+
+  // Lazily create the table/formula stream + done-event on first use. The
+  // pipeline owns and destroys these CUDA resources; the recognizer-registry
+  // construction helpers call these (via a callback) when they register a
+  // backend that will run on the corresponding stream.
+  void ensure_table_stream_();
+  void ensure_formula_stream_();
 
   // Reusable per-call routing plan — member, not local, to avoid the
   // per-page heap churn of the inner vectors.
@@ -257,7 +329,24 @@ private:
   void dispatch_router_(OcrPipelineResult &out,
                         const GpuImage &gpu_img,
                         const std::vector<Box> &boxes,
-                        PipelineTimer &timer);
+                        PipelineTimer &timer,
+                        const routing::RequestRouting &routing = {},
+                        bool defer_external = false);
+
+  // Resolve the recognizer for a per-request dispatch: the named override entry
+  // when `name` is non-empty AND present in the registry, else the route
+  // default. Returns nullptr only when neither exists.
+  [[nodiscard]] table::ITableRecognizer *
+  pick_table_recognizer_(const std::string &name) const;
+  [[nodiscard]] formula::IFormulaRecognizer *
+  pick_formula_recognizer_(const std::string &name) const;
+
+  // Build + register every kind:openai backend (for `modality`) that isn't
+  // already the route default, so per-request overrides can address them with
+  // no first-request build latency. Openai clients are cheap (no GPU/VRAM);
+  // local heavy engines are intentionally NOT prewarmed here.
+  void prewarm_openai_registry_(const std::string &modality,
+                                const routing::RoutingTable &tbl);
 
   // Phase 4 of run_batch_with_layout: layout (one batched TRT execute in
   // pdf_only mode, per-image otherwise), CUA router dispatch, and reading-

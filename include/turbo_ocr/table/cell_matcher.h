@@ -10,7 +10,7 @@ namespace turbo_ocr::table {
 // One OCR text-line on the original page.
 struct OcrLine {
     // Axis-aligned bbox in original-image pixels: [x1, y1, x2, y2].
-    std::array<float, 4> bbox;
+    std::array<float, 4> bbox{};
     std::string text;
 };
 
@@ -19,13 +19,17 @@ struct MatchedCell {
     // Axis-aligned bbox derived from the quad (min/max over x_even/y_odd of
     // the 8 coords) — matches PaddleX's quad→bbox conversion in
     // match_table_and_ocr.
-    std::array<float, 4> bbox;
+    std::array<float, 4> bbox{};
     // Indices into the input OCR slice. Empty for cells with no match.
     std::vector<std::size_t> ocr_indices;
 };
 
-// PaddleX `match_table_and_ocr` literal — `compute_inter > 0.7`.
-inline constexpr float MATCH_INTER_THRESHOLD = 0.7f;
+// PaddleX `match_table_and_ocr` uses `compute_inter > 0.7`, but SLANeXt cell
+// quads are smaller than the DB text-line boxes, so a correctly-placed line
+// often has <70% of its area inside the quad and gets silently dropped (≈35% of
+// lines / 45% of cells came out empty on OmniDocBench). 0.4 recovers most of
+// those without cross-cell bleed; lines matching no cell fall back to argmax.
+inline constexpr float MATCH_INTER_THRESHOLD = 0.4f;
 
 // PaddleX-equivalent intersect ratio: inter_area / box_b_area.
 // +1 byte-equal preservation: PaddleX uses `(x_right - x_left + 1)` style

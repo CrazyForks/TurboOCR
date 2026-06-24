@@ -1,6 +1,7 @@
 #include "turbo_ocr/engine/trt_engine.h"
 #include "turbo_ocr/common/cuda_check.h"
 #include "turbo_ocr/common/errors.h"
+#include "turbo_ocr/engine/engine_cache.h"
 
 #include <cstdlib>
 #include <format>
@@ -132,33 +133,12 @@ bool TrtEngine::launch_baked(int slot, cudaStream_t stream) {
 }
 
 bool TrtEngine::load() {
-  std::ifstream file(model_path_, std::ios::binary);
-  if (!file.good()) [[unlikely]] {
-    std::cerr << std::format("[TRT] Error loading engine file: {}", model_path_) << '\n';
-    return false;
-  }
-
-  file.seekg(0, file.end);
-  auto pos = file.tellg();
-  if (pos < 0) [[unlikely]] {
-    std::cerr << std::format("[TRT] Error reading engine file size: {}", model_path_) << '\n';
-    return false;
-  }
-  auto size = static_cast<size_t>(pos);
-  file.seekg(0, file.beg);
-
-  std::vector<char> trtModelStream(size);
-  file.read(trtModelStream.data(), size);
-
-  runtime_.reset(nvinfer1::createInferRuntime(logger_));
-  if (!runtime_) [[unlikely]] {
-    std::cerr << std::format("[TRT] Failed to create runtime for: {}", model_path_) << '\n';
-    return false;
-  }
-
-  engine_.reset(runtime_->deserializeCudaEngine(trtModelStream.data(), size));
+  // Deserialize the engine once per .trt path (process-global cache) and share
+  // it across all pool workers — only the IExecutionContext below is
+  // per-instance/per-thread.
+  engine_ = engine::get_or_load_engine(model_path_);
   if (!engine_) [[unlikely]] {
-    std::cerr << std::format("[TRT] Failed to deserialize engine: {}", model_path_) << '\n';
+    // get_or_load_engine already logged the specific read/deserialize failure.
     return false;
   }
 

@@ -25,8 +25,6 @@
 #include "turbo_ocr/server/env_utils.h"
 #include "turbo_ocr/server/server_types.h"
 
-using turbo_ocr::OCRResultItem;
-using turbo_ocr::results_to_json;
 using turbo_ocr::pipeline::PdfImageMode;
 using turbo_ocr::pipeline::PdfJobOptions;
 using turbo_ocr::pipeline::PdfJobResult;
@@ -180,7 +178,7 @@ bool extract_pdf_bytes(const drogon::HttpRequestPtr &req,
       return false;
     }
     for (auto &file : parser.getFiles()) {
-      auto name = file.getItemName();
+      const auto &name = file.getItemName();
       if (name == "file" || name == "pdf") {
         decoded_buf.assign(file.fileData(), file.fileLength());
         break;

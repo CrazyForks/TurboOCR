@@ -11,7 +11,6 @@ using turbo_ocr::table::CharDict;
 using turbo_ocr::table::decode_structure;
 using turbo_ocr::table::default_dict;
 using turbo_ocr::table::SLANEXT_VOCAB;
-using turbo_ocr::table::StructureResult;
 
 namespace {
 
@@ -46,7 +45,7 @@ TEST_CASE("eos at step 0 still emits token (matches RapidAI walk)",
     write_probs(probs, 1, v, find_token(dict, "<thead>"), 1.0f);
     std::vector<float> loc(2 * 8, 0.0f);
     auto r = decode_structure(probs.data(), loc.data(), 2, v, dict, 488,
-                              200, 200);
+                              488, 200, 200);
     REQUIRE(r.structure.size() == 7);
     REQUIRE(r.structure[3] == "<thead>");
 }
@@ -68,7 +67,7 @@ TEST_CASE("walk terminates at first non-step-0 eos",
     write_quad(loc, 1, {0.1f, 0.1f, 0.5f, 0.1f, 0.5f, 0.5f, 0.1f, 0.5f});
     write_quad(loc, 3, {0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f});
     auto r = decode_structure(probs.data(), loc.data(), 5, v, dict, 488,
-                              200, 200);
+                              488, 200, 200);
     REQUIRE(r.cells.size() == 1);
     REQUIRE(r.structure.size() == 7);
     REQUIRE(r.structure[3] == "<td></td>");
@@ -92,7 +91,7 @@ TEST_CASE("td token quad scales as 4-corner AABB-style quad",
     // per-axis scale_w = 300 * 488 / (300 * 488/600) = 600,
     //                scale_h = 600 * 488 / (600 * 488/600) = 600.
     auto r = decode_structure(probs.data(), loc.data(), 3, v, dict, 488,
-                              300, 600);
+                              488, 300, 600);
     REQUIRE(r.cells.size() == 1);
     const auto& q = r.cells[0].bbox;
     REQUIRE(q[0] == static_cast<int>(0.10f * 600.0f));
@@ -111,21 +110,23 @@ TEST_CASE("vocab boundary tokens decode to slanet-plus indices",
     REQUIRE(dict.len() == SLANEXT_VOCAB);
     REQUIRE(dict.sos_idx() == 0);
     REQUIRE(dict.eos_idx() == SLANEXT_VOCAB - 1);
-    // slanet-plus order: <thead>=1, </thead>=2, <tbody>=3, </tbody>=4,
-    //                    <tr>=5, </tr>=6, <td=7, >=8, </td>=9.
+    // Authoritative PaddleX dict order: build() drops the bare "<td>" and
+    // appends "<td></td>"; <tbody>/</tbody> live at the tail, not the head.
+    // <thead>=1 </thead>=2 <tr>=3 </tr>=4 </td>=5 <td=6 >=7  colspan="2"=8.
     REQUIRE(dict.token(1) == "<thead>");
-    REQUIRE(dict.token(3) == "<tbody>");
-    REQUIRE(dict.token(5) == "<tr>");
-    REQUIRE(dict.token(7) == "<td");
-    REQUIRE(dict.token(8) == ">");
-    REQUIRE(dict.token(9) == "</td>");
+    REQUIRE(dict.token(2) == "</thead>");
+    REQUIRE(dict.token(3) == "<tr>");
+    REQUIRE(dict.token(4) == "</tr>");
+    REQUIRE(dict.token(5) == "</td>");
+    REQUIRE(dict.token(6) == "<td");
+    REQUIRE(dict.token(7) == ">");
+    REQUIRE(dict.token(8) == " colspan=\"2\"");
     // <td></td> is the merged sentinel — last slot before eos.
     REQUIRE(dict.is_td_token(SLANEXT_VOCAB - 2));
     REQUIRE(dict.token(SLANEXT_VOCAB - 2) == "<td></td>");
-    // colspan="20" replaces colspan="25" — verify the regression-prone
-    // tail of the colspan block.
-    REQUIRE(find_token(dict, " colspan=\"20\"") < dict.len());
-    REQUIRE(find_token(dict, " colspan=\"25\"") == dict.len());
+    // The colspan block runs "2".."19" then jumps to "25" (no "20".."24").
+    REQUIRE(find_token(dict, " colspan=\"25\"") < dict.len());
+    REQUIRE(find_token(dict, " colspan=\"20\"") == dict.len());
 }
 
 TEST_CASE("blank quad is filtered out", "[slanext_postprocess_aabb]") {
@@ -138,7 +139,7 @@ TEST_CASE("blank quad is filtered out", "[slanext_postprocess_aabb]") {
     write_probs(probs, 2, v, dict.eos_idx(), 1.0f);
     std::vector<float> loc(3 * 8, 0.0f);  // all zeros — blank quad
     auto r = decode_structure(probs.data(), loc.data(), 3, v, dict, 488,
-                              244, 244);
+                              488, 244, 244);
     // Token is still emitted, but the all-zero quad is dropped to match
     // RapidAI `filter_blank_bbox`.
     REQUIRE(r.cells.empty());

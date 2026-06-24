@@ -395,7 +395,24 @@ def _serve(sock_path: str, svc: FormulaService) -> None:
             conn.close()
 
 
+def _install_parent_death_signal() -> None:
+    """Ask the kernel to SIGTERM this sidecar if its parent (the C++ server)
+    dies, so it never outlives the server holding ~300 MB of ORT-CUDA VRAM in a
+    shared PID namespace (bare-metal / supervisor-restart runs). Linux-only;
+    best-effort. SIGTERM's default action terminates us, freeing the GPU."""
+    try:
+        import ctypes
+        import signal
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+        if os.getppid() == 1:  # parent already died between spawn and prctl
+            os._exit(0)
+    except Exception:
+        pass
+
+
 def main() -> int:
+    _install_parent_death_signal()
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--tokenizer", required=True)

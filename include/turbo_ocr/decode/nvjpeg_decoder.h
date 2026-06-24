@@ -139,9 +139,11 @@ public:
   // The buffer must be large enough for h * pitch bytes (pitch >= w * 3).
   // Returns true on success. The decode is async on the given stream;
   // the caller must synchronize the stream before reading the output.
+  // w/h describe the caller's buffer-size contract (see above); nvjpeg infers
+  // the actual decode dimensions, so they are unused inside this method.
   [[nodiscard]] bool decode_to_gpu(const unsigned char *data, size_t len,
                                     void *d_output, size_t pitch,
-                                    int w, int h,
+                                    int /*w*/, int /*h*/,
                                     cudaStream_t stream = 0) {
     if (!handle_ || !is_jpeg(data, len))
       return false;

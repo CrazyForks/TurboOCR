@@ -21,8 +21,8 @@ enum class TableVariant : std::uint8_t {
 // One <td>-family cell with its 8-coord quad in original-image pixels.
 // Layout: [x1, y1, x2, y2, x3, y3, x4, y4].
 struct StructureCell {
-    std::size_t token_idx;
-    std::array<int, 8> bbox;
+    std::size_t token_idx = 0;
+    std::array<int, 8> bbox{};
 };
 
 // Full SLANeXt decode result for one sample.
@@ -32,7 +32,7 @@ struct StructureResult {
     // Per <td>-family cell quad in original image space.
     std::vector<StructureCell> cells;
     // Mean of per-step argmax softmax scores across kept tokens.
-    float structure_score;
+    float structure_score = 0.0f;
 };
 
 } // namespace turbo_ocr::table

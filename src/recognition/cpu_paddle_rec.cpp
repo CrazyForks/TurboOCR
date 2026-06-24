@@ -200,9 +200,9 @@ CpuPaddleRec::run_batched(const cv::Mat &img, const std::vector<Box> &boxes) {
   // boundary, e.g. several 320px crops batched with a 900px one.) orig_idx
   // restores box order.
   struct BatchCrop {
-    int orig_idx;
-    int target_w;
-    int bucket_w;
+    int orig_idx = 0;
+    int target_w = 0;
+    int bucket_w = 0;
     cv::Mat crop;
   };
   std::vector<BatchCrop> crops(total);

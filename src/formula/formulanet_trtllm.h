@@ -83,8 +83,9 @@ class FormulaNetTrtLlmDecoder {
   BuildPackedMaskFn invoke_build_packed_mask_ = nullptr;
 
   std::unique_ptr<nvinfer1::ILogger>          logger_;
-  std::unique_ptr<nvinfer1::IRuntime>          runtime_;
-  std::unique_ptr<nvinfer1::ICudaEngine>       engine_;
+  // Shared, process-global engine (deserialized once per .trt path via the
+  // engine cache). ctx_ below stays per-instance/per-thread.
+  std::shared_ptr<nvinfer1::ICudaEngine>       engine_;
   std::unique_ptr<nvinfer1::IExecutionContext> ctx_;
 
   // Device + pinned-host buffers, keyed by tensor name. Owns the allocations.

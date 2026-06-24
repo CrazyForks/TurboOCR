@@ -64,10 +64,16 @@ StructureResult decode_structure(
         if (dict.is_td_token(best_i)) {
             const float* lrow = loc_preds + step * 8;
             std::array<int, 8> bbox{};
+            bool blank = true;
             for (std::size_t k = 0; k < 8; ++k) {
                 bbox[k] = static_cast<int>(lrow[k] * scales[k]);
+                if (bbox[k] != 0) blank = false;
             }
-            cells.push_back(StructureCell{best_i, bbox});
+            // RapidAI filter_blank_bbox: keep the structure token but drop an
+            // all-zero quad so a degenerate prediction never becomes a phantom cell.
+            if (!blank) {
+                cells.push_back(StructureCell{best_i, bbox});
+            }
         }
         structure.emplace_back(token);
         score_sum += best_v;

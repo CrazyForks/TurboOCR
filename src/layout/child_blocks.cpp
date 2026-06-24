@@ -359,9 +359,9 @@ flatten_descendants(int parent_idx,
   // enough for any acyclic tree; anything deeper means a cycle that
   // visited didn't catch (defence in depth).
   struct Frame {
-    int idx;
+    int idx = 0;
     std::vector<int> kids;
-    size_t cursor;
+    size_t cursor = 0;
   };
   std::vector<Frame> stack;
   auto sorted_kids = [&](int idx) {

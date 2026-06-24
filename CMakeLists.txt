@@ -191,6 +191,7 @@ add_library(turbo_ocr_common STATIC
     src/docassembly/repetition_guard.cpp
     src/docassembly/title_level.cpp
     src/docassembly/table_merge.cpp
+    src/routing/routing_config.cpp
     third_party/clipper/clipper.cpp
     third_party/simdutf/simdutf.cpp
 )
@@ -220,6 +221,7 @@ add_executable(turbo_ocr_tests
     tests/cpp/test_docassembly.cpp
     tests/cpp/test_dict_resolution.cpp
     tests/cpp/test_gpu_safety.cpp
+    tests/cpp/test_routing_config.cpp
     src/render/pdf_renderer.cpp
     third_party/catch2/catch_amalgamated.cpp
 )
@@ -451,6 +453,7 @@ else()
     # --- GPU library ---
     add_library(turbo_ocr_gpu STATIC
         src/engine/trt_engine.cpp
+        src/engine/engine_cache.cpp
         src/engine/onnx_to_trt.cpp
         src/detection/paddle_det.cpp
         src/recognition/paddle_rec.cpp
@@ -459,6 +462,10 @@ else()
         src/lang_cls/script_id.cpp
         src/layout/paddle_layout.cpp
         src/pipeline/ocr_pipeline.cpp
+        src/pipeline/ocr_pipeline_run.cpp
+        src/pipeline/ocr_pipeline_detail.cpp
+        src/pipeline/infer_one.cpp
+        src/pipeline/recognizer_registry.cpp
         src/kernels/kernels.cu
         src/kernels/jfa.cu
         src/render/pdf_renderer.cpp
@@ -474,13 +481,16 @@ else()
         src/table/table_stage.cpp
         src/table/table_cls.cpp
         src/table/table_cell.cpp
-        src/table/nemotron_table_struct.cpp
-        src/table/nemotron_postprocess.cpp
+        src/table/slanext_enc_split.cpp
         src/table/slanext.cpp
         src/table/slanext_dict.cpp
         src/table/slanext_postprocess.cpp
         src/table/cell_matcher.cpp
         src/table/html_reconstruct.cpp
+        src/table/table_recognizer.cpp
+        src/table/slanext_table_recognizer.cpp
+        src/table/vlm_table_recognizer.cpp
+        src/table/vlm_table.cpp
         src/table/kernels/table_kernels.cu
         src/formula/formulanet.cpp
         src/formula/formula_tokenizer.cpp
@@ -488,8 +498,14 @@ else()
         src/formula/vlm_formula.cpp
         src/formula/ppformulanet_s.cpp
         src/vlm/crop_pool.cpp
+        src/backends/openai_endpoint.cpp
         src/formula/kernels/formula_kernels.cu
     )
+    # The SLANeXt host GRU decoder is a tight scalar GEMV/attention loop; let the
+    # compiler vectorize the dot-product reductions (FP reassociation only —
+    # accuracy-neutral, verified) under the default AVX2 (-march=x86-64-v3) target.
+    set_source_files_properties(src/table/slanext_enc_split.cpp PROPERTIES
+        COMPILE_OPTIONS "-ffast-math;-fopenmp-simd")
     target_include_directories(turbo_ocr_gpu PUBLIC
         ${CUDAToolkit_INCLUDE_DIRS}
         ${TENSORRT_DIR}/include
@@ -528,6 +544,20 @@ else()
     target_include_directories(turbo_ocr_tests PRIVATE
         ${CUDAToolkit_INCLUDE_DIRS}
         ${TENSORRT_DIR}/include
+    )
+    # Table/router/formula/parser unit tests resolve their symbols from
+    # turbo_ocr_gpu, so they only build in the GPU configuration (the CPU
+    # test binary links turbo_ocr_common only).
+    target_sources(turbo_ocr_tests PRIVATE
+        tests/table/test_cell_matcher.cpp
+        tests/table/test_html_reconstruct.cpp
+        tests/table/test_slanext_dict.cpp
+        tests/table/test_slanext_postprocess.cpp
+        tests/table/test_slanext_postprocess_aabb.cpp
+        tests/router/test_cua_router.cpp
+        tests/formula/test_formula_tokenizer.cpp
+        tests/formula/test_formulanet_ar_loop.cpp
+        tests/cpp/test_openai_parsers.cpp
     )
 
     # GPU HTTP + gRPC server (shared pipeline pool)

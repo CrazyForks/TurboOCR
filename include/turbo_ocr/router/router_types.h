@@ -67,7 +67,7 @@ struct RouterConfig {
       c.tau_trust[i]  = 0.40f;
       c.tau_verify[i] = 0.20f;
     }
-    c.tau_trust[21]  = 0.60f; c.tau_verify[21]  = 0.35f; // table
+    c.tau_trust[21]  = 0.60f; c.tau_verify[21]  = 0.25f; // table (verify<0.30 layout floor: route every detected table to SLANeXt — it's cheap and demoting a real table to text is the worst error; recovers low-confidence tables the layout emits in [0.30,0.35))
     c.tau_trust[5]   = 0.55f; c.tau_verify[5]   = 0.30f; // display_formula
     c.tau_trust[15]  = 0.55f; c.tau_verify[15]  = 0.30f; // inline_formula
     c.tau_trust[14]  = 0.50f; c.tau_verify[14]  = 0.30f; // image

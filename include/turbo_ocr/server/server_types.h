@@ -24,7 +24,10 @@
 #include "turbo_ocr/common/types.h"
 #include "turbo_ocr/decode/fast_png_decoder.h"
 #include "turbo_ocr/layout/layout_types.h"
+#include "turbo_ocr/routing/routing_config.h"
 #include "turbo_ocr/server/metrics.h"
+
+#include <set>
 
 namespace turbo_ocr::server {
 
@@ -44,6 +47,14 @@ struct InferOptions {
   // PP-StructureV3 parsing_res_list granularity). Auto-enables layout
   // and reading_order since aggregation needs both.
   bool want_blocks = false;
+
+  // Per-request routing override (Tier-A): a backend NAME per modality (empty
+  // == use the configured route default). Parsed from /ocr/raw query params
+  // (?route_table=/?route_formula=) and /ocr JSON body (routing{}). Validated
+  // against the registry name-set at the route layer (unknown => 400) before
+  // it reaches the pipeline. Rides the by-value `opts` capture into the
+  // dispatcher lambda, so it's timeout-safe like the other flags.
+  routing::RequestRouting routing_override;
 };
 
 /// Image decoder: (raw_bytes_ptr, length) -> cv::Mat
@@ -98,7 +109,7 @@ using DrogonCallback = std::function<void(const drogon::HttpResponsePtr &)>;
 
 /// Structured JSON error response: {"error":{"code":"...","message":"..."}}
 [[nodiscard]] inline drogon::HttpResponsePtr error_response(
-    drogon::HttpStatusCode status, const char *code, std::string message) {
+    drogon::HttpStatusCode status, const char *code, const std::string &message) {
   std::string body;
   body.reserve(64 + std::strlen(code) + message.size());
   body += R"({"error":{"code":")";
@@ -223,7 +234,11 @@ inline void register_observability_middleware() {
             auto ms = (now_ns - start_ns) / 1'000'000;
             resp->addHeader("X-Inference-Time-Ms", std::to_string(ms));
             duration_s = static_cast<double>(now_ns - start_ns) / 1e9;
-          } catch (...) {}
+          } catch (...) {
+            // Best-effort timing only: a malformed X-Start-Ns (std::stoll
+            // throws) just omits the X-Inference-Time-Ms header — never fail
+            // the response over an observability detail.
+          }
         }
 
         // Retry-After on 503
@@ -337,6 +352,33 @@ parse_query_options(const drogon::HttpRequestPtr &req,
     out->want_layout = true;
   }
 
+  return {};
+}
+
+// Validate a per-request routing override (raw backend names extracted from
+// query params or the JSON body) against the sets of names the pipeline
+// actually registered (routing::routable_backend_names). An unknown name is a
+// 400 (ROUTING_UNKNOWN_OVERRIDE) — fail loudly rather than silently ignore an
+// override the operator expected to take effect. Empty names => no override.
+[[nodiscard]] inline ParseOptionsResult
+validate_routing_override(const std::string &table, const std::string &formula,
+                          const std::set<std::string> &valid_table,
+                          const std::set<std::string> &valid_formula,
+                          routing::RequestRouting *out) {
+  if (!table.empty()) {
+    if (valid_table.find(table) == valid_table.end())
+      return {"route_table override '" + table +
+                  "' names no configured table backend (see /capabilities)",
+              "ROUTING_UNKNOWN_OVERRIDE"};
+    out->table = table;
+  }
+  if (!formula.empty()) {
+    if (valid_formula.find(formula) == valid_formula.end())
+      return {"route_formula override '" + formula +
+                  "' names no configured formula backend (see /capabilities)",
+              "ROUTING_UNKNOWN_OVERRIDE"};
+    out->formula = formula;
+  }
   return {};
 }
 

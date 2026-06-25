@@ -154,7 +154,7 @@ The initial local numbers were inflated by wiring/config bugs, **not** model cei
 |---|---|---|---|---|
 | reading order never requested | RO 0.558; multi-column pages scrambled (and text inflated) | `tools/omnidoc_run.py` posted only `?layout=1`; the XY-cut order the server already computes was never asked for, so markdown was dumped in `(y,x)` order | request `?layout=1&reading_order=1` + map the result-indexed order to layout blocks in `omnidoc_to_md.py` | **RO 0.558 → 0.30, text 0.150 → 0.11** |
 | local formula backend inert | formula CDM 0.414 | `FORMULA_BACKEND=formulanet` fed only `encoder.onnx`, but PP-FormulaNet-S is split (resizer+encoder+decoder) → decoder never runs → every LaTeX empty → markdown falls back to the **text recognizer** reading formulas as garbled text | `FORMULA_BACKEND=ppformulanet_s` + the ORT sidecar (`scripts/ppformulanet_s_sidecar.py`) | **CDM 0.414 → 0.811** (nearly VL's 0.874) |
-| table cell-text dropped | table TEDS 0.644 (struct 0.855) — 45% of cells empty | `cell_matcher` required ≥70% of an OCR line's area inside a cell quad (SLANeXt quads are smaller than DB line boxes → ~35% of lines dropped); and cells the page detector missed stayed empty | gate 0.4 + argmax fallback (`cell_matcher.cpp`) **and** per-cell crop OCR — empty grid cells are recognized directly from their quad (`slanext_table_recognizer.cpp`) | **TEDS 0.644 → 0.767 (struct 0.872)** |
+| table cell-text dropped | table TEDS 0.644 (struct 0.855) — 45% of cells empty | `cell_matcher` required ≥70% of an OCR line's area inside a cell quad (SLANeXt quads are smaller than DB line boxes → ~35% of lines dropped); and cells the page detector missed stayed empty | gate 0.5 + argmax fallback (`cell_matcher.cpp`, swept 0.3/0.4/0.5 → 0.5 optimal) **and** per-cell crop OCR — empty grid cells are recognized directly from their quad (`slanext_table_recognizer.cpp`) | **TEDS 0.644 → 0.774 (struct 0.872)** |
 
 ### 5b. The full matrix (125 docs, PaddleOCR-VL-1.5)
 
@@ -162,7 +162,7 @@ The initial local numbers were inflated by wiring/config bugs, **not** model cei
 |---|---|---|---|---|---|---|---|---|
 | Local — as first shipped (inert formula, no RO) | 55 img/s | 0.150 | 0.644 | 0.855 | 0.191 | 0.414 † | 0.733 | 0.558 |
 | Local — + reading-order fix | 55 img/s | 0.127 | 0.646 | 0.861 | 0.184 | 0.414 † | 0.730 | 0.355 |
-| **Local — all fixes + per-cell OCR** | **28 img/s** | **0.127** | **0.767** | **0.872** | **0.152** | **0.811** | **0.296** | **0.317** |
+| **Local — all fixes + per-cell OCR + 0.5 gate** | **28 img/s** | **0.113** | **0.774** | **0.872** | **0.152** | **0.811** | **0.296** | **0.303** |
 | Local — medium tier (tiny is better here) | 30 img/s | 0.179 | 0.611 | 0.855 | 0.204 | 0.447 | 0.720 | 0.579 |
 | Hybrid — VL on regions, as first shipped | 6.1 img/s | 0.144 | 0.892 | 0.926 | 0.082 | 0.847 | 0.148 | 0.480 |
 | **Hybrid — + reading-order fix** | 6.1 img/s | **0.118** | 0.895 | 0.928 | 0.082 | 0.843 | 0.148 | **0.313** |
@@ -174,21 +174,25 @@ The initial local numbers were inflated by wiring/config bugs, **not** model cei
 
 | modality (metric) | local (fixed) | VL on region (hybrid) | VL full page |
 |---|---|---|---|
-| **text** (edit ↓) | 0.127 | 0.118 | **0.073** |
-| **table** (TEDS ↑) | 0.767 | 0.895 | **0.900** |
+| **text** (edit ↓) | 0.113 | 0.118 | **0.073** |
+| **table** (TEDS ↑) | 0.774 | 0.895 | **0.900** |
 | **table** (structure ↑) | 0.872 | 0.926 | **0.931** |
 | **formula** (CDM ↑) | **0.811** | 0.843 | **0.874** |
-| **reading order** (edit ↓) | 0.317 | 0.313 | **0.194** |
+| **reading order** (edit ↓) | 0.303 | 0.313 | **0.194** |
 
 What this actually says:
-- **The local pipeline is far stronger than the raw numbers first showed.** Four fixes took it from
-  "weak" (table 0.644, formula 0.414, RO 0.558) to **table 0.767, formula 0.811, RO 0.317, text 0.127**
-  — at **28 img/s**, ~20× VL-only and ~5× the hybrid. **Local formula (0.811) and table (0.767) are now
-  within striking distance of VL (0.874 / 0.900).** Remaining table headroom is wide-line splitting in
-  dense numeric grids; remaining RO gap (0.317 vs 0.194) is the XY-cut algorithm itself, not wiring.
+- **The local pipeline is far stronger than the raw numbers first showed.** Four fixes plus a swept
+  matcher gate took it from "weak" (table 0.644, formula 0.414, RO 0.558) to **table 0.774, formula
+  0.811, RO 0.303, text 0.113** — at **28 img/s**, ~20× VL-only and ~5× the hybrid. **Local formula
+  (0.811) and table (0.774) are now within striking distance of VL (0.874 / 0.900).** Remaining table
+  headroom is structure decode on complex spanning/borderless grids; remaining RO gap (0.303 vs 0.194)
+  is the XY-cut algorithm itself, not wiring (four reorder algorithms were tried — none beat the tuned
+  baseline).
 - **Memory caveat:** the local formula sidecar (ORT) needs VRAM headroom — sharing one 32 GB GPU with a
-  vLLM (15 GB) **OOMs and silently empties some formulas** (CDM drops to ~0.70). Give the formula
-  sidecar its own GPU or run local-only; the 0.811 above is the clean (vLLM-free) number.
+  vLLM (15 GB) can OOM and empty some formulas (CDM drops to ~0.70). This is **no longer silent**: the
+  sidecar fails loud if it can't reach the GPU, and a per-region failure now surfaces as
+  `formula_degraded` in the response. Give the formula sidecar its own GPU or run local-only; the 0.811
+  above is the clean (vLLM-free) number.
 - **VL-only is still the most accurate on everything** (text 0.073, table 0.900, formula 0.874, RO
   0.194) — one model over the whole page gives the most coherent result — but at **1.3 pages/s**.
 - **Hybrid ≈ VL-only on tables/formulas**, and after the RO fix it matches local on text/RO; its value

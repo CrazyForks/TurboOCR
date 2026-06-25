@@ -595,6 +595,26 @@ emit_pipeline_result_json(pipeline::OcrPipelineResult &out,
     j += ',';
     detail::append_formulas_array(j, out.formulas);
   }
+  // Additive degradation signal: present only when the formula stage actually
+  // failed a region (backend error, not empty input). Omitted on the clean
+  // path so existing responses stay byte-identical.
+  if (out.formula_degraded) {
+    j += ",\"formula_degraded\":true";
+    if (!out.formula_warning.empty()) {
+      j += ",\"formula_warning\":\"";
+      detail::append_escaped_string(j, out.formula_warning);
+      j += '"';
+    }
+  }
+  // Same additive contract for the table stage (see formula_degraded above).
+  if (out.table_degraded) {
+    j += ",\"table_degraded\":true";
+    if (!out.table_warning.empty()) {
+      j += ",\"table_warning\":\"";
+      detail::append_escaped_string(j, out.table_warning);
+      j += '"';
+    }
+  }
   j += '}';
   return j;
 }

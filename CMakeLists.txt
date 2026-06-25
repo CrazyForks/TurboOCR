@@ -478,7 +478,6 @@ else()
         src/router/cua_router.cpp
         src/router/region_features.cpp
         src/router/routing_plan.cpp
-        src/table/table_stage.cpp
         src/table/table_cls.cpp
         src/table/table_cell.cpp
         src/table/slanext_enc_split.cpp
@@ -549,7 +548,9 @@ else()
     # turbo_ocr_gpu, so they only build in the GPU configuration (the CPU
     # test binary links turbo_ocr_common only).
     target_sources(turbo_ocr_tests PRIVATE
+        tests/pipeline/test_finalize_deferred.cpp
         tests/table/test_cell_matcher.cpp
+        tests/table/test_otsl_to_html.cpp
         tests/table/test_html_reconstruct.cpp
         tests/table/test_slanext_dict.cpp
         tests/table/test_slanext_postprocess.cpp

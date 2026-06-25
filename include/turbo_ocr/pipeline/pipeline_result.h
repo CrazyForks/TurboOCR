@@ -51,6 +51,22 @@ struct OcrPipelineResult {
   std::vector<router::TableResult>       tables;
   std::vector<router::FormulaResult>     formulas;
   PendingExternal                        pending;  // deferred async work (empty on sync path)
+
+  // Set when a configured formula region failed to recognize (engine result
+  // ok==false, e.g. sidecar RPC crash/timeout) — distinct from a region that
+  // legitimately had no formula. Surfaced additively in the JSON response so a
+  // degraded formula stage never looks byte-identical to a clean empty result.
+  bool                                   formula_degraded = false;
+  // Human-readable detail for the degradation (empty when not degraded).
+  std::string                            formula_warning;
+
+  // Same contract for the table stage: set when a configured table region
+  // produced no structure (async backend transport failure / empty response,
+  // or local decode that yielded empty HTML). Without this, a remote-VLM
+  // timeout on the default async table backend would be byte-identical to a
+  // page that simply had no table.
+  bool                                   table_degraded = false;
+  std::string                            table_warning;
 };
 
 // Await + parse + assemble any deferred external (VLM) work into out.tables /

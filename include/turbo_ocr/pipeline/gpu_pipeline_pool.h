@@ -53,11 +53,10 @@ inline void maybe_load_router_models(OcrPipeline &pipeline) {
                            !env("FORMULA_ONNX").empty() ||
                            std::getenv("TABLE_BACKEND") != nullptr ||
                            !env("TABLE_CLS_TRT").empty() ||
-                           !env("TABLE_STRUCT_ONNX").empty() ||
                            !env("TABLE_SLANEXT_ENCODER_ONNX").empty() ||
                            !env("VLLM_TABLE_BASE_URL").empty();
   if (!want_router) return;
-  // Router (CuaRouter) + formula stage (+ legacy cell-det TableStage). A
+  // Router (CuaRouter) + formula stage. A
   // CONFIGURED backend that fails to load (out-of-memory / bad model) ABORTS
   // boot — we never start a server that silently produces no formulas/tables.
   if (!pipeline.load_router_models(

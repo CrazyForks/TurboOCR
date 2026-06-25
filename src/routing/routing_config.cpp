@@ -59,7 +59,13 @@ RoutingTable synth_from_env() {
   // builds the TESTED VLMFormula client (byte-identical to before this module).
   // The generic OpenAIEndpoint is reached ONLY via an explicit
   // TURBO_ROUTING_CONFIG kind:openai entry — opt-in, never the env default.
-  std::string fb = env_or("FORMULA_BACKEND", "formulanet");
+  // Default to the WORKING ORT-sidecar backend. "formulanet" (single fused-Loop
+  // TRT engine) is inert on TRT 10.15 — its decode never runs and it returns
+  // empty LaTeX while is_ready()==true, which would silently disable formula
+  // out of the box (violates the no-silent-failure contract). formulanet now
+  // also fails its own load() so an explicit FORMULA_BACKEND=formulanet aborts
+  // boot loudly rather than serving silent-empty.
+  std::string fb = env_or("FORMULA_BACKEND", "ppformulanet_s");
   {
     BackendSpec b; b.name = "formula-env"; b.kind = Kind::Local; b.engine = fb;
     t.backends["formula-env"] = b;

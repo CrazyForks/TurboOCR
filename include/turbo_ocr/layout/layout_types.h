@@ -94,8 +94,9 @@ inline constexpr int kImageClassId = 14; // "image"
 // display_formula). Used only by the OPT-IN nested-child protection in
 // layout_postfilter.h (LAYOUT_KEEP_NESTED_CHILDREN=1); the default merge
 // behaviour is unchanged. `text` (class 22) is deliberately excluded:
-// keeping a text region nested in a table region makes table_stage extract
-// the same text twice (once as a table cell, once as loose OCR).
+// keeping a text region nested in a table region makes the table recognizer's
+// cell matcher extract the same text twice (once as a table cell, once as
+// loose OCR).
 inline constexpr bool is_nestable_class(int class_id) noexcept {
   switch (class_id) {
     case 5:  // display_formula

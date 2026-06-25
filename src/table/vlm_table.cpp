@@ -242,8 +242,21 @@ void pad_rows(std::vector<Row> &rows) {
   size_t max_w = 0;
   for (const auto &r : rows) max_w = std::max(max_w, r.cells.size());
   for (auto &r : rows) {
+    if (r.cells.empty()) {
+      r.cells.resize(max_w, OtslElement{OtslTok::Ecel, ""});
+      continue;
+    }
+    // A short row usually means the decoder truncated the trailing colspan
+    // tokens of the row's LAST cell, so pad with <lcel> to left-merge the
+    // missing columns into it (appending <ecel> would fabricate phantom columns
+    // that shift every <ucel> rowspan below). EXCEPTION: a pure <ucel>
+    // rowspan-continuation cannot root a horizontal merge, so an <lcel> chained
+    // off it is malformed — in that one case pad with standalone <ecel> (same
+    // column count, valid geometry). Decide once from the last *real* cell.
+    const OtslTok pad_tok =
+        (r.cells.back().tok == OtslTok::Ucel) ? OtslTok::Ecel : OtslTok::Lcel;
     while (r.cells.size() < max_w) {
-      r.cells.push_back(OtslElement{OtslTok::Ecel, ""});
+      r.cells.push_back(OtslElement{pad_tok, ""});
     }
   }
 }
@@ -450,7 +463,11 @@ VLMTable::run(const GpuImage &page, const std::vector<Box> &regions,
     std::cerr << "[VLMTable] page D2H failed\n";
     return out;
   }
-  cudaStreamSynchronize(stream);
+  if (cudaError_t serr = cudaStreamSynchronize(stream); serr != cudaSuccess) {
+    std::cerr << "[VLMTable] page D2H stream sync failed: "
+              << cudaGetErrorString(serr) << '\n';
+    return out;
+  }
 
   const int n = static_cast<int>(regions.size());
   const int png_threads = std::max(1, get_env_int("VLM_PNG_THREADS", 4));
@@ -539,7 +556,11 @@ VLMTable::submit_async(const GpuImage &page,
                                       cudaMemcpyDeviceToHost, stream)) {
     return futs;
   }
-  cudaStreamSynchronize(stream);
+  if (cudaError_t serr = cudaStreamSynchronize(stream); serr != cudaSuccess) {
+    std::cerr << "[VLMTable] submit_async page D2H stream sync failed: "
+              << cudaGetErrorString(serr) << '\n';
+    return futs;
+  }
 
   const int png_threads = std::max(1, get_env_int("VLM_PNG_THREADS", 4));
   const int workers = std::min(png_threads, n);

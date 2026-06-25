@@ -24,6 +24,11 @@ public:
 
     std::size_t vocab_size() const noexcept { return id_to_token_.size(); }
 
+    // Learned end-of-sequence id (resolved from the tokenizer's "</s>" entry at
+    // load; falls back to 2). Callers that scan raw token rows for EOS must use
+    // this rather than a hard-coded literal.
+    int64_t eos_id() const noexcept { return eos_id_; }
+
     // Exposed for tests and the routing pipeline post-step.
     static std::string latex_post_process(const std::string& s);
 

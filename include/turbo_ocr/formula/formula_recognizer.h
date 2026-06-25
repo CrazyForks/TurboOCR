@@ -20,6 +20,12 @@ struct FormulaEngineResult {
   std::string latex;
   std::size_t token_count = 0;
   bool        hit_eos = false;
+  // Status channel: distinguishes "region legitimately had no formula"
+  // (ok==true, empty latex) from "the formula stage failed for this region"
+  // (ok==false, e.g. sidecar RPC crash/timeout). The pipeline surfaces ok==false
+  // as a per-response degraded flag so a degraded stage never looks identical to
+  // a clean empty result. Default true: backends opt in by clearing it on error.
+  bool        ok = true;
 };
 
 // Backend-agnostic formula recognition interface. Implementations may use

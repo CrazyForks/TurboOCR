@@ -4,6 +4,7 @@
 #include "turbo_ocr/engine/onnx_to_trt.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <iostream>
@@ -37,6 +38,26 @@ bool FormulaNet::load_model(const std::string &onnx_path) {
   }
   if (!discover_tensor_names()) return false;
   if (!allocate_buffers())      return false;
+
+  // FAIL LOUD: the single fused-Loop engine is INERT on TRT 10.15 (see the
+  // load_model header comment) — the MTP decode never runs, so run() would
+  // return empty LaTeX for every region while is_ready()==true. Serving that
+  // silently disables the formula stage, violating the no-silent-failure
+  // contract. Refuse to load so the fail-loud recognizer_registry boot aborts
+  // with a clear cause instead of starting a server that produces no formulas.
+  // Set TURBO_FORMULANET_ALLOW_INERT=1 only for the host-loop unit tests that
+  // exercise the decode trace without expecting real engine output.
+  if (const char *allow = std::getenv("TURBO_FORMULANET_ALLOW_INERT");
+      !allow || !allow[0]) {
+    std::cerr << "[FormulaNet] REFUSING to load: the fused-Loop formulanet "
+                 "engine is inert on TRT 10.15 (decode never runs -> silent "
+                 "empty LaTeX). Use FORMULA_BACKEND=ppformulanet_s (working "
+                 "ORT sidecar) or vlm. Set TURBO_FORMULANET_ALLOW_INERT=1 to "
+                 "override (testing only).\n";
+    engine_.reset();
+    buffers_allocated_ = false;
+    return false;
+  }
   return true;
 }
 
@@ -191,7 +212,7 @@ bool FormulaNet::run_sub_batch(const GpuImage &page,
   // Decode rows via the tokenizer. The tokenizer trims at the first EOS and
   // applies the LaTeX postprocess internally; we expose token_count / hit_eos
   // for downstream metrics (plan 03 §9 FormulaResult contract).
-  const int64_t eos_id = 2;  // matches FormulaTokenizer::eos_id_ default
+  const int64_t eos_id = tokenizer_->eos_id();  // learned, not a literal
   for (int i = 0; i < B; ++i) {
     const int64_t *row = h_output_.get() + i * T_clamped;
     std::size_t tok_count = static_cast<std::size_t>(T_clamped);

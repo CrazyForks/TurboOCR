@@ -1,10 +1,13 @@
 #include <catch_amalgamated.hpp>
 
 #include "turbo_ocr/common/serialization.h"
+#include "turbo_ocr/pipeline/pipeline_result.h"
 
 using turbo_ocr::OCRResultItem;
 using turbo_ocr::Box;
 using turbo_ocr::results_to_json;
+using turbo_ocr::emit_pipeline_result_json;
+using turbo_ocr::pipeline::OcrPipelineResult;
 
 TEST_CASE("results_to_json empty results", "[serialization]") {
   std::vector<OCRResultItem> results;
@@ -95,4 +98,39 @@ TEST_CASE("results_to_json multiple results separated by commas", "[serializatio
       comma_count++;
   }
   CHECK(comma_count == 2);
+}
+
+TEST_CASE("emit_pipeline_result_json omits degraded keys on the clean path",
+          "[serialization]") {
+  OcrPipelineResult out;
+  out.results.push_back({.text = "A", .confidence = 0.9f, .box = Box{}});
+  auto json = emit_pipeline_result_json(out, /*want_blocks=*/false);
+  CHECK(json.find("formula_degraded") == std::string::npos);
+  CHECK(json.find("formula_warning") == std::string::npos);
+  CHECK(json.find("table_degraded") == std::string::npos);
+  CHECK(json.find("table_warning") == std::string::npos);
+}
+
+TEST_CASE("emit_pipeline_result_json surfaces a degraded formula stage",
+          "[serialization]") {
+  OcrPipelineResult out;
+  out.results.push_back({.text = "A", .confidence = 0.9f, .box = Box{}});
+  out.formula_degraded = true;
+  out.formula_warning = "formula stage degraded: 2 of 3 region(s) failed";
+  auto json = emit_pipeline_result_json(out, /*want_blocks=*/false);
+  CHECK(json.find("\"formula_degraded\":true") != std::string::npos);
+  CHECK(json.find("\"formula_warning\":\"formula stage degraded: 2 of 3 "
+                  "region(s) failed\"") != std::string::npos);
+}
+
+TEST_CASE("emit_pipeline_result_json surfaces a degraded table stage",
+          "[serialization]") {
+  OcrPipelineResult out;
+  out.results.push_back({.text = "A", .confidence = 0.9f, .box = Box{}});
+  out.table_degraded = true;
+  out.table_warning = "table stage degraded: 1 of 2 region(s) produced no HTML";
+  auto json = emit_pipeline_result_json(out, /*want_blocks=*/false);
+  CHECK(json.find("\"table_degraded\":true") != std::string::npos);
+  CHECK(json.find("\"table_warning\":\"table stage degraded: 1 of 2 "
+                  "region(s) produced no HTML\"") != std::string::npos);
 }

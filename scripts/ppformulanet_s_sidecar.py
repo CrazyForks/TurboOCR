@@ -65,6 +65,51 @@ def _log(msg: str) -> None:
     sys.stderr.flush()
 
 
+def _compute_ld_fix(libdirs: "list[str]", current_ld: str) -> "str | None":
+    """Pure decision for the LD self-heal (no env/exec) so it is unit-testable.
+
+    Returns the LD_LIBRARY_PATH that makes every dir in `libdirs` reachable
+    (those dirs prepended to `current_ld`), or None when nothing needs to change
+    (no libdirs, or all already present).
+    """
+    if not libdirs:
+        return None
+    cur_dirs = set(current_ld.split(":")) if current_ld else set()
+    if all(d in cur_dirs for d in libdirs):
+        return None
+    return ":".join(libdirs) + (":" + current_ld if current_ld else "")
+
+
+def _ensure_gpu_runtime_libs() -> None:
+    """Self-heal LD_LIBRARY_PATH so the CUDA EP's cu12 deps load.
+
+    onnxruntime-gpu's CUDA provider dlopens bundled cu12 libs (libcublasLt.so.12
+    etc.). When the parent (the C++ server) exports a cu13 TensorRT
+    LD_LIBRARY_PATH, those cu12 libs are shadowed, the CUDA provider fails to
+    load, and ORT silently falls back to CPU — a ~50x perf cliff the C++ side
+    cannot observe. Prepend this interpreter's nvidia/*/lib dirs and re-exec
+    once (guarded against a re-exec loop). Opt out with PPFNS_NO_LD_FIX=1.
+    """
+    if os.environ.get("PPFNS_NO_LD_FIX") or os.environ.get("_PPFNS_LD_FIXED"):
+        return
+    libdirs = sorted(
+        str(p) for p in (Path(sys.prefix) / "lib").glob(
+            "python*/site-packages/nvidia/*/lib") if p.is_dir())
+    new_ld = _compute_ld_fix(libdirs, os.environ.get("LD_LIBRARY_PATH", ""))
+    if new_ld is None:
+        return  # nothing to fix (no bundled cu12 libs, or already reachable)
+    os.environ["LD_LIBRARY_PATH"] = new_ld
+    os.environ["_PPFNS_LD_FIXED"] = "1"
+    _log("re-exec with cu12 nvidia libs prepended to LD_LIBRARY_PATH")
+    try:
+        # PR_SET_PDEATHSIG survives execv (per-process, not per-image), so the
+        # parent-death signal armed before this call still holds across re-exec.
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except OSError as e:
+        _log(f"FATAL: re-exec failed: {e}")
+        sys.exit(4)
+
+
 def _crop_margin_bgr(bgr: np.ndarray) -> np.ndarray:
     """Strip blank margins from a BGR crop. cv2 luma + bbox.
 
@@ -181,7 +226,22 @@ class FormulaService:
 
         self.sess = ort.InferenceSession(
             str(model_path), sess_options=sess_opts, providers=providers)
-        _log(f"model loaded in {time.monotonic()-t0:.2f}s providers={self.sess.get_providers()}")
+        active = self.sess.get_providers()
+        _log(f"model loaded in {time.monotonic()-t0:.2f}s providers={active}")
+        # No-silent-failure: a GPU OCR server's formula sidecar must run on the
+        # GPU. If the session is CPU-only — whether because cu12 runtime libs are
+        # shadowed (CUDA in avail but not active) or because a CPU-only
+        # onnxruntime is installed (CUDA absent from avail entirely) — refuse to
+        # serve a ~50x-slower CPU path. Exiting makes the C++ load() fail loud so
+        # the server refuses to start rather than silently degrade. Override with
+        # PPFNS_ALLOW_CPU=1 for a deliberate CPU-only deployment.
+        if "CUDAExecutionProvider" not in active and not os.environ.get("PPFNS_ALLOW_CPU"):
+            why = ("cu12 runtime libs not loadable"
+                   if "CUDAExecutionProvider" in avail
+                   else "onnxruntime has no CUDA provider (CPU-only package?)")
+            _log(f"FATAL: formula sidecar is CPU-only ({why}). Refusing silent "
+                 "CPU fallback — set PPFNS_ALLOW_CPU=1 to override.")
+            sys.exit(3)
         self.input_name = self.sess.get_inputs()[0].name
         self.output_name = self.sess.get_outputs()[0].name
 
@@ -412,7 +472,11 @@ def _install_parent_death_signal() -> None:
 
 
 def main() -> int:
+    # Arm parent-death FIRST: PR_SET_PDEATHSIG survives the execv inside
+    # _ensure_gpu_runtime_libs, so arming before the (possible) re-exec keeps the
+    # orphan window minimal.
     _install_parent_death_signal()
+    _ensure_gpu_runtime_libs()  # may re-exec; must run before onnxruntime import
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--tokenizer", required=True)

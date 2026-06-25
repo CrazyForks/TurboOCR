@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
+#include <iostream>
 #include <string>
 #include <utility>
 
@@ -72,28 +73,68 @@ namespace turbo_ocr::pipeline {
 // See pipeline_result.h. No-op when out.pending is empty (sync path).
 void finalize_deferred(OcrPipelineResult &out) {
   auto &pe = out.pending;
+  // The deferred (async) path is what the DEFAULT vlm backend uses. Mirror the
+  // synchronous path's no-silent-failure contract: every region here was a
+  // table/formula crop dispatched to the backend, so an empty parse result —
+  // whether from an exhausted transport failure (the pool resolves the future
+  // with "" on a 4xx/exhausted-retry) or a broken-promise throw — means the
+  // stage produced nothing for a region it was asked to handle. Count those and
+  // surface a degradation flag so a remote timeout can never look byte-identical
+  // to a page that genuinely had no table/formula.
   if (pe.formula_rec && !pe.formula.empty()) {
     out.formulas.reserve(out.formulas.size() + pe.formula.size());
+    std::size_t degraded = 0;
     for (auto &pc : pe.formula) {
-      std::string raw = pc.fut.get();           // the only blocking point
+      std::string latex;
+      try {
+        std::string raw = pc.fut.get();         // the only blocking point
+        latex = pe.formula_rec->parse_async_result(raw);
+      } catch (const std::exception &e) {
+        std::cerr << "[finalize_deferred] formula future threw: " << e.what() << '\n';
+      }
+      if (latex.empty()) ++degraded;
       router::FormulaResult fr;
       fr.layout_id = pc.layout_id;
-      fr.latex     = pe.formula_rec->parse_async_result(raw);
+      fr.latex     = std::move(latex);
       fr.score     = pc.score;
       fr.box       = pc.box;
       out.formulas.push_back(std::move(fr));
     }
+    if (degraded > 0) {
+      out.formula_degraded = true;
+      out.formula_warning =
+          "formula stage degraded: " + std::to_string(degraded) + " of " +
+          std::to_string(pe.formula.size()) +
+          " region(s) produced no LaTeX (async backend transport failure or "
+          "empty response, not empty input)";
+    }
   }
   if (pe.table_rec && !pe.table.empty()) {
     out.tables.reserve(out.tables.size() + pe.table.size());
+    std::size_t degraded = 0;
     for (auto &pc : pe.table) {
-      std::string raw = pc.fut.get();
+      std::string html;
+      try {
+        std::string raw = pc.fut.get();
+        html = pe.table_rec->parse_async_result(raw);
+      } catch (const std::exception &e) {
+        std::cerr << "[finalize_deferred] table future threw: " << e.what() << '\n';
+      }
+      if (html.empty()) ++degraded;
       router::TableResult tr;
       tr.layout_id = pc.layout_id;
-      tr.html      = pe.table_rec->parse_async_result(raw);
+      tr.html      = std::move(html);
       tr.score     = pc.score;
       tr.box       = pc.box;
       out.tables.push_back(std::move(tr));
+    }
+    if (degraded > 0) {
+      out.table_degraded = true;
+      out.table_warning =
+          "table stage degraded: " + std::to_string(degraded) + " of " +
+          std::to_string(pe.table.size()) +
+          " region(s) produced no HTML (async backend transport failure or "
+          "empty response, not empty input)";
     }
   }
   pe = PendingExternal{};

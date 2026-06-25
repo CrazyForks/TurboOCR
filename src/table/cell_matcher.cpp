@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 #ifdef __has_include
 #  if __has_include(<boost/geometry.hpp>)
@@ -50,6 +51,74 @@ std::array<float, 4> quad_to_bbox(const std::array<int, 8>& quad) {
             static_cast<float>(xmax), static_cast<float>(ymax)};
 }
 
+namespace {
+// Per-cell reading order: top-to-bottom by row band (8px tolerance), then
+// left-to-right — so multi-line cell text joins correctly regardless of
+// page-global OCR order.
+inline bool reading_order_less(const std::vector<OcrLine>& ocr,
+                               std::size_t a, std::size_t b) {
+    const auto& ba = ocr[a].bbox; const auto& bb = ocr[b].bbox;
+    const int ra = static_cast<int>(std::floor(ba[1] / READING_ORDER_BAND_PX));
+    const int rb = static_cast<int>(std::floor(bb[1] / READING_ORDER_BAND_PX));
+    if (ra != rb) return ra < rb;
+    return ba[0] < bb[0];
+}
+
+// Overlap fraction a line must have inside a cell quad to be placed there. PaddleX
+// uses 0.7, but SLANeXt quads are smaller than DB text-line boxes so 0.7 drops too
+// many; 0.5 is the OmniDocBench-125 optimum. Env-tunable (TABLE_MATCH_INTER) for sweeps.
+inline float match_threshold() {
+    static const float t = [] {
+        if (const char* e = std::getenv("TABLE_MATCH_INTER")) {
+            const float v = std::strtof(e, nullptr);
+            if (v > 0.0f) return v;
+        }
+        return MATCH_INTER_THRESHOLD;
+    }();
+    return t;
+}
+// A line clearing no cell's threshold is rescued into its argmax cell when at least
+// this fraction overlaps, so a line straddling internal boundaries is never silently
+// dropped; 0 disables the rescue. Env-tunable (TABLE_MATCH_FALLBACK).
+inline float fallback_floor() {
+    static const float t = [] {
+        if (const char* e = std::getenv("TABLE_MATCH_FALLBACK"))
+            return std::strtof(e, nullptr);
+        return 0.15f;
+    }();
+    return t;
+}
+// Rescue still-unassigned lines into their argmax cell (>= floor), then sort each
+// cell's indices into reading order. PaddleX's match_table_and_ocr places a line in
+// EVERY cell it clears the threshold for (one line may land in multiple cells) —
+// empirically higher TEDS than forcing one cell. `assigned[i]` marks lines already
+// placed during the per-cell threshold pass.
+inline void finalize_multicell(const std::vector<OcrLine>& ocr,
+                               std::vector<MatchedCell>& out,
+                               std::vector<char>& assigned) {
+    const float floor = fallback_floor();
+    for (std::size_t i = 0; i < ocr.size(); ++i) {
+        if (assigned[i]) continue;
+        float best = 0.0f;
+        std::size_t bestc = out.size();
+        for (std::size_t c = 0; c < out.size(); ++c) {
+            const float r = compute_inter(out[c].bbox, ocr[i].bbox);
+            if (r > best) { best = r; bestc = c; }
+        }
+        if (bestc < out.size() && best > floor) {
+            out[bestc].ocr_indices.push_back(i);
+            assigned[i] = 1;
+        }
+    }
+    for (auto& cell : out) {
+        std::sort(cell.ocr_indices.begin(), cell.ocr_indices.end(),
+                  [&ocr](std::size_t a, std::size_t b) {
+                      return reading_order_less(ocr, a, b);
+                  });
+    }
+}
+} // namespace
+
 #ifdef TURBO_OCR_HAS_BOOST_GEOMETRY
 
 namespace bg = boost::geometry;
@@ -73,60 +142,29 @@ std::vector<MatchedCell> match_cells_to_ocr(
 
     std::vector<MatchedCell> out;
     out.reserve(cells.size());
-    std::vector<char> assigned(ocr.size(), 0);  // global: did this line land in any cell?
-    for (const auto& quad : cells) {
-        const auto cell_bbox = quad_to_bbox(quad);
+    for (const auto& quad : cells)
+        out.push_back(MatchedCell{quad_to_bbox(quad), {}});
+
+    // PaddleX match_table_and_ocr semantics: a line goes into EVERY cell where
+    // >threshold of its area overlaps (one line may land in multiple cells — this
+    // scores higher TEDS than forcing one cell). Unmatched lines are rescued in
+    // finalize. The rtree query yields each line once per cell, so no per-cell dedup.
+    const float thr = match_threshold();
+    std::vector<char> assigned(ocr.size(), 0);
+    for (std::size_t c = 0; c < out.size(); ++c) {
+        const auto& cell_bbox = out[c].bbox;
         const BBox query(BPoint(cell_bbox[0], cell_bbox[1]),
                          BPoint(cell_bbox[2], cell_bbox[3]));
-        std::vector<std::size_t> indices;
         for (auto it = tree.qbegin(bgi::intersects(query));
              it != tree.qend(); ++it) {
             const std::size_t i = it->second;
-            if (compute_inter(cell_bbox, ocr[i].bbox) > MATCH_INTER_THRESHOLD) {
-                indices.push_back(i);
+            if (compute_inter(cell_bbox, ocr[i].bbox) > thr) {
+                out[c].ocr_indices.push_back(i);
                 assigned[i] = 1;
             }
         }
-        // Reading order within the cell: top-to-bottom by row band (8px
-        // tolerance), then left-to-right — so multi-line cell text joins correctly
-        // regardless of page-global OCR order.
-        std::sort(indices.begin(), indices.end(),
-                  [&ocr](std::size_t a, std::size_t b) {
-                      const auto& ba = ocr[a].bbox; const auto& bb = ocr[b].bbox;
-                      const int ra = static_cast<int>(std::floor(ba[1] / READING_ORDER_BAND_PX));
-                      const int rb = static_cast<int>(std::floor(bb[1] / READING_ORDER_BAND_PX));
-                      if (ra != rb) return ra < rb;
-                      return ba[0] < bb[0];
-                  });
-        out.push_back(MatchedCell{cell_bbox, std::move(indices)});
     }
-    // Fallback: never silently drop a detected OCR line. A line straddling cell
-    // boundaries (dense numeric grids) can miss the threshold for every cell — assign
-    // each still-unassigned line to the cell whose quad it overlaps most.
-    auto cell_order = [&ocr](std::size_t a, std::size_t b) {
-        const auto& ba = ocr[a].bbox; const auto& bb = ocr[b].bbox;
-        const int ra = static_cast<int>(std::floor(ba[1] / READING_ORDER_BAND_PX));
-        const int rb = static_cast<int>(std::floor(bb[1] / READING_ORDER_BAND_PX));
-        if (ra != rb) return ra < rb;
-        return ba[0] < bb[0];
-    };
-    for (std::size_t i = 0; i < ocr.size(); ++i) {
-        if (assigned[i]) continue;
-        float best = 0.0f;
-        std::size_t bestc = out.size();
-        for (std::size_t c = 0; c < out.size(); ++c) {
-            const float r = compute_inter(out[c].bbox, ocr[i].bbox);
-            if (r > best) { best = r; bestc = c; }
-        }
-        // Only rescue lines genuinely straddling internal cell boundaries (>=15% of
-        // the line in its best cell); a line mostly outside the table stays unassigned.
-        if (bestc < out.size() && best > 0.15f) {
-            out[bestc].ocr_indices.push_back(i);
-            std::sort(out[bestc].ocr_indices.begin(),
-                      out[bestc].ocr_indices.end(), cell_order);
-            assigned[i] = 1;
-        }
-    }
+    finalize_multicell(ocr, out, assigned);
     return out;
 }
 
@@ -189,67 +227,35 @@ std::vector<MatchedCell> match_cells_to_ocr(
 
     std::vector<MatchedCell> out;
     out.reserve(cells.size());
-    std::vector<char> assigned(ocr.size(), 0);  // global: did this line land in any cell?
-    for (const auto& quad : cells) {
-        const auto cell_bbox = quad_to_bbox(quad);
-        std::vector<std::size_t> indices;
-        if (ocr.empty()) {
-            out.push_back(MatchedCell{cell_bbox, std::move(indices)});
-            continue;
-        }
+    for (const auto& quad : cells)
+        out.push_back(MatchedCell{quad_to_bbox(quad), {}});
+    if (ocr.empty()) return out;
+
+    // Multi-cell (see rtree variant): a line goes into every cell it clears the
+    // threshold for. A line spans multiple grid buckets, so a per-cell `seen`
+    // guard avoids adding it to the SAME cell twice; across cells it may repeat.
+    const float thr = match_threshold();
+    std::vector<char> assigned(ocr.size(), 0);
+    std::vector<char> seen(ocr.size(), 0);
+    for (std::size_t c = 0; c < out.size(); ++c) {
+        const auto& cell_bbox = out[c].bbox;
         int bx0, by0, bx1, by1;
         grid.range(cell_bbox, bx0, by0, bx1, by1);
-        std::vector<char> seen(ocr.size(), 0);
+        std::fill(seen.begin(), seen.end(), 0);
         for (int gy = by0; gy <= by1; ++gy) {
             for (int gx = bx0; gx <= bx1; ++gx) {
                 for (std::size_t i : grid.buckets[gy][gx]) {
                     if (seen[i]) continue;
                     seen[i] = 1;
-                    if (compute_inter(cell_bbox, ocr[i].bbox) > MATCH_INTER_THRESHOLD) {
-                        indices.push_back(i);
+                    if (compute_inter(cell_bbox, ocr[i].bbox) > thr) {
+                        out[c].ocr_indices.push_back(i);
                         assigned[i] = 1;
                     }
                 }
             }
         }
-        // Reading order within the cell: top-to-bottom by row band (8px
-        // tolerance), then left-to-right — so multi-line cell text joins correctly
-        // regardless of page-global OCR order.
-        std::sort(indices.begin(), indices.end(),
-                  [&ocr](std::size_t a, std::size_t b) {
-                      const auto& ba = ocr[a].bbox; const auto& bb = ocr[b].bbox;
-                      const int ra = static_cast<int>(std::floor(ba[1] / READING_ORDER_BAND_PX));
-                      const int rb = static_cast<int>(std::floor(bb[1] / READING_ORDER_BAND_PX));
-                      if (ra != rb) return ra < rb;
-                      return ba[0] < bb[0];
-                  });
-        out.push_back(MatchedCell{cell_bbox, std::move(indices)});
     }
-    // Fallback: never silently drop a detected OCR line (see rtree variant above).
-    auto cell_order = [&ocr](std::size_t a, std::size_t b) {
-        const auto& ba = ocr[a].bbox; const auto& bb = ocr[b].bbox;
-        const int ra = static_cast<int>(std::floor(ba[1] / READING_ORDER_BAND_PX));
-        const int rb = static_cast<int>(std::floor(bb[1] / READING_ORDER_BAND_PX));
-        if (ra != rb) return ra < rb;
-        return ba[0] < bb[0];
-    };
-    for (std::size_t i = 0; i < ocr.size(); ++i) {
-        if (assigned[i]) continue;
-        float best = 0.0f;
-        std::size_t bestc = out.size();
-        for (std::size_t c = 0; c < out.size(); ++c) {
-            const float r = compute_inter(out[c].bbox, ocr[i].bbox);
-            if (r > best) { best = r; bestc = c; }
-        }
-        // Only rescue lines genuinely straddling internal cell boundaries (>=15% of
-        // the line in its best cell); a line mostly outside the table stays unassigned.
-        if (bestc < out.size() && best > 0.15f) {
-            out[bestc].ocr_indices.push_back(i);
-            std::sort(out[bestc].ocr_indices.begin(),
-                      out[bestc].ocr_indices.end(), cell_order);
-            assigned[i] = 1;
-        }
-    }
+    finalize_multicell(ocr, out, assigned);
     return out;
 }
 

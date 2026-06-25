@@ -15,7 +15,6 @@
 #include "turbo_ocr/router/cua_router.h"
 #include "turbo_ocr/routing/routing_config.h"
 #include "turbo_ocr/table/table_recognizer.h"
-#include "turbo_ocr/table/table_stage.h"
 #include "turbo_ocr/table/cell_matcher.h"
 #include "turbo_ocr/table/html_reconstruct.h"
 #include "turbo_ocr/table/slanext_enc_split.h"
@@ -103,8 +102,18 @@ void OcrPipeline::dispatch_router_(OcrPipelineResult &out,
       // Local structure backends fill empty grid cells via per-cell crop OCR.
       table_rec->set_cell_recognizer(rec_.get());
       out.tables = table_rec->run(gpu_img, tboxes, out.results, table_stream_);
-      for (std::size_t i = 0; i < out.tables.size() && i < tlids.size(); ++i)
+      std::size_t degraded_tables = 0;
+      for (std::size_t i = 0; i < out.tables.size() && i < tlids.size(); ++i) {
         out.tables[i].layout_id = tlids[i];
+        if (out.tables[i].html.empty()) ++degraded_tables;  // decode produced nothing
+      }
+      if (degraded_tables > 0) {
+        out.table_degraded = true;
+        out.table_warning =
+            "table stage degraded: " + std::to_string(degraded_tables) + " of " +
+            std::to_string(out.tables.size()) +
+            " region(s) produced no HTML (structure decode failed, not empty input)";
+      }
     }
     timer.gpu_stop();
     CUDA_CHECK(cudaEventRecord(table_done_event_, table_stream_));
@@ -142,14 +151,34 @@ void OcrPipeline::dispatch_router_(OcrPipelineResult &out,
     } else {
       auto eng_res = formula_rec->run(gpu_img, fboxes, formula_stream_);
       out.formulas.reserve(eng_res.size());
+      std::size_t degraded_regions = 0;
       for (std::size_t i = 0; i < eng_res.size() && i < flids.size(); ++i) {
         const int lid = flids[i];
+        // A dispatched formula region that yields no LaTeX is degraded — whether
+        // the backend flagged ok==false (sidecar RPC crash) or simply returned
+        // empty (a VLM transport failure resolves to "" with ok left default).
+        // These regions were classified as formula, so empty == recognition
+        // failure, never a clean "no formula here". Mirrors the async
+        // finalize_deferred check so sync and async degrade identically.
+        if (!eng_res[i].ok || eng_res[i].latex.empty()) ++degraded_regions;
         router::FormulaResult fr;
         fr.layout_id = lid;
         fr.latex     = std::move(eng_res[i].latex);
         fr.score     = out.layout[lid].score;      // proxy until engine surfaces one
         fr.box       = out.layout[lid].box;
         out.formulas.push_back(std::move(fr));
+      }
+      // Backend under-returned (e.g. an empty vector on a transient page-D2H /
+      // stream-sync failure): every dispatched region with no result is degraded.
+      if (eng_res.size() < flids.size())
+        degraded_regions += flids.size() - eng_res.size();
+      if (degraded_regions > 0) {
+        out.formula_degraded = true;
+        out.formula_warning =
+            "formula stage degraded: " + std::to_string(degraded_regions) +
+            " of " + std::to_string(flids.size()) +
+            " region(s) produced no LaTeX (backend error or empty result, not "
+            "empty input)";
       }
     }
     timer.gpu_stop();

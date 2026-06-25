@@ -41,6 +41,20 @@ inline constexpr float kVerticalAspectRatio = 1.5f;
   return {x0, y0, x1, y1};
 }
 
+// Clamp a Box's axis-aligned rect to the [0,cols)×[0,rows) page bounds and
+// return it as [x0, y0, w, h] with w,h >= 1. Shared crop-rect computation for
+// the formula/table VLM crop sites (page D2H → per-region crop) so the
+// clamp-and-size logic lives in exactly one place.
+[[nodiscard]] inline std::array<int, 4>
+clamped_crop_rect(const Box &b, int cols, int rows) noexcept {
+  const auto r = aabb(b);
+  const int x0 = std::clamp(r[0], 0, std::max(0, cols - 1));
+  const int y0 = std::clamp(r[1], 0, std::max(0, rows - 1));
+  const int x1 = std::clamp(r[2], x0, cols);
+  const int y1 = std::clamp(r[3], y0, rows);
+  return {x0, y0, std::max(1, x1 - x0), std::max(1, y1 - y0)};
+}
+
 // Check if a box is vertically oriented (height >= width * 1.5).
 // Uses integer arithmetic to avoid floating-point precision issues.
 [[nodiscard]] inline bool is_vertical_box(const Box &b) noexcept {

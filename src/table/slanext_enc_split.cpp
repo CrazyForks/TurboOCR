@@ -151,9 +151,16 @@ StructureResult SlanextEncSplit::infer(const GpuImage& page, const Box& region,
   // then one TRT execute -> feature [1, 256, 96].
   kernels::cuda_fused_slanext_pre_rgb(page, rx, ry, rw, rh, d_image_.get(), stream);
   nvinfer1::Dims4 in_dims{1, 3, kInputSize, kInputSize};
-  if (!engine_->set_input_shape(input_name_, in_dims)) return empty;
+  if (!engine_->set_input_shape(input_name_, in_dims)) {
+    std::cerr << "[slanext-split] encoder set_input_shape failed for region ["
+              << rx << ',' << ry << ',' << rw << 'x' << rh
+              << "] — table region DROPPED\n";
+    return empty;
+  }
   if (!engine_->execute(stream)) {
-    std::cerr << "[slanext-split] encoder execute failed\n";
+    std::cerr << "[slanext-split] encoder execute failed for region ["
+              << rx << ',' << ry << ',' << rw << 'x' << rh
+              << "] — table region DROPPED\n";
     return empty;
   }
   CUDA_CHECK(cudaMemcpyAsync(h_feat_.get(), d_feat_.get(),

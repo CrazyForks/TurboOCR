@@ -328,15 +328,9 @@ VLMFormula::run_pool(const std::vector<uint8_t> &host_page,
   std::vector<std::vector<uint8_t>> crops_png(n);
   if (workers <= 1) {
     for (int i = 0; i < n; ++i) {
-      auto r = aabb(boxes[i]);
-      int x0 = std::clamp(r[0], 0, std::max(0, page.cols - 1));
-      int y0 = std::clamp(r[1], 0, std::max(0, page.rows - 1));
-      int x1 = std::clamp(r[2], x0, page.cols);
-      int y1 = std::clamp(r[3], y0, page.rows);
-      int w = std::max(1, x1 - x0);
-      int h = std::max(1, y1 - y0);
-      const uint8_t *src = host_page.data() + (size_t)y0 * page.step + (size_t)x0 * 3;
-      crops_png[i] = encode_png_bgr(src, w, h, (int)page.step);
+      auto cr = clamped_crop_rect(boxes[i], page.cols, page.rows);
+      const uint8_t *src = host_page.data() + (size_t)cr[1] * page.step + (size_t)cr[0] * 3;
+      crops_png[i] = encode_png_bgr(src, cr[2], cr[3], (int)page.step);
     }
   } else {
     std::vector<std::thread> enc_threads;
@@ -346,15 +340,9 @@ VLMFormula::run_pool(const std::vector<uint8_t> &host_page,
       enc_threads.emplace_back([&, t] {
         for (int i = next.fetch_add(1, std::memory_order_relaxed); i < n;
              i = next.fetch_add(1, std::memory_order_relaxed)) {
-          auto r = aabb(boxes[i]);
-          int x0 = std::clamp(r[0], 0, std::max(0, page.cols - 1));
-          int y0 = std::clamp(r[1], 0, std::max(0, page.rows - 1));
-          int x1 = std::clamp(r[2], x0, page.cols);
-          int y1 = std::clamp(r[3], y0, page.rows);
-          int w = std::max(1, x1 - x0);
-          int h = std::max(1, y1 - y0);
-          const uint8_t *src = host_page.data() + (size_t)y0 * page.step + (size_t)x0 * 3;
-          crops_png[i] = encode_png_bgr(src, w, h, (int)page.step);
+          auto cr = clamped_crop_rect(boxes[i], page.cols, page.rows);
+          const uint8_t *src = host_page.data() + (size_t)cr[1] * page.step + (size_t)cr[0] * 3;
+          crops_png[i] = encode_png_bgr(src, cr[2], cr[3], (int)page.step);
         }
       });
     }
@@ -378,6 +366,10 @@ VLMFormula::run_pool(const std::vector<uint8_t> &host_page,
     res.latex = extract_latex(raw);
     res.token_count = res.latex.size();
     res.hit_eos = !res.latex.empty();
+    // A transport failure resolves the pool future to "" -> empty latex; mark
+    // the region failed so the sync pipeline flags degradation rather than
+    // treating it as a formula-free region.
+    res.ok = !res.latex.empty();
     out[i] = std::move(res);
   }
   return out;
@@ -402,15 +394,9 @@ VLMFormula::submit_async(const std::vector<uint8_t> &host_page,
   // Parallel PNG encode (same as run_pool).
   if (workers <= 1) {
     for (int i = 0; i < n; ++i) {
-      auto r = aabb(boxes[i]);
-      int x0 = std::clamp(r[0], 0, std::max(0, page.cols - 1));
-      int y0 = std::clamp(r[1], 0, std::max(0, page.rows - 1));
-      int x1 = std::clamp(r[2], x0, page.cols);
-      int y1 = std::clamp(r[3], y0, page.rows);
-      int w = std::max(1, x1 - x0);
-      int h = std::max(1, y1 - y0);
-      const uint8_t *src = host_page.data() + (size_t)y0 * page.step + (size_t)x0 * 3;
-      crops_png[i] = encode_png_bgr(src, w, h, (int)page.step);
+      auto cr = clamped_crop_rect(boxes[i], page.cols, page.rows);
+      const uint8_t *src = host_page.data() + (size_t)cr[1] * page.step + (size_t)cr[0] * 3;
+      crops_png[i] = encode_png_bgr(src, cr[2], cr[3], (int)page.step);
     }
   } else {
     std::vector<std::thread> enc_threads;
@@ -420,15 +406,9 @@ VLMFormula::submit_async(const std::vector<uint8_t> &host_page,
       enc_threads.emplace_back([&, t] {
         for (int i = next.fetch_add(1, std::memory_order_relaxed); i < n;
              i = next.fetch_add(1, std::memory_order_relaxed)) {
-          auto r = aabb(boxes[i]);
-          int x0 = std::clamp(r[0], 0, std::max(0, page.cols - 1));
-          int y0 = std::clamp(r[1], 0, std::max(0, page.rows - 1));
-          int x1 = std::clamp(r[2], x0, page.cols);
-          int y1 = std::clamp(r[3], y0, page.rows);
-          int w = std::max(1, x1 - x0);
-          int h = std::max(1, y1 - y0);
-          const uint8_t *src = host_page.data() + (size_t)y0 * page.step + (size_t)x0 * 3;
-          crops_png[i] = encode_png_bgr(src, w, h, (int)page.step);
+          auto cr = clamped_crop_rect(boxes[i], page.cols, page.rows);
+          const uint8_t *src = host_page.data() + (size_t)cr[1] * page.step + (size_t)cr[0] * 3;
+          crops_png[i] = encode_png_bgr(src, cr[2], cr[3], (int)page.step);
         }
       });
     }
@@ -471,7 +451,10 @@ VLMFormula::submit_async(const GpuImage &page, const std::vector<Box> &boxes,
     std::cerr << "[VLMFormula] async page D2H failed\n";
     return futs;
   }
-  cudaStreamSynchronize(stream);
+  if (cudaError_t serr = cudaStreamSynchronize(stream); serr != cudaSuccess) {
+    std::cerr << "[VLMFormula] page D2H sync failed: " << cudaGetErrorString(serr) << '\n';
+    return futs;
+  }
   return submit_async(host_page, page, boxes);
 }
 
@@ -493,15 +476,9 @@ VLMFormula::run_legacy(const std::vector<uint8_t> &host_page,
   std::vector<std::vector<uint8_t>> crops_png;
   crops_png.reserve(boxes.size());
   for (const auto &b : boxes) {
-    auto r = aabb(b);
-    int x0 = std::clamp(r[0], 0, std::max(0, page.cols - 1));
-    int y0 = std::clamp(r[1], 0, std::max(0, page.rows - 1));
-    int x1 = std::clamp(r[2], x0, page.cols);
-    int y1 = std::clamp(r[3], y0, page.rows);
-    int w = std::max(1, x1 - x0);
-    int h = std::max(1, y1 - y0);
-    const uint8_t *src = host_page.data() + (size_t)y0 * page.step + (size_t)x0 * 3;
-    crops_png.push_back(encode_png_bgr(src, w, h, (int)page.step));
+    auto cr = clamped_crop_rect(b, page.cols, page.rows);
+    const uint8_t *src = host_page.data() + (size_t)cr[1] * page.step + (size_t)cr[0] * 3;
+    crops_png.push_back(encode_png_bgr(src, cr[2], cr[3], (int)page.step));
   }
 
   struct Job {
@@ -538,6 +515,7 @@ VLMFormula::run_legacy(const std::vector<uint8_t> &host_page,
       r.latex = std::move(job.results[i]);
       r.token_count = r.latex.size();
       r.hit_eos = !r.latex.empty();
+      r.ok = !r.latex.empty();  // empty == request failed for this crop
       out[job.off + i] = std::move(r);
     }
   }
@@ -571,7 +549,10 @@ VLMFormula::run(const GpuImage &page, const std::vector<Box> &boxes,
     std::cerr << "[VLMFormula] page D2H failed\n";
     return out;
   }
-  cudaStreamSynchronize(stream);
+  if (cudaError_t serr = cudaStreamSynchronize(stream); serr != cudaSuccess) {
+    std::cerr << "[VLMFormula] page D2H sync failed: " << cudaGetErrorString(serr) << '\n';
+    return out;
+  }
 
   if (use_pool_backend()) {
     return run_pool(host_page, page, boxes);

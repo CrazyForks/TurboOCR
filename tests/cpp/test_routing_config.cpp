@@ -144,7 +144,7 @@ TEST_CASE("openai backend with a garbage parser is rejected", "[routing_config]"
 // synth_from_env via load_routing_config (TURBO_ROUTING_CONFIG unset)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("synth: all unset yields formulanet formula + geometric-default table",
+TEST_CASE("synth: all unset yields ppformulanet_s formula + geometric-default table",
           "[routing_config]") {
   reset_env();
   auto t = load_routing_config();
@@ -153,9 +153,11 @@ TEST_CASE("synth: all unset yields formulanet formula + geometric-default table"
   REQUIRE(t.routes.count("table") == 1);
   REQUIRE(t.routes.count("text") == 1);
 
+  // Default is the WORKING ORT-sidecar backend, not the inert fused-Loop TRT
+  // "formulanet" engine (which would serve silent-empty on TRT 10.15).
   const auto &fb = t.backends.at(t.routes.at("formula"));
   CHECK(fb.kind == Kind::Local);
-  CHECK(fb.engine == "formulanet");
+  CHECK(fb.engine == "ppformulanet_s");
 
   // With no table backend configured, table routes to "default" (geometric
   // line-art fallback) — NOT an unconfigured slanext that would fail to load and,

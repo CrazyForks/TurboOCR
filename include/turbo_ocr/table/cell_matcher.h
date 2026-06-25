@@ -27,9 +27,13 @@ struct MatchedCell {
 // PaddleX `match_table_and_ocr` uses `compute_inter > 0.7`, but SLANeXt cell
 // quads are smaller than the DB text-line boxes, so a correctly-placed line
 // often has <70% of its area inside the quad and gets silently dropped (≈35% of
-// lines / 45% of cells came out empty on OmniDocBench). 0.4 recovers most of
-// those without cross-cell bleed; lines matching no cell fall back to argmax.
-inline constexpr float MATCH_INTER_THRESHOLD = 0.4f;
+// lines / 45% of cells came out empty on OmniDocBench); lines matching no cell
+// fall back to argmax. 0.5 is the measured OmniDocBench-125 optimum: it assigns
+// each line to its dominant cell (a line split across two non-overlapping cells
+// can clear 0.5 in at most one), and the per-cell crop-OCR backfill recovers any
+// cell the page detector under-segmented. Sweep: 0.3→TEDS 0.7605, 0.4→0.7691,
+// 0.5→0.7737. Env-tunable via TABLE_MATCH_INTER.
+inline constexpr float MATCH_INTER_THRESHOLD = 0.5f;
 
 // PaddleX-equivalent intersect ratio: inter_area / box_b_area.
 // +1 byte-equal preservation: PaddleX uses `(x_right - x_left + 1)` style
@@ -40,8 +44,12 @@ float compute_inter(const std::array<float, 4>& a, const std::array<float, 4>& b
 // [x1, y1, x2, y2, x3, y3, x4, y4].
 std::array<float, 4> quad_to_bbox(const std::array<int, 8>& quad);
 
-// Match OCR lines to cell quads. For each cell returns the OCR indices whose
-// box satisfies compute_inter(cell, ocr) > MATCH_INTER_THRESHOLD.
+// Match OCR lines to cell quads (PaddleX match_table_and_ocr semantics). For each
+// cell returns the OCR indices whose box satisfies compute_inter(cell, ocr) >
+// threshold (env TABLE_MATCH_INTER, default MATCH_INTER_THRESHOLD). A line may land
+// in MULTIPLE cells it clears the threshold for — at the 0.5 default this happens
+// only where cell quads OVERLAP (a line split across two non-overlapping cells can
+// clear 0.5 in at most one); lines clearing no cell are rescued into their argmax.
 std::vector<MatchedCell> match_cells_to_ocr(
     const std::vector<std::array<int, 8>>& cells,
     const std::vector<OcrLine>& ocr);

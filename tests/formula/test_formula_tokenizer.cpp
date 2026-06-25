@@ -97,6 +97,9 @@ TEST_CASE("FormulaTokenizer::load loads real tokenizer.json when present",
     }
     REQUIRE(tok->vocab_size() >= 50000);
 
+    // eos_id() exposes the learned EOS so callers stop hard-coding the literal.
+    REQUIRE(tok->eos_id() == 2);
+
     // Decoding only the BOS+EOS frame returns the empty string.
     std::vector<int64_t> ids = {0, 2};  // <s>, </s>
     REQUIRE(tok->decode(ids) == "");

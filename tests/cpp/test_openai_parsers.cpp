@@ -45,12 +45,16 @@ TEST_CASE("otsl_to_html emits row+col span for corner-merge",
         "<tr></tr></table>");
 }
 
-TEST_CASE("otsl_to_html pads a short row with empty cells",
+TEST_CASE("otsl_to_html pads a short row by left-merging into the last cell",
           "[openai_parsers][table]") {
-  // Row 2 has one cell but the table is two-wide -> pad with an empty <td>.
+  // Row 2 has one cell but the table is two-wide. A short row means the decoder
+  // truncated the trailing colspan tokens of its LAST cell, so we pad with
+  // <lcel> (left-merge) -> the cell spans the missing column (colspan=2). The
+  // old behavior padded with a phantom standalone <td></td>, which shifts every
+  // <ucel> rowspan below it and corrupts colspan geometry on irregular tables.
   CHECK(otsl_to_html("<fcel>A<fcel>B<nl><fcel>C<nl>") ==
         "<table><tr><td>A</td><td>B</td></tr>"
-        "<tr><td>C</td><td></td></tr></table>");
+        "<tr><td colspan=\"2\">C</td></tr></table>");
 }
 
 TEST_CASE("otsl_to_html escapes cell text", "[openai_parsers][table]") {

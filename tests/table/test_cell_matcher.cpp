@@ -45,6 +45,50 @@ TEST_CASE("unmatched cell returns empty indices", "[cell_matcher]") {
     REQUIRE(m[0].ocr_indices.empty());
 }
 
+TEST_CASE("a line below threshold in a neighbor lands in the dominant cell only",
+          "[cell_matcher]") {
+    // Two adjacent cells. The line sits MOSTLY in the left cell (~0.67 of its area)
+    // and only ~0.33 in the right — below the 0.4 threshold — so it goes left only.
+    std::vector<std::array<int, 8>> cells = {
+        quad(0, 0, 100, 100), quad(100, 0, 200, 100)};
+    std::vector<OcrLine> ocr = {line(60.0f, 10.0f, 120.0f, 90.0f, "straddle")};
+    auto m = match_cells_to_ocr(cells, ocr);
+    REQUIRE(m.size() == 2);
+    REQUIRE(m[0].ocr_indices == std::vector<std::size_t>{0});
+    REQUIRE(m[1].ocr_indices.empty());
+}
+
+TEST_CASE("a line clearing the threshold in two OVERLAPPING cells lands in both "
+          "(multi-cell)", "[cell_matcher]") {
+    // PaddleX match_table_and_ocr places a line in EVERY cell it clears the
+    // threshold for. At the 0.5 default a line split across two NON-overlapping
+    // cells can clear 0.5 in at most one (the two fractions sum to <=1), so
+    // multi-cell only happens where the cell quads OVERLAP — the realistic
+    // SLANeXt case. Here both cells cover the line by ~0.83, so it lands in both.
+    std::vector<std::array<int, 8>> cells = {
+        quad(0, 0, 120, 100), quad(80, 0, 200, 100)};  // overlap x:80..120
+    std::vector<OcrLine> ocr = {line(70.0f, 10.0f, 130.0f, 90.0f, "shared")};
+    auto m = match_cells_to_ocr(cells, ocr);
+    REQUIRE(m.size() == 2);
+    REQUIRE(m[0].ocr_indices == std::vector<std::size_t>{0});
+    REQUIRE(m[1].ocr_indices == std::vector<std::size_t>{0});
+}
+
+TEST_CASE("at the 0.5 default a boundary-centred line over non-overlapping cells "
+          "lands in the dominant cell only", "[cell_matcher]") {
+    // A line exactly centred on the shared edge has ~0.5 of its area in each of
+    // two non-overlapping cells; neither clears the strict >0.5 gate, so the
+    // argmax fallback assigns it to a single cell rather than duplicating it.
+    std::vector<std::array<int, 8>> cells = {
+        quad(0, 0, 100, 100), quad(100, 0, 200, 100)};
+    std::vector<OcrLine> ocr = {line(50.0f, 10.0f, 150.0f, 90.0f, "boundary")};
+    auto m = match_cells_to_ocr(cells, ocr);
+    REQUIRE(m.size() == 2);
+    const std::size_t total =
+        m[0].ocr_indices.size() + m[1].ocr_indices.size();
+    REQUIRE(total == 1);  // assigned once, not duplicated
+}
+
 TEST_CASE("rtree handles many lines efficiently", "[cell_matcher]") {
     std::vector<OcrLine> ocr;
     ocr.reserve(1000);

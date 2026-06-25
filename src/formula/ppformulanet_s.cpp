@@ -446,7 +446,11 @@ PPFormulaNetS::run(const GpuImage &page, const std::vector<Box> &boxes,
     std::cerr << "[PPFormulaNetS] page D2H failed\n";
     return out;
   }
-  cudaStreamSynchronize(stream);
+  if (cudaError_t serr = cudaStreamSynchronize(stream); serr != cudaSuccess) {
+    std::cerr << "[PPFormulaNetS] page D2H stream sync failed: "
+              << cudaGetErrorString(serr) << '\n';
+    return out;
+  }
 
   std::vector<std::vector<uint8_t>> crops;
   std::vector<int> widths, heights;
@@ -454,13 +458,8 @@ PPFormulaNetS::run(const GpuImage &page, const std::vector<Box> &boxes,
   widths.reserve(boxes.size());
   heights.reserve(boxes.size());
   for (const auto &b : boxes) {
-    auto r = aabb(b);
-    int x0 = std::clamp(r[0], 0, std::max(0, page.cols - 1));
-    int y0 = std::clamp(r[1], 0, std::max(0, page.rows - 1));
-    int x1 = std::clamp(r[2], x0, page.cols);
-    int y1 = std::clamp(r[3], y0, page.rows);
-    int w = std::max(1, x1 - x0);
-    int h = std::max(1, y1 - y0);
+    auto cr = clamped_crop_rect(b, page.cols, page.rows);
+    const int x0 = cr[0], y0 = cr[1], w = cr[2], h = cr[3];
     std::vector<uint8_t> crop(static_cast<size_t>(w) * h * 3);
     const uint8_t *src = host_page_.data() + static_cast<size_t>(y0) * page.step
                           + static_cast<size_t>(x0) * 3;
@@ -485,7 +484,10 @@ PPFormulaNetS::run(const GpuImage &page, const std::vector<Box> &boxes,
               << " formula region(s) DROPPED (sidecar degraded: check VRAM / "
                  "the ppformulanet_s sidecar process). is_ready now="
               << (is_ready() ? "true" : "false") << '\n';
+    // ok=false per region so the pipeline can flag the response as degraded
+    // rather than treating these as legitimately formula-free regions.
     out.resize(boxes.size());
+    for (auto &r : out) r.ok = false;
     return out;
   }
   out.reserve(latex_results.size());
@@ -494,10 +496,16 @@ PPFormulaNetS::run(const GpuImage &page, const std::vector<Box> &boxes,
     r.latex = std::move(s);
     r.token_count = r.latex.size();  // approximation; sidecar doesn't return n_tokens
     r.hit_eos = true;
+    r.ok = !r.latex.empty();  // an empty per-region result is a recognition failure
     out.push_back(std::move(r));
   }
-  // Pad if RPC under-returned (shouldn't happen).
-  while (out.size() < boxes.size()) out.push_back({});
+  // Pad if RPC under-returned (shouldn't happen) — mark padded regions failed,
+  // not legitimately formula-free.
+  while (out.size() < boxes.size()) {
+    FormulaEngineResult r;
+    r.ok = false;
+    out.push_back(std::move(r));
+  }
   return out;
 }
 

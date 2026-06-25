@@ -15,7 +15,6 @@
 #include "turbo_ocr/router/cua_router.h"
 #include "turbo_ocr/routing/routing_config.h"
 #include "turbo_ocr/table/table_recognizer.h"
-#include "turbo_ocr/table/table_stage.h"
 #include "turbo_ocr/table/cell_matcher.h"
 #include "turbo_ocr/table/html_reconstruct.h"
 #include "turbo_ocr/table/slanext_enc_split.h"
@@ -141,22 +140,14 @@ bool OcrPipeline::load_router_models(
   // classify path is available even when no downstream engines load.
   router_ = std::make_unique<router::CuaRouter>();
 
-  // Table half — required if any table TRT path is provided. Skip
-  // entirely when all table paths are empty.
-  const bool want_table =
-      !table_cls_trt.empty() && !cell_wired_trt.empty() &&
-      !slanext_wired_trt.empty();
-  if (want_table) {
-    auto stage = std::make_unique<table::TableStage>();
-    if (!stage->init(table_cls_trt, cell_wired_trt, cell_wireless_trt,
-                     slanext_wired_trt, slanext_wireless_trt)) {
-      std::cerr << "[Pipeline] Failed to init TableStage\n";
-      return false;
-    }
-    table_stage_ = std::move(stage);
-    ensure_table_stream_();
-    std::cout << "[Pipeline] Table stage enabled" << '\n';
-  }
+  // The live table path is the SlanextTableRecognizer registry built in
+  // load_table_backend(); the table-engine arguments above are retained for
+  // ABI stability but no longer drive a separate cell-det stage here.
+  (void)table_cls_trt;
+  (void)cell_wired_trt;
+  (void)cell_wireless_trt;
+  (void)slanext_wired_trt;
+  (void)slanext_wireless_trt;
 
   // Formula half — backend selected via FORMULA_BACKEND
   // (formulanet | ppformulanet_s | vlm). The file-based backends are guarded

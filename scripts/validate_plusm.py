@@ -23,10 +23,11 @@ GATE: plus-M must beat PP-FormulaNet-S/plus-S on ZH CJK-char-F1 (it does:
 reference preds file (e.g. the paddle reference) for C++-prototype regression.
 """
 from __future__ import annotations
-import argparse, json, os, re, statistics, sys
+import argparse, json, os, re, statistics, sys, tempfile
 from concurrent.futures import ProcessPoolExecutor
 
-OMNIDOCBENCH = "/workspace/omnidocbench"
+OMNIDOCBENCH = os.environ.get(
+    "OMNIDOCBENCH", os.path.expanduser("~/code/workspace/omnidocbench"))
 
 
 def is_cjk(ch: str) -> bool:
@@ -117,7 +118,7 @@ def main() -> int:
     ap.add_argument("--baseline-key", default=None)
     ap.add_argument("--out", default=None)
     ap.add_argument("--cdm-workers", type=int, default=10)
-    ap.add_argument("--tmp", default="/home/user/.claude/jobs/6858f5a7/tmp/plusm_validate")
+    ap.add_argument("--tmp", default=os.path.join(tempfile.gettempdir(), "plusm_validate"))
     args = ap.parse_args()
 
     man = json.load(open(args.manifest, encoding="utf-8"))

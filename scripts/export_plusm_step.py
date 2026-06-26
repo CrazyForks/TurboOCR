@@ -17,10 +17,13 @@ I/O (C++ binds):
 
 Validated bit-exact vs the fused graph on the 12 golden crops before export.
 """
-import sys, json, numpy as np, torch, torch.nn as nn, torch.nn.functional as F, onnxruntime as ort
+import sys, os, json, numpy as np, torch, torch.nn as nn, torch.nn.functional as F, onnxruntime as ort
 
-REPO = "/workspace/turboocr"
-WNPZ = sys.argv[1] if len(sys.argv) > 1 else "/home/user/.claude/jobs/6858f5a7/tmp/plusm_step/decoder_weights.npz"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if len(sys.argv) < 2:
+    sys.exit("usage: export_plusm_step.py <decoder_weights.npz> [MAXLEN=1056]  "
+             "(bit-exact golden greedy JSON via PLUSM_GOLDEN env)")
+WNPZ = sys.argv[1]
 OUTDIR = f"{REPO}/models/formula/ppformulanet_plus_m"
 MAX = int(sys.argv[2]) if len(sys.argv) > 2 else 1056
 D, H, Dh, L, VOCAB = 512, 16, 32, 6, 50000
@@ -131,7 +134,10 @@ def main():
     so = ort.SessionOptions(); so.log_severity_level = 3
     enc = ort.InferenceSession(f"{OUTDIR}/encoder.onnx", so, providers=["CPUExecutionProvider"])
     mem = torch.tensor(np.concatenate([enc.run(None, {"x": crops[i:i+1]})[0] for i in range(crops.shape[0])], 0))
-    fused = json.load(open("/home/user/.claude/jobs/6858f5a7/tmp/plusm_gate/plusm_greedy_golden12.json"))
+    golden = os.environ.get("PLUSM_GOLDEN")
+    if not golden or not os.path.exists(golden):
+        sys.exit("set PLUSM_GOLDEN to the bit-exact golden greedy JSON before exporting")
+    fused = json.load(open(golden))
     SUF = "" if MAX == 1056 else f"_{MAX}"  # bucket exports get a suffix; 1056 keeps prod names
     outs = host_decode(prep, step, mem, max_len=min(400, MAX))
     ok = sum(outs[i] == fused[str(i)] for i in range(len(outs)))

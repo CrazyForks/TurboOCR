@@ -52,6 +52,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--score-timeout-sec", type=int, default=900)
     p.add_argument("--skip-ocr", action="store_true",
                    help="Reuse existing JSON predictions if present.")
+    p.add_argument("--base-config", default=str(BASE_CONFIG),
+                   help="Scorer config template (default: full text+formula+table).")
     return p.parse_args()
 
 
@@ -96,8 +98,9 @@ def _run(cmd: list[str], *, timeout: int, cwd: Path | None = None) -> None:
     print(f"[run] done in {time.time() - t0:.1f}s", flush=True)
 
 
-def _render_config(experiment: str, pred_dir: Path) -> Path:
-    base = BASE_CONFIG.read_text()
+def _render_config(experiment: str, pred_dir: Path,
+                   base_config: Path = BASE_CONFIG) -> Path:
+    base = base_config.read_text()
     rendered = base.replace(
         "data_path: /tmp/omnidoc_subset125/md",
         f"data_path: {pred_dir}",
@@ -298,7 +301,8 @@ def main() -> int:
     ], timeout=300)
     md_sec = time.time() - t1
 
-    cfg_path = _render_config(args.experiment_name, md_dir)
+    cfg_path = _render_config(args.experiment_name, md_dir,
+                              Path(args.base_config))
     save_name = f"{md_dir.name}_quick_match"
 
     scorer_py = str(BENCH_PY) if BENCH_PY.exists() else sys.executable

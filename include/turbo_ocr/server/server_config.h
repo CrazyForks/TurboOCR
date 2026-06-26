@@ -45,12 +45,12 @@ struct ServerConfig {
   // ---- Request lifecycle ----
   // Per-request inference deadline (ms). When > 0, a submit whose future does
   // not resolve within this window returns 504 INFERENCE_TIMEOUT and frees its
-  // slot. Default 0 = DISABLED (unbounded wait — the pre-hardening behavior),
-  // so this is strictly opt-in and never changes a deployed server's behavior.
-  // Recommended for production: set REQUEST_TIMEOUT_MS=30000 to recover wedged
-  // GPU slots. Applies to single-image / batch / gRPC; PDF pages are unaffected
-  // (the PDF path blocks-and-joins by design).
-  int request_timeout_ms = 0;  // REQUEST_TIMEOUT_MS (0 = disabled)
+  // slot. The effective default (set by from_env) is 60000 — ON by default, so a
+  // wedged GPU slot is recovered instead of hanging unbounded; set
+  // REQUEST_TIMEOUT_MS=0 to opt out (unbounded wait, the pre-hardening behavior).
+  // Applies to single-image / batch / gRPC; the PDF path scales it by page count
+  // and surfaces a timeout as 504 (see pdf_job.h).
+  int request_timeout_ms = 0;  // REQUEST_TIMEOUT_MS (from_env default 60000; 0 = off)
 
   // ---- Body limits ----
   int max_body_mb     = 100;     // MAX_BODY_MB / --max-body-mb

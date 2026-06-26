@@ -29,9 +29,9 @@ struct FormulaEngineResult {
 };
 
 // Backend-agnostic formula recognition interface. Implementations may use
-// any execution shape internally — split TRT engines with a host AR loop
-// (FormulaNet), a fused image-to-tokens engine that owns its own loop
-// (PP-FormulaNet-S), an ORT sidecar, or a remote VLM.
+// any execution shape internally — an in-process ONNX Runtime graph driven by
+// a host AR loop (PP-FormulaNet-S, on the CUDA or CPU execution provider), or
+// a remote VLM endpoint.
 //
 // Contract: load the on-disk artefact bundle from a directory, optionally
 // load a tokenizer, then answer run() with a FormulaEngineResult per input
@@ -81,8 +81,9 @@ public:
 // (typically read from FORMULA_BACKEND). Unknown keys return nullptr.
 //
 // Supported keys:
-//   "formulanet"      — split encoder + decoder + host AR loop (default)
-//   "ppformulanet_s"  — PP-FormulaNet-S fused image-to-tokens TRT engine
+//   "ppformulanet_s"  — PP-FormulaNet-S, in-process ONNX Runtime (CUDA/CPU);
+//                       FAST split-graph host loop, PPFNS_EXACT forces the fused graph
+//   "formulanet"      — legacy split encoder + decoder + host AR loop
 //   "vlm"             — OpenAI-compatible vLLM endpoint (env-configured)
 std::unique_ptr<IFormulaRecognizer>
 make_formula_recognizer(std::string_view backend);

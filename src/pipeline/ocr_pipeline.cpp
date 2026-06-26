@@ -17,7 +17,6 @@
 #include "turbo_ocr/table/cell_matcher.h"
 #include "turbo_ocr/table/html_reconstruct.h"
 #include "turbo_ocr/table/slanext_enc_split.h"
-#include "turbo_ocr/table/table_cls.h"
 #include "turbo_ocr/table/table_types.h"
 #include "turbo_ocr/engine/onnx_to_trt.h"
 

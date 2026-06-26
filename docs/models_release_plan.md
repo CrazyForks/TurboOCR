@@ -31,7 +31,7 @@ else on disk is provenance/experimental and should be **excluded** from a releas
 | Angle classifier | `cls.onnx` | ~1 MB |
 | Layout | `layout/layout.onnx` (PP-DocLayoutV3) | ~124 MB |
 | Autorotate | `doc_ori.onnx` | ~6.5 MB |
-| Table (SLANeXt) | `table/slanext_encoder/{SLANeXt_wired_encoder.onnx, SLANeXt_wireless_encoder.onnx, SLANeXt_wired_decoder.bin, SLANeXt_wireless_decoder.bin, SLANeXt_dict_infer.txt}`, `table/table_cls.onnx` | ~24 MB |
+| Table (SLANet-Plus) | `table/slanext_encoder/{SLANeXt_wired_encoder.onnx, SLANeXt_wired_decoder.bin, SLANeXt_dict_infer.txt}` | ~8 MB |
 | Formula (PP-FormulaNet-S) | `formula/ppformulanet_s/{inference_trt.onnx, tokenizer.json}` | ~310 MB |
 | **Subtotal (local, no VL)** | | **~640 MB** |
 | External VL (hybrid only) | `vlm/paddleocr_vl_1_5/` (PaddleOCR-VL-1.5-0.9B) | ~1.8 GB |
@@ -73,11 +73,8 @@ upload):
    cp models/{keys_tiny,keys}.txt /tmp/models_release/
    cp models/layout/layout.onnx /tmp/models_release/
    cp models/table/slanext_encoder/SLANeXt_wired_encoder.onnx /tmp/models_release/slanext_wired_encoder.onnx
-   cp models/table/slanext_encoder/SLANeXt_wireless_encoder.onnx /tmp/models_release/slanext_wireless_encoder.onnx
    cp models/table/slanext_encoder/SLANeXt_wired_decoder.bin /tmp/models_release/slanext_wired_decoder.bin
-   cp models/table/slanext_encoder/SLANeXt_wireless_decoder.bin /tmp/models_release/slanext_wireless_decoder.bin
    cp models/table/slanext_encoder/SLANeXt_dict_infer.txt /tmp/models_release/slanext_dict_infer.txt
-   cp models/table/table_cls.onnx /tmp/models_release/table_cls.onnx
    cp models/formula/ppformulanet_s/inference_trt.onnx /tmp/models_release/ppformulanet_s_trt.onnx
    cp models/formula/ppformulanet_s/tokenizer.json /tmp/models_release/ppformulanet_s_tokenizer.json
    ```
@@ -109,11 +106,8 @@ into the nested layout the server expects:
 ```bash
 mkdir -p "$OUT/table/slanext_encoder" "$OUT/formula/ppformulanet_s"
 fetch_verified "slanext_wired_encoder.onnx"    "$OUT/table/slanext_encoder/SLANeXt_wired_encoder.onnx"
-fetch_verified "slanext_wireless_encoder.onnx" "$OUT/table/slanext_encoder/SLANeXt_wireless_encoder.onnx"
 fetch_verified "slanext_wired_decoder.bin"     "$OUT/table/slanext_encoder/SLANeXt_wired_decoder.bin"
-fetch_verified "slanext_wireless_decoder.bin"  "$OUT/table/slanext_encoder/SLANeXt_wireless_decoder.bin"
 fetch_verified "slanext_dict_infer.txt"        "$OUT/table/slanext_encoder/SLANeXt_dict_infer.txt"
-fetch_verified "table_cls.onnx"                "$OUT/table/table_cls.onnx"
 fetch_verified "ppformulanet_s_trt.onnx"       "$OUT/formula/ppformulanet_s/inference_trt.onnx"
 fetch_verified "ppformulanet_s_tokenizer.json" "$OUT/formula/ppformulanet_s/tokenizer.json"
 ```

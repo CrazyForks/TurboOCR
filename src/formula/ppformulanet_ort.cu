@@ -228,7 +228,12 @@ bool PPFormulaNetOrt::decode_chunk(int B, std::vector<std::vector<int64_t>> &out
     if ((it + 1) % CHECK == 0) {
       cudaStreamSynchronize(stream_);
       size_t n = (size_t)(it + 1) * B * 3; hall.resize(n);
-      cudaMemcpy(hall.data(), d_all_, n * sizeof(int64_t), cudaMemcpyDeviceToHost);
+      if (cudaError_t e = cudaMemcpy(hall.data(), d_all_, n * sizeof(int64_t),
+                                     cudaMemcpyDeviceToHost); e != cudaSuccess) {
+        std::cerr << "[PPFormulaNetOrt] periodic D2H copy failed it=" << it
+                  << ": " << cudaGetErrorString(e) << '\n';
+        last = it + 1; ok = false; break;  // don't early-stop on stale tokens
+      }
       int nd = 0;
       for (int b = 0; b < B; ++b) {
         if (done[b]) { ++nd; continue; }
@@ -249,7 +254,13 @@ bool PPFormulaNetOrt::decode_chunk(int B, std::vector<std::vector<int64_t>> &out
     ok = false;
   }
   size_t n = (size_t)last * B * 3; hall.resize(n);
-  cudaMemcpy(hall.data(), d_all_, n * sizeof(int64_t), cudaMemcpyDeviceToHost);
+  if (cudaError_t e = cudaMemcpy(hall.data(), d_all_, n * sizeof(int64_t),
+                                 cudaMemcpyDeviceToHost); e != cudaSuccess) {
+    std::cerr << "[PPFormulaNetOrt] final D2H copy failed: " << cudaGetErrorString(e)
+              << " — failing chunk instead of decoding stale tokens\n";
+    out.assign(B, {});  // empty seqs + return false -> caller marks crops failed
+    return false;
+  }
   out.assign(B, {});
   for (int b = 0; b < B; ++b) {
     bool stop = false;

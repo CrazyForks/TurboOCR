@@ -129,14 +129,14 @@ PaddleOCR-VL process on its own GPU (~15 GB), *not* in the C++ VRAM column.
 | hybrid: local table + VL formula | 12 | 344 / 1799 | 6.0 GB | +15 GB | 127 | 1679 |
 
 Reading the rows: text detection+recognition is **fast** (324 img/s); layout and SLANeXt table add
-modest cost (56 / 86 img/s). **The local formula backend is the throughput bottleneck** — PP-FormulaNet-S
-is a host-side autoregressive decoder running in-process on ORT-CUDA-13, so on this formula-dense subset
-(every page has a formula or table) it serializes (p90 jumps to ~5 s) and the full local pipeline drops
-to **3.8 img/s** — *slower* than VL-batched formula (both_vl 6.1), which fans crops across vLLM's
-continuous batching. Local's speed advantage is on **text/table-heavy** docs where the formula stage rarely
-fires. Coverage: SLANeXt/VL over-detect tables slightly (127 vs 119 GT); formula counts (525 / 673 /
-1679 vs 489 GT) are high because layout flags inline formulas and equation-numbers, not just the GT
-*display* formulas the scorer evaluates.
+modest cost (56 / 86 img/s). The formula-stage rows above (4.6 / 3.8 img/s) were measured with the
+**prior host-side autoregressive** PP-FormulaNet-S decoder, which serialized on this formula-dense subset
+(every page has a formula or table; p90 ~5 s). **The FAST in-process decoder is now the default** (split
+GPU encoder + batched host decode on ORT-CUDA-13): it removes that serialization and lifts the full local
+pipeline to **~20–24 img/s** (concurrency 4 / pool 2–4) — clearing the 10 img/s floor and overtaking the
+VL paths (hybrid 6.1, VL-only 1.3). Coverage: SLANeXt/VL over-detect tables slightly (127 vs 119 GT);
+formula counts (525 / 673 / 1679 vs 489 GT) are high because layout flags inline formulas and
+equation-numbers, not just the GT *display* formulas the scorer evaluates.
 
 **VRAM and throughput vs `PIPELINE_POOL_SIZE`** (`--pool-sizes 1 2 4 8`): VRAM ≈ base + pool × ~2 GB
 (both_local: 3.5 / 6.3 / 11.9 / 23.1 GB at pool 1/2/4/8); throughput **peaks around pool=2** at
@@ -154,45 +154,53 @@ page), all on the **same 125 docs**, scored identically (`↓` lower better, `�
 
 | pipeline | speed | text ↓ | tbl TEDS ↑ | tbl struct ↑ | tbl edit ↓ | fml CDM ↑ | fml edit ↓ | RO ↓ |
 |---|---|---|---|---|---|---|---|---|
-| **Local** (tiny tier; SLANeXt + PP-FormulaNet-S) | 3.8 img/s | 0.113 | 0.774 | 0.872 | 0.152 | 0.811 | 0.296 | 0.303 |
+| **Local** (tiny tier; SLANeXt + PP-FormulaNet-S, FAST decoder) | ~20–24 img/s | 0.144 | 0.773 | 0.876 | 0.148 | 0.805 | 0.306 | 0.333 |
 | **Hybrid** (local text+layout, VL on table/formula regions) | 6.1 img/s | 0.118 | 0.895 | 0.928 | 0.082 | 0.843 | 0.148 | 0.313 |
 | **VL-only** (PaddleOCR-VL over the whole page) | 1.3 pg/s | **0.073** | **0.900** | **0.931** | **0.074** | **0.874** | **0.131** | **0.194** |
+
+The Local row is the shipped default **`LAYOUT_MERGE_MODE=all`** on the 125-doc subset with the **FAST**
+in-process PP-FormulaNet-S decoder (FAST == fused-graph parity: CDM 0.8052 vs 0.8053 with `PPFNS_EXACT=1`).
+**`LAYOUT_MERGE_MODE=outer`** is the alternative if formula CDM is the priority — it scores CDM **0.8108**
+(formula edit 0.299, table TEDS 0.768, table struct 0.872, RO ~0.342) at a slight cost to the other
+metrics. All Local/Hybrid numbers are the 125-doc subset; the VL-only row is the PaddleOCR-VL full-page
+reference run.
 
 ### 5b. Per modality — which backend wins
 
 | modality (metric) | local | VL on region (hybrid) | VL full page |
 |---|---|---|---|
-| **text** (edit ↓) | 0.113 | 0.118 | **0.073** |
-| **table** (TEDS ↑) | 0.774 | 0.895 | **0.900** |
-| **table** (structure ↑) | 0.872 | 0.926 | **0.931** |
-| **formula** (CDM ↑) | 0.811 | 0.843 | **0.874** |
-| **reading order** (edit ↓) | 0.303 | 0.313 | **0.194** |
+| **text** (edit ↓) | 0.144 | 0.118 | **0.073** |
+| **table** (TEDS ↑) | 0.773 | 0.895 | **0.900** |
+| **table** (structure ↑) | 0.876 | 0.926 | **0.931** |
+| **formula** (CDM ↑) | 0.805 | 0.843 | **0.874** |
+| **reading order** (edit ↓) | 0.333 | 0.313 | **0.194** |
 
 What this says:
-- **Local needs no external model and is competitive on accuracy**: formula CDM 0.811 and table TEDS
-  0.774 land within striking distance of VL (0.874 / 0.900), on one GPU with no vLLM. The remaining
-  table gap is structure decode on complex spanning/borderless grids; the reading-order gap (0.303 vs
+- **Local needs no external model and is competitive on accuracy**: formula CDM 0.805 and table TEDS
+  0.773 land within striking distance of VL (0.874 / 0.900), on one GPU with no vLLM. The remaining
+  table gap is structure decode on complex spanning/borderless grids; the reading-order gap (0.333 vs
   0.194) is the XY-cut algorithm itself (four reorder variants were evaluated — none beat the tuned
   baseline).
-- **But on this formula-dense subset local is throughput-bound by the formula stage** (3.8 img/s —
-  see §4): PP-FormulaNet-S is a single-instance host-side AR decoder, so it serializes and is actually
-  *slower* than VL-batched formula here. Local's speed advantage is on text/table-heavy docs (raw OCR
-  ~324 img/s, +table 86), where the formula stage rarely fires.
+- **With the FAST in-process formula decoder (now default) local also wins on throughput** (~20–24
+  img/s — see §4): the split-encoder + batched host decode removes the old serialization, so the full
+  local pipeline clears the 10 img/s floor and runs faster than both VL paths (hybrid 6.1, VL-only 1.3)
+  even on this formula-dense subset. The earlier host-side AR decoder bottlenecked at ~3.8 img/s. Local's
+  margin widens further on text/table-heavy docs (raw OCR ~324 img/s, +table 86).
 - **VL-only is the most accurate on everything** (text 0.073, table 0.900, formula 0.874, RO 0.194):
   one model over the whole page gives the most coherent result — at 1.3 pages/s.
-- **Hybrid ≈ VL-only on tables/formulas** while keeping fast local text, and at 6.1 img/s it is the
-  fastest of the three on formula-dense pages (vLLM batches the region crops). Its larger win is on
-  text-heavy docs, where most pages skip the per-region VL round-trips entirely.
+- **Hybrid ≈ VL-only on tables/formulas** while keeping fast local text; at 6.1 img/s it batches the
+  region crops across vLLM, ahead of VL-only but now behind the FAST local pipeline (~20–24 img/s). Its
+  larger win is on text-heavy docs, where most pages skip the per-region VL round-trips entirely.
 - **VRAM note:** the in-process formula stage (ORT-CUDA) needs headroom — sharing one 32 GB GPU with a
   vLLM (15 GB) can OOM and empty some formulas (CDM drops to ~0.70). This is **not silent**: the stage
   fails loud if it can't reach the GPU, and a per-region failure surfaces as `formula_degraded` in the
-  response. Give the formula stage its own GPU or run local-only; the 0.811 above is the clean
+  response. Give the formula stage its own GPU or run local-only; the 0.805 above is the clean
   (vLLM-free) number.
 
-Pick by what you optimise: **one GPU, no external model, competitive accuracy → local** (best when
-formulas are sparse); **maximum accuracy → VL-only**; **VL-grade tables/formulas at the highest
-throughput on formula-dense docs → hybrid**. The local gap to VL is genuine model headroom
-(handwriting, inline-math LaTeX, dense-table cell content).
+Pick by what you optimise: **one GPU, no external model, competitive accuracy at the highest throughput
+→ local** (the FAST formula decoder holds ~20–24 img/s even on formula-dense pages); **maximum accuracy
+→ VL-only**; **VL-grade tables/formulas without hosting a local formula model → hybrid**. The local gap
+to VL is genuine model headroom (handwriting, inline-math LaTeX, dense-table cell content).
 
 ---
 
@@ -207,7 +215,7 @@ python3 scripts/bench_speed_matrix.py --baseline result/bench_speed_matrix.json 
 
 # Accuracy — boot a server with the config, then score (needs omnidocbench/.venv):
 #   local:  TABLE_BACKEND=slanext + SLANEXT envs + FORMULA_BACKEND=ppformulanet_s + FORMULA_ONNX/_TOKENIZER
-#           + PPFNS_SIDECAR_SCRIPT + cu12 PATH/LD_LIBRARY_PATH (see the vLLM-free recipe below)
+#           (in-process ORT-CUDA-13 — no Python sidecar; see the vLLM-free recipe below)
 #   hybrid: TURBO_ROUTING_CONFIG=routing.json (table/formula -> vl), TABLE_SLANEXT_* for slanext_local
 python3 scripts/omnidoc_run_and_score_n.py --server-url http://localhost:8822 --experiment-name local_125
 

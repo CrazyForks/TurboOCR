@@ -181,7 +181,7 @@ backend is set, run any request with `layout` enabled and the response gains
 | Capability | Enable at startup | Recognizer |
 |---|---|---|
 | Formula → LaTeX | `FORMULA_BACKEND=ppformulanet_s` | PP-FormulaNet-S |
-| Table → HTML | `TABLE_BACKEND=slanext` (+ SLANeXt model paths) | SLANet+ |
+| Table → HTML | `TABLE_BACKEND=slanext` (+ SLANeXt model paths) | SLANeXt |
 
 ```bash
 docker run --gpus all -p 8000:8000 \
@@ -198,14 +198,28 @@ curl -X POST "http://localhost:8000/ocr/raw?layout=1" \
 
 ## Upgrading to v3 (breaking changes)
 
-v3 moves the default engine from PP-OCRv5 to **PP-OCRv6**. Changes since v2.3:
+v3 moves the default engine from PP-OCRv5 to **PP-OCRv6**. The changes since v2.3
+sort into three buckets — only the first needs a config change.
 
-- **PP-OCRv6 is now the default** (was PP-OCRv5), shipped as three tiers (`tiny`/`small`/`medium`) from the new `models-v3.0.0-ppocrv6` release. Recognition output and the model files change — **clear the TensorRT engine cache on upgrade** so engines rebuild from the new ONNX.
-- **`OCR_MODEL` replaces `OCR_LANG`.** Select by tier/model name (`tiny`/`small`/`medium`, or `arabic`/`eslav`/`korean`/`thai`/`greek`). `OCR_LANG` still works as a **deprecated** alias (warns on use).
-- **`OCR_SERVER` removed.** PP-OCRv6 covers Latin + Chinese + Japanese in one model, so the separate Chinese-server recognizer toggle is gone. Non-Latin scripts (Arabic, Cyrillic, Korean, Thai, Greek) are served by retained PP-OCRv5 recognizers.
+**Breaking / config-incompatible** (action required):
+
+- **`OCR_SERVER` removed.** PP-OCRv6 covers Latin + Chinese + Japanese in one model, so the separate Chinese-server recognizer toggle is gone. Non-Latin scripts (Arabic, Cyrillic, Korean, Thai, Greek) are served by retained PP-OCRv5 recognizers, selected via `OCR_MODEL`.
+- **Clear the TensorRT engine cache on upgrade.** PP-OCRv6 ships new det/rec ONNX, so cached v5 engines must rebuild — wipe `~/.cache/turbo-ocr` (or the mounted `trt-cache` volume) once.
+- **Sidecar-specific formula env is gone.** Only relevant if you set `PPFNS_SIDECAR_SCRIPT` or launched `scripts/ppformulanet_s_sidecar.py` directly — both no longer exist. Plain `FORMULA_BACKEND=ppformulanet_s` users are unaffected (see *Additive / transparent* below).
+
+**Default-behaviour changes** (no config change, but output or runtime differ):
+
+- **PP-OCRv6 is the default engine** (was PP-OCRv5), shipped as three tiers (`tiny`/`small`/`medium`) from the new `models-v3.0.0-ppocrv6` release. Recognition output changes vs v5.
 - **Default tier is `tiny`** (max throughput). Set `OCR_MODEL=small` or `medium` for higher accuracy.
-- **`LAYOUT_MERGE_MODE` values renamed and the default changed.** The nested-box modes are now `outer` / `inner` / `all` (was `large` / `small` / `union`); the old names are still accepted as **deprecated aliases**. The new **default is `all`** — it keeps every detected box and drops nothing, so formulas/tables/titles nested inside a larger region survive. To restore the previous default behaviour set `LAYOUT_MERGE_MODE=outer`. Modes: `outer` keeps the outer/container box and drops boxes nested inside it; `inner` keeps the innermost boxes and drops the pure containers; `all` keeps both.
-- **The Python formula sidecar was removed.** Formula recognition (`FORMULA_BACKEND=ppformulanet_s`) is now a fully **in-process pure-C++ PP-FormulaNet-S recognizer** on ORT-CUDA-13 — there is no separate Python process to launch or manage. For a CPU formula decode set `FORMULA_DEVICE=cpu` (ORT `CPUExecutionProvider`, no CUDA and no Python).
+- **`LAYOUT_MERGE_MODE` default changed to `all`** (was effectively `large` / keep-outer). `all` keeps every detected box and drops nothing, so formulas/tables/titles nested inside a larger region survive (≈ +0.008 table TEDS, ≈ −0.006 formula CDM on OmniDocBench). Set `LAYOUT_MERGE_MODE=outer` to restore the previous behaviour. The mode *names* also changed (`outer`/`inner`/`all`, formerly `large`/`small`/`union`), but the old names still work as **deprecated aliases** — so the rename itself is not breaking. Modes: `outer` keeps the outer/container box and drops boxes nested inside it; `inner` keeps the innermost boxes and drops the pure containers; `all` keeps both.
+- **Requests now time out at 60 s** instead of hanging unbounded. `REQUEST_TIMEOUT_MS` default changed `0` → `60000`: a wedged GPU slot returns `504 INFERENCE_TIMEOUT` and frees itself. Set `REQUEST_TIMEOUT_MS=0` to opt back into the old unbounded wait. A companion watchdog (`PIPELINE_HARD_KILL_MS`, default `600000` = 10 min) `_Exit`s the process for the orchestrator to restart **only** if a worker stays wedged mid-CUDA long after a recycle was already requested — so a genuine hang can now terminate the process instead of leaking a slot forever (this watchdog is inert when `REQUEST_TIMEOUT_MS=0`).
+
+**Additive / transparent** (nothing to do):
+
+- **`OCR_MODEL` is the new selector name; `OCR_LANG` still works** as a deprecated alias (warns on use), so this is backward-compatible. Select by tier/model name (`tiny`/`small`/`medium`, or `arabic`/`eslav`/`korean`/`thai`/`greek`).
+- **The Python formula sidecar is gone — transparently.** `FORMULA_BACKEND=ppformulanet_s` is now a fully **in-process pure-C++ PP-FormulaNet-S recognizer** on ORT-CUDA-13: same backend name, same output, no separate Python process to launch or manage. Set `FORMULA_DEVICE=cpu` for an ORT `CPUExecutionProvider` decode (no CUDA, no Python). Only callers of the deleted sidecar script / `PPFNS_SIDECAR_SCRIPT` env are affected (see *Breaking* above).
+- **New `POST /ocr/markdown` route** (GPU build) exports a parsed page as faithful Markdown. Purely additive — existing routes are unchanged.
+- **Oversized-image guard on `/infer`.** Like the other image routes, `/infer` now rejects inputs whose dimensions exceed `MAX_IMAGE_DIM` (default `16384`) with `400 DIMENSIONS_TOO_LARGE` (a decompression-bomb guard). Only affects callers that were sending images larger than 16384 px on a side.
 
 ---
 
@@ -220,6 +234,7 @@ One binary serves HTTP and gRPC from a shared GPU pipeline pool.
 | `POST /ocr/pixels` | Zero-decode raw pixel buffer |
 | `POST /ocr/batch` | Batch of images |
 | `POST /ocr/pdf` | PDF → text (optional page images & auto-rotate) |
+| `POST /ocr/markdown` | Page → faithful Markdown (GPU build; requires layout) |
 | `GET /metrics` | Prometheus metrics |
 
 All endpoints accept `?layout=1` (region detection + reading order). Example:
@@ -243,6 +258,7 @@ Common ones:
 | `OCR_MODEL` | `tiny` | `tiny` / `small` / `medium`, or a PP-OCRv5 script model |
 | `DISABLE_LAYOUT` | `0` | `1` skips the layout model (~300–500 MB VRAM) |
 | `LAYOUT_MERGE_MODE` | `all` | Nested-box policy: `all` (keep every box) / `outer` (outer regions only) / `inner` (innermost only). Old `large`/`small`/`union` accepted as aliases. |
+| `REQUEST_TIMEOUT_MS` | `60000` | Per-request inference deadline; on overrun returns `504` and frees the slot. `0` = unbounded (pre-v3 behaviour). |
 | `PIPELINE_POOL_SIZE` | auto | Concurrent GPU pipelines |
 
 → [Full configuration reference (35+ variables)](https://aiptimizer.github.io/TurboOCR/build/config/)

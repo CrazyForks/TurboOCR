@@ -12,12 +12,12 @@
 <div class="phc-stat">
   <div class="phc-stat-num">&asymp; 49.0</div>
   <div class="phc-stat-label">OmniDocBench v1.7 composite</div>
-  <div class="phc-stat-foot">1651 pages, regen 2026-05-17</div>
+  <div class="phc-stat-foot">full 1651 pages, 2026-05-17 — pre formula-fix, re-measure pending</div>
 </div>
 <div class="phc-stat">
   <div class="phc-stat-num">0.568</div>
   <div class="phc-stat-label">Table TEDS (all)</div>
-  <div class="phc-stat-foot">+0.541 vs baseline (May 14)</div>
+  <div class="phc-stat-foot">full 1651 pages; +0.541 vs May 14 baseline</div>
 </div>
 <div class="phc-stat">
   <div class="phc-stat-num">0.079</div>
@@ -41,8 +41,8 @@
     ---
 
     Per-model cards: detection, classification, layout, recognition,
-    table, and the three-engine FormulaNet. Input shapes, dynamic
-    profiles, latency budgets.
+    table, and the in-process PP-FormulaNet-S formula stage. Input
+    shapes, dynamic profiles, latency budgets.
 
 -   __[Benchmarks](benchmarks/omnidocbench.md)__
 
@@ -126,12 +126,22 @@ CUDA resources. Verifiable at
 
 ## Headline numbers
 
-| Metric | Value | Source |
-|---|---:|---|
-| Composite Overall (OmniDocBench v1.7) | **≈ 49.0** | `omnidocbench/result/md_quick_match_metric_result.json` (regen 2026-05-17) |
-| text_block Edit_dist — English | **0.079** | same file, per-language slice |
-| table TEDS (.all) | **0.568** | same file |
-| text-only p50 latency | **6.0 ms** | `.claude/plans/99_bench_diary.md` (8 sweeps, RTX 5090, TRT 10.15.1.29) |
+| Metric | Test set | Value | Source |
+|---|---|---:|---|
+| Composite Overall (OmniDocBench v1.7) | full 1651 | **≈ 49.0** | `omnidocbench/result/md_quick_match_metric_result.json` (regen 2026-05-17, **pre formula-fix** — re-measure pending) |
+| text_block Edit_dist — English | full 1651 | **0.079** | same file, per-language slice |
+| table TEDS (.all) | full 1651 | **0.568** | same file |
+| formula CDM | 125-doc table/formula subset | **0.805** | in-process PP-FormulaNet-S, FAST decoder — see [resources](resources_speed_accuracy.md) |
+| table TEDS | 125-doc table/formula subset | **0.773** | same subset run |
+| text-only p50 latency | — | **6.0 ms** | `.claude/plans/99_bench_diary.md` (8 sweeps, RTX 5090, TRT 10.15.1.29) |
+
+!!! note "Formula CDM is fixed; full-1651 re-measure pending"
+    The earlier formula CDM 0.063 "regression" was an integration bug, **now resolved**: the in-process
+    PP-FormulaNet-S stage (FAST decoder) scores **CDM 0.805** on the 125-doc table/formula subset. The
+    ≈ 49.0 composite above is the **full-1651** run from 2026-05-17 that predates the fix and still embeds
+    the broken-formula 0.063, so it is a floor pending a re-measure with the fixed stage. The two test
+    sets are not directly comparable — the 125-doc cut is a deterministic, table/formula-heavy stratified
+    subset; the full-1651 numbers are the whole OmniDocBench set.
 
 Full per-language, per-layout, and per-attribute breakdowns live on the
 [OmniDocBench results](benchmarks/omnidocbench.md) page; the per-fixture

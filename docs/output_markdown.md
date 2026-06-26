@@ -86,15 +86,18 @@ gracefully via centroid containment when ids are unset.
 
 ---
 
-## Wiring plan (apply after the in-flight build/routes work settles)
+## How it is wired
 
-### 1. CMake — one line
+This module is **already wired and shipped** as the GPU route `POST /ocr/markdown`
+(`src/routes/image_routes.cpp`, `register_ocr_markdown_route_gpu`). The CPU server
+does not expose it yet — `/ocr/markdown` only appears in `/capabilities` on the
+GPU build. The sections below document the wiring as built.
+
+### 1. CMake
 
 `markdown_export.cpp` is CUDA-free and needs only OpenCV (already linked
-`PUBLIC` by `turbo_ocr_common`). Add it to the `turbo_ocr_common STATIC`
-source list in `CMakeLists.txt` (the block starting `add_library(
-turbo_ocr_common STATIC`, ~line 182), e.g. right after
-`src/routing/routing_config.cpp`:
+`PUBLIC` by `turbo_ocr_common`). It is compiled into the `turbo_ocr_common
+STATIC` source list in `CMakeLists.txt`:
 
 ```cmake
     src/output/markdown_export.cpp
@@ -103,16 +106,13 @@ turbo_ocr_common STATIC`, ~line 182), e.g. right after
 That makes it available to both servers (`paddle_highspeed_cpp` and
 `paddle_cpu_server` link `turbo_ocr_common` transitively) and to the test exe.
 
-### 2. Route — `POST /ocr/markdown`
+### 2. Route — `POST /ocr/markdown` (GPU build)
 
-A dedicated route is recommended over `?format=markdown` on `/ocr/raw` because
+A dedicated route is used rather than `?format=markdown` on `/ocr/raw` because
 the Markdown handler must (a) force layout + reading order on, (b) always decode
-to a `cv::Mat` (the nvJPEG GPU-direct fast path keeps no host bitmap, but we need
-the page pixels to crop figures). Paste this into `src/routes/image_routes.cpp`
-next to `register_ocr_raw_route_gpu` and add the include
-`#include "turbo_ocr/output/markdown_export.h"` plus
-`#include "turbo_ocr/common/serialization.h"` (the latter is already pulled in
-via server_types.h).
+to a `cv::Mat` (the nvJPEG GPU-direct fast path keeps no host bitmap, but the
+page pixels are needed to crop figures). The handler lives in
+`src/routes/image_routes.cpp` next to `register_ocr_raw_route_gpu`:
 
 ```cpp
 // --- /ocr/markdown: faithful Markdown export ---
@@ -191,17 +191,17 @@ void register_ocr_markdown_route_gpu(server::WorkPool &pool,
 }
 ```
 
-Then register it in `register_image_routes(...)` (same file, ~line 901)
-alongside the other `register_ocr_*_route_gpu(...)` calls:
+It is registered in `register_image_routes(...)` (same file) alongside the other
+`register_ocr_*_route_gpu(...)` calls:
 
 ```cpp
   register_ocr_markdown_route_gpu(pool, dispatcher, decode, layout_available);
 ```
 
-(For the CPU server, mirror the same handler in `common_routes.cpp` against the
-`InferFunc`/`InferResult` path — wrap the `InferResult` fields into an
-`OcrPipelineResult` exactly like `server::emit_infer_result_json` does, then
-call `render_markdown_with_assets`.)
+The CPU server does **not** yet expose `/ocr/markdown`. To add it, mirror the
+same handler in `common_routes.cpp` against the `InferFunc`/`InferResult` path —
+wrap the `InferResult` fields into an `OcrPipelineResult` exactly like
+`server::emit_infer_result_json` does, then call `render_markdown_with_assets`.
 
 ### Usage
 

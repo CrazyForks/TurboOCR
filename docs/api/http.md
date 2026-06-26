@@ -1,17 +1,18 @@
 # HTTP API
 
 !!! abstract "TL;DR"
-    Six endpoints. `POST /ocr/raw` is the fast path; `POST /ocr/pixels`
-    skips decoding entirely; `POST /ocr/batch` and `POST /ocr/pdf` cover
-    multi-image and PDF inputs. `GET /health/live` and `GET /health/ready`
-    are Kubernetes-friendly probes. Default bind: `http://localhost:8000`.
+    `POST /ocr/raw` is the fast path; `POST /ocr/pixels` skips decoding
+    entirely; `POST /ocr/batch` and `POST /ocr/pdf` cover multi-image and PDF
+    inputs; `POST /ocr/markdown` (GPU build) exports a parsed page as
+    Markdown. `GET /health/live` and `GET /health/ready` are
+    Kubernetes-friendly probes. Default bind: `http://localhost:8000`.
 
-Routes are registered in three files:
+Routes are registered in these files:
 
 - `src/routes/common_routes.cpp` — `/health/live`, `/health/ready`,
-  `/ocr/raw` (CPU path), `/ocr` (base64 JSON).
+  `/capabilities`, `/ocr/raw` (CPU path), `/ocr` (base64 JSON).
 - `src/routes/image_routes.cpp` — GPU `/ocr/raw`, `/ocr/pixels`,
-  `/ocr/batch`.
+  `/ocr/batch`, `/ocr/markdown`, `/infer`.
 - `src/routes/pdf_routes.cpp` — `/ocr/pdf` (CPU + GPU overloads).
 
 ## Shared query parameters
@@ -25,7 +26,7 @@ Parsed by `server::parse_query_options()` in
 | `layout` | `0` | Run PP-DocLayoutV3 and emit a `layout` array. |
 | `reading_order` | `0` | XY-cut over the layout boxes; emits `reading_order`. Auto-enables `layout`. |
 | `as_blocks` | `0` | Emit paragraph-level `blocks`. Auto-enables `layout` + `reading_order`. |
-| `tables` | startup default | Run the CUA router's table branch (SLANet+/Nemotron) and emit `tables`. Auto-enables `layout`. |
+| `tables` | startup default | Run the CUA router's table branch (SLANeXt, or a VLM backend) and emit `tables`. Auto-enables `layout`. |
 | `formulas` | startup default | Run the formula branch (PP-FormulaNet-S, in-process ORT-CUDA-13) and emit `formulas`. Auto-enables `layout`. |
 | `rec_mode` | env `OCR_REC_MODE` | Per-request recognizer override (`mobile` / `server`). |
 
@@ -410,6 +411,34 @@ Error codes: `MISSING_PDF`, `MISSING_FILE`, `INVALID_MULTIPART`,
 `BASE64_DECODE_FAILED`, `EMPTY_BODY`, `EMPTY_PDF`, `INVALID_DPI`,
 `INVALID_PARAMETER`, `PDF_TOO_LARGE`, `PDF_RENDER_FAILED`,
 `AUTOROTATE_DISABLED`.
+
+---
+
+## `POST /ocr/markdown`
+
+GPU build only. Runs the full pipeline (layout + reading order forced on) and
+returns the page as **faithful Markdown** instead of JSON — the in-process
+counterpart of PP-StructureV3 `save_to_markdown`. See
+[Faithful Markdown export](../output_markdown.md) for the serialization rules.
+
+- **Body**: raw image bytes (same decoders as `/ocr/raw`).
+- **`embed` query** (default `true`): `embed=1` inlines figure/chart crops as
+  base64 `data:` URIs (self-contained `.md`); `embed=0` emits
+  `![](assets/blockN.png)` file-reference links (write the crops yourself).
+- **Requires layout**: against a server started with `DISABLE_LAYOUT=1` the
+  request returns `400 LAYOUT_DISABLED`.
+- **Response**: `text/markdown; charset=utf-8`.
+
+```bash
+# self-contained markdown (images inline as data URIs)
+curl --data-binary @page.png http://localhost:8000/ocr/markdown > page.md
+
+# file-reference image links
+curl --data-binary @page.png 'http://localhost:8000/ocr/markdown?embed=0'
+```
+
+Error codes: `EMPTY_BODY`, `LAYOUT_DISABLED`, `IMAGE_DECODE_FAILED`,
+`DIMENSIONS_TOO_LARGE`, plus the shared inference set.
 
 ---
 

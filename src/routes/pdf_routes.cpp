@@ -334,6 +334,21 @@ bool emit_job_error(const PdfJobResult &job, server::DrogonCallback &cb) {
           std::format("{} of {} rendered pages could not be decoded; retry",
                       job.decode_failures, job.num_pages)));
       return true;
+    case PdfJobStatus::PageFailed:
+      // A page's OCR/inference threw. Fail the whole request rather than return
+      // a 200 with silently-empty pages — partial OCR must never look complete.
+      cb(server::error_response(drogon::k500InternalServerError,
+          "PAGE_FAILED",
+          std::format("{} of {} pages failed during OCR; retry",
+                      job.page_failures, job.num_pages)));
+      return true;
+    case PdfJobStatus::TimedOut:
+      // The job-wide deadline (scaled by page count) was exceeded — a 504, not an
+      // inference failure. Distinct from PAGE_FAILED so clients retry / raise the
+      // deadline rather than treating it as bad input.
+      cb(server::error_response(drogon::k504GatewayTimeout, "INFERENCE_TIMEOUT",
+          "PDF job exceeded the request deadline"));
+      return true;
   }
   return false;
 }
@@ -453,6 +468,10 @@ void register_pdf_route(server::WorkPool &pool,
       job_opts.image_mode = image_mode;
       job_opts.encode_opts = encode_opts;
       job_opts.pdf_only_batch = pdf_only_batch;
+      // Bound the per-page future join with the configured request deadline so a
+      // wedged page can't hang the whole PDF request (same value the dispatcher
+      // applies to single-image submits).
+      job_opts.request_timeout_ms = dispatcher.request_timeout_ms();
 
       auto job = pipeline::run_pdf_job(dispatcher, pdf_renderer, pdf_data,
                                        pdf_len_local, job_opts);

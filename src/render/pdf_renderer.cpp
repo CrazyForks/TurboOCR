@@ -428,6 +428,38 @@ bool PdfRenderer::send_cmd_once(Daemon &d, const std::string &cmd,
     if (fprintf(d.cmd_in, "%s\n", cmd.c_str()) < 0) return false;
     if (fflush(d.cmd_in) != 0) return false;  // EPIPE if reader is dead
   }
+  // Bound the blocking reply read: a daemon that accepted the command but never
+  // answers (wedged mid-render) would otherwise hang the worker forever. The
+  // initial "OK N" wait is NOT covered by the 30 s missed-page net in
+  // render_streamed, so poll the result fd first. On timeout/error return false
+  // and let send_cmd's existing respawn+retry path recover. Configurable via
+  // PDF_RENDER_REPLY_TIMEOUT_MS (default 120000).
+  static const int reply_timeout_ms = [] {
+    const char *e = std::getenv("PDF_RENDER_REPLY_TIMEOUT_MS");
+    int v = e ? std::atoi(e) : 120000;
+    return v > 0 ? v : 120000;
+  }();
+  struct pollfd pfd = {fileno(d.result_out), POLLIN, 0};
+  // poll() returns -1/EINTR on signal delivery — that is NOT a daemon failure, so
+  // retry against the remaining budget rather than tripping the respawn path. A
+  // genuine timeout (0) or real error (-1, errno != EINTR) still returns false.
+  {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(reply_timeout_ms);
+    for (;;) {
+      const auto now = std::chrono::steady_clock::now();
+      int remaining = static_cast<int>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+              .count());
+      if (remaining < 0) remaining = 0;
+      const int pr = ::poll(&pfd, 1, remaining);
+      if (pr > 0) break;                        // fd readable
+      if (pr == 0) return false;                // timed out
+      if (errno == EINTR) continue;             // signal: retry with remaining budget
+      return false;                             // real poll error
+    }
+  }
+
   char buf[4096];
   if (!fgets(buf, sizeof(buf), d.result_out)) return false;
   auto len = std::strlen(buf);

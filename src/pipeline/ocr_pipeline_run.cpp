@@ -70,6 +70,11 @@ void OcrPipeline::dispatch_router_(OcrPipelineResult &out,
   const bool has_formula = !plan_.formula_layout_ids.empty() && formula_rec;
   if (!has_table && !has_formula) return;          // routed-all-text bail
 
+  // A CUDA fault in the table/formula stage is caught here so a recoverable one
+  // self-heals: the detection guard above only recycles on a deadline overrun,
+  // so without this every later request to this worker would re-hit the wedge.
+  try {
+
   // Tables: dispatch every detected table region to the configured backend
   // (TABLE_BACKEND -> slanext|vlm) behind one ITableRecognizer. Crop
   // margin/detunion region adjustment stays here (backend-independent); per-
@@ -183,6 +188,18 @@ void OcrPipeline::dispatch_router_(OcrPipelineResult &out,
     }
     timer.gpu_stop();
     CUDA_CHECK(cudaEventRecord(formula_done_event_, formula_stream_));
+  }
+
+  } catch (const turbo_ocr::CudaError &) {
+    // Sticky -> the context is poisoned, fail-fast for a pod restart (same
+    // policy as the detection guard). Recoverable -> clear the error and flag
+    // this worker's pipeline for rebuild so the next request self-heals; a
+    // rebuild also drops any stale table/formula done-event from a throw that
+    // skipped its cudaEventRecord. Re-throw so this request still fails loud.
+    turbo_ocr::abort_on_sticky_cuda_fault("dispatch_router_ table/formula");
+    cudaGetLastError();  // clear the recoverable error before the rebuild
+    recycle_requested_.store(true, std::memory_order_relaxed);
+    throw;
   }
 }
 
@@ -573,6 +590,10 @@ std::vector<OcrPipelineResult> OcrPipeline::run_batch_with_layout(
         cudaFreeHost(h_pinned_buf_);
         h_pinned_buf_ = nullptr;
       }
+      // Zero before alloc — if cudaHostAlloc throws (pinned OOM) the buffer
+      // stays {nullptr, size 0} so the next batch re-enters this realloc branch
+      // instead of memcpy'ing into a null buffer under a stale (larger) size.
+      h_pinned_size_ = 0;
       // Upload-only pinned buffer: CPU writes (memcpy) once and the GPU DMAs
       // it. Write-combined uncached memory is ~10-15% faster for this access
       // pattern (no read-back from CPU).

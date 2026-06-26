@@ -3,9 +3,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <format>
 #include <functional>
 #include <future>
+#include <iostream>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -54,12 +56,20 @@ public:
     // watchdog, written by the owning worker around work(*entry); heap-allocated
     // shared_ptrs so the vector can't relocate atomics out from under either.
     task_start_ms_.reserve(n);
+    recycle_requested_at_ms_.reserve(n);
     for (size_t i = 0; i < n; ++i) {
       auto flag = std::make_shared<std::atomic<bool>>(false);
       recycle_flags_.push_back(flag);
       auto start_ms = std::make_shared<std::atomic<long long>>(0);
       task_start_ms_.push_back(start_ms);
-      workers_.emplace_back([this, flag, start_ms,
+      // When the watchdog first requests a recycle for this worker's CURRENT
+      // task it records the time here (0 == none requested). The hard-kill only
+      // fires after a recycle was actually requested AND remained unhonoured for
+      // PIPELINE_HARD_KILL_MS — i.e. the worker is wedged mid-CUDA and never
+      // reaches the next loop top to consume the flag.
+      auto req_at = std::make_shared<std::atomic<long long>>(0);
+      recycle_requested_at_ms_.push_back(req_at);
+      workers_.emplace_back([this, flag, start_ms, req_at,
                              entry = std::move(entries[i])]() mutable {
         while (true) {
           WorkFn work;
@@ -83,9 +93,20 @@ public:
           // entry suspect; the new stream/pipeline is independent of it.
           if (flag->exchange(false))
             maybe_recycle_(*entry);
+          // Clear any stale recycle-request time from a prior task BEFORE marking
+          // this task started, so the watchdog never hard-kills a fresh task on a
+          // previous task's timestamp.
+          req_at->store(0, std::memory_order_relaxed);
           start_ms->store(now_ms_(), std::memory_order_relaxed);
           work(*entry);
           start_ms->store(0, std::memory_order_relaxed);
+          req_at->store(0, std::memory_order_relaxed);
+          // A recoverable CUDA fault in the table/formula stage flags the
+          // pipeline for rebuild; recycle the entry before its next task so the
+          // slot self-heals instead of re-faulting on every later request.
+          if (recycle_enabled_ && entry->pipeline &&
+              entry->pipeline->consume_recycle_request())
+            flag->store(true, std::memory_order_relaxed);
         }
       });
     }
@@ -157,6 +178,13 @@ public:
     request_timeout_ms_.store(ms, std::memory_order_relaxed);
   }
 
+  /// The configured per-request deadline (ms; 0 = unbounded). Lets callers that
+  /// drive the dispatcher via raw submit() (e.g. the PDF orchestrator) bound
+  /// their own future joins with the same deadline.
+  [[nodiscard]] long request_timeout_ms() const noexcept {
+    return request_timeout_ms_.load(std::memory_order_relaxed);
+  }
+
   /// Submit + wait honouring the configured request deadline. When a positive
   /// timeout is set this is submit_for(timeout, fn) (throws TimeoutError on
   /// overrun); when disabled (0) it preserves today's submit(fn).get()
@@ -220,6 +248,15 @@ private:
   // effect at the worker's NEXT loop iteration — it cannot interrupt a CUDA
   // call mid-flight (that wedge is caught by the H4 sticky-fault fail-fast).
   void watchdog_loop_() {
+    // Hard margin AFTER a recycle was actually requested before a wedged-mid-CUDA
+    // worker is declared unrecoverable and the process exits. Env-configurable
+    // (PIPELINE_HARD_KILL_MS) with a deliberately large default so it only ever
+    // catches a true hang, not a merely slow task on a contended box.
+    static const long long kHardKillMs = [] {
+      const char *e = std::getenv("PIPELINE_HARD_KILL_MS");
+      long long v = e ? std::atoll(e) : 600000;  // 10 min
+      return v > 0 ? v : 600000;
+    }();
     while (true) {
       {
         std::unique_lock lock(mutex_);
@@ -234,7 +271,31 @@ private:
       for (size_t i = 0; i < task_start_ms_.size(); ++i) {
         long long started =
             task_start_ms_[i]->load(std::memory_order_relaxed);
-        if (started != 0 && now - started > deadline) request_recycle(i);
+        if (started == 0) continue;
+        const long long overrun = now - started;
+        const long long req_at =
+            recycle_requested_at_ms_[i]->load(std::memory_order_relaxed);
+        // Only hard-kill when a recycle was ACTUALLY requested for this task and
+        // remained unhonoured for kHardKillMs — the worker is wedged mid-CUDA, so
+        // the recycle flag (read only at the next loop top) will never be consumed
+        // and the slot is unreclaimable in-process. Exit so the orchestrator
+        // restarts the pod (mirrors the sticky-fault _Exit in cuda_check.h).
+        if (req_at != 0 && now - req_at > kHardKillMs) {
+          std::cerr << std::format(
+                           "[Dispatcher] FATAL: worker {} still wedged {} ms after "
+                           "a recycle request went unhonoured ({} ms total overrun, "
+                           "stuck mid-CUDA); exiting so the orchestrator restarts "
+                           "the pod\n",
+                           i, now - req_at, overrun)
+                    << std::flush;
+          std::_Exit(EXIT_FAILURE);
+        }
+        // First crossing of the deadline+grace: request a recycle and record when,
+        // so the hard-kill clock starts from the request, not from task start.
+        if (overrun > deadline && req_at == 0) {
+          request_recycle(i);
+          recycle_requested_at_ms_[i]->store(now, std::memory_order_relaxed);
+        }
       }
     }
   }
@@ -252,6 +313,10 @@ private:
   std::thread watchdog_;
   std::vector<std::shared_ptr<std::atomic<bool>>> recycle_flags_;
   std::vector<std::shared_ptr<std::atomic<long long>>> task_start_ms_;
+  // Per-worker time (ms, 0 == none) the watchdog first requested a recycle for
+  // the current task; gates the hard-kill so it only fires on a genuinely
+  // unhonoured recycle (see watchdog_loop_).
+  std::vector<std::shared_ptr<std::atomic<long long>>> recycle_requested_at_ms_;
   std::atomic<long> request_timeout_ms_{0};
   PipelineBuildSpec spec_;
   bool recycle_enabled_ = !spec_.det_model.empty();

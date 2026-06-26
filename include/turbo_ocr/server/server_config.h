@@ -335,8 +335,10 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
   c.http_port = env_int_strict("PORT",      8080,  1, 65535, c.errors);
   c.grpc_port = env_int_strict("GRPC_PORT", 50051, 1, 65535, c.errors);
 
+  // Default 60 s: an out-of-the-box 504 beats an unbounded worker hang. Operators
+  // may still set 0 explicitly to opt back into unbounded blocking.
   c.request_timeout_ms =
-      env_int_strict("REQUEST_TIMEOUT_MS", 0, 0, 3600000, c.errors);
+      env_int_strict("REQUEST_TIMEOUT_MS", 60000, 0, 3600000, c.errors);
 
   c.max_body_mb     = env_int_strict("MAX_BODY_MB",        100,  1, 102400, c.errors);
   c.max_body_mem_mb = env_int_strict("MAX_BODY_MEMORY_MB", 1024, 1, 102400, c.errors);
@@ -407,8 +409,10 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
       {"json", "text"}, c.errors);
   // Consumed by the layout module (layout_postfilter.h); validated here so a
   // typo fails startup instead of silently falling back to the default.
-  (void)env_choice_strict("LAYOUT_MERGE_MODE", "large",
-      {"large", "small", "union"}, c.errors);
+  // Canonical names are "all"/"outer"/"inner"; the old "union"/"large"/"small"
+  // strings are still accepted as deprecated aliases.
+  (void)env_choice_strict("LAYOUT_MERGE_MODE", "all",
+      {"all", "outer", "inner", "union", "large", "small"}, c.errors);
 
   c.disable_angle_cls = env_bool_strict("DISABLE_ANGLE_CLS", false, c.errors);
   c.layout_disabled   = env_bool_strict("DISABLE_LAYOUT",    false, c.errors);

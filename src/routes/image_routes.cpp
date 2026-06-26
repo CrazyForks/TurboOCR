@@ -15,6 +15,7 @@
 #include "turbo_ocr/routing/routing_config.h"
 #include "turbo_ocr/common/logger.h"
 #include "turbo_ocr/common/serialization.h"
+#include "turbo_ocr/output/markdown_export.h"
 #include "turbo_ocr/decode/image_dims.h"
 #include "turbo_ocr/decode/image_config.h"
 #include "turbo_ocr/decode/nvjpeg_decoder.h"
@@ -734,6 +735,81 @@ void register_ocr_pixels_route_gpu(server::WorkPool &pool,
   }, {drogon::Post});
 }
 
+// --- /ocr/markdown: faithful Markdown export ---
+void register_ocr_markdown_route_gpu(server::WorkPool &pool,
+                                     pipeline::PipelineDispatcher &dispatcher,
+                                     const server::ImageDecoder &decode,
+                                     bool layout_available) {
+  drogon::app().registerHandler(
+      "/ocr/markdown",
+      [&pool, &dispatcher, &decode, layout_available](
+          const drogon::HttpRequestPtr &req,
+          std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
+        if (req->body().empty()) {
+          callback(server::error_response(drogon::k400BadRequest,
+                                          "EMPTY_BODY", "Empty body"));
+          return;
+        }
+        if (!layout_available) {
+          callback(server::error_response(drogon::k400BadRequest,
+              "LAYOUT_DISABLED",
+              "/ocr/markdown requires the layout model (do not start with "
+              "DISABLE_LAYOUT=1)"));
+          return;
+        }
+        // ?embed=0 -> file-ref image links (assets written by an out-of-band
+        // exporter); default true -> self-contained base64 data: URIs.
+        bool embed = true;
+        if (auto p = req->getParameter("embed"); p == "0" || p == "false")
+          embed = false;
+
+        server::submit_work(pool, std::move(callback),
+            [req, &dispatcher, &decode, embed](server::DrogonCallback &cb) {
+          server::run_with_error_handling(cb, "/ocr/markdown", [&] {
+            const auto *data =
+                reinterpret_cast<const unsigned char *>(req->body().data());
+            size_t len = req->body().size();
+            cv::Mat img = decode(data, len);
+            if (img.empty()) {
+              cb(server::error_response(drogon::k400BadRequest,
+                  "IMAGE_DECODE_FAILED", "Failed to decode image"));
+              return;
+            }
+            const int kMaxImageDim = decode::max_image_dim();
+            if (img.cols > kMaxImageDim || img.rows > kMaxImageDim) {
+              cb(server::error_response(drogon::k400BadRequest,
+                  "DIMENSIONS_TOO_LARGE", "Image dimensions exceed maximum"));
+              return;
+            }
+
+            pipeline::OcrPipelineResult out;
+            try {
+              out = dispatcher.submit_for_default([img](auto &e) {
+                return e.pipeline->run_with_layout(
+                    img, e.stream, /*want_layout=*/true,
+                    /*want_reading_order=*/true, /*routing=*/{},
+                    /*defer_external=*/true);
+              });
+            } catch (const turbo_ocr::TimeoutError &) {
+              cb(timeout_response());
+              return;
+            }
+            pipeline::finalize_deferred(out);
+
+            turbo_ocr::assign_layout_ids(out.results, out.layout);
+            std::string md = turbo_ocr::output::render_markdown_with_assets(
+                out, img, /*base_dir=*/".", /*embed_images=*/embed);
+
+            auto resp = drogon::HttpResponse::newHttpResponse();
+            resp->setStatusCode(drogon::k200OK);
+            resp->setBody(std::move(md));
+            resp->setContentTypeString("text/markdown; charset=utf-8");
+            cb(resp);
+          });
+        });
+      }, {drogon::Post});
+}
+
 // --- POST /infer (Tier-B): run ONE crop through a chosen backend ----------
 // Body JSON: { "image": "<base64>", "modality": "table"|"formula",
 //              "backend": "<registry-name>"  |  { inline BackendSpec } }
@@ -815,6 +891,17 @@ void register_infer_route_gpu(server::WorkPool &pool,
             callback(server::error_response(drogon::k400BadRequest, code.c_str(), msg));
             return;
           }
+          // Reject inline kind:local: building a local engine on the request
+          // thread spins up ORT-CUDA sessions + hundreds of MB of cudaMalloc,
+          // unguarded — a resource-exhaustion vector. Local backends must be
+          // named (already loaded at startup); only kind:openai (a cheap HTTP
+          // client, gated by TURBO_ALLOW_ADHOC_BACKENDS above) may be inline.
+          if (inline_spec && inline_spec->kind == routing::Kind::Local) {
+            callback(server::error_response(drogon::k400BadRequest, "ADHOC_LOCAL_DISABLED",
+                "inline kind:local backends are not allowed; name an already-loaded "
+                "backend (see /capabilities) instead"));
+            return;
+          }
         } else {
           callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
               "'backend' must be a string (name) or an object (inline spec)"));
@@ -831,9 +918,29 @@ void register_infer_route_gpu(server::WorkPool &pool,
               cb(server::error_response(drogon::k400BadRequest, "BASE64_DECODE_FAILED", "Failed to decode base64"));
               return;
             }
-            cv::Mat img = decode(reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size());
+            // Decompression-bomb guard, mirroring reject_if_too_large_pre/post
+            // on the other image routes: a header sniff before decode, then a
+            // post-decode check for formats the sniff can't parse. Without it a
+            // 60000x60000 PNG decodes to a ~10 GB host Mat and OOMs the worker.
+            const int kMaxImageDim = decode::max_image_dim();
+            const auto *raw = reinterpret_cast<const unsigned char *>(bytes.data());
+            if (auto d = turbo_ocr::decode::peek_image_dimensions(raw, bytes.size())) {
+              if (d->width > kMaxImageDim || d->height > kMaxImageDim) {
+                cb(server::error_response(drogon::k400BadRequest, "DIMENSIONS_TOO_LARGE",
+                    std::format("Image dimensions {}x{} exceed maximum of {}x{}",
+                                d->width, d->height, kMaxImageDim, kMaxImageDim)));
+                return;
+              }
+            }
+            cv::Mat img = decode(raw, bytes.size());
             if (img.empty()) {
               cb(server::error_response(drogon::k400BadRequest, "IMAGE_DECODE_FAILED", "Failed to decode image"));
+              return;
+            }
+            if (img.cols > kMaxImageDim || img.rows > kMaxImageDim) {
+              cb(server::error_response(drogon::k400BadRequest, "DIMENSIONS_TOO_LARGE",
+                  std::format("Image dimensions {}x{} exceed maximum of {}x{}",
+                              img.cols, img.rows, kMaxImageDim, kMaxImageDim)));
               return;
             }
             std::string result;
@@ -877,6 +984,7 @@ void register_image_routes(server::WorkPool &pool,
   register_ocr_batch_route_gpu(pool, dispatcher, decode, nvjpeg_available, layout_available,
                                max_batch_images);
   register_ocr_pixels_route_gpu(pool, dispatcher, layout_available);
+  register_ocr_markdown_route_gpu(pool, dispatcher, decode, layout_available);
   register_infer_route_gpu(pool, dispatcher, decode);
 }
 

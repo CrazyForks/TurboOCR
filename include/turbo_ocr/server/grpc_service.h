@@ -686,6 +686,9 @@ public:
     job_opts.want_reading_order = want_reading_order;
     job_opts.want_blocks = want_blocks;
     job_opts.pdf_only_batch = pdf_chunk_batch_;
+    // Bound the GPU per-page future join with the configured request deadline so
+    // a wedged page can't hang the RPC (no-op on the sequential CPU overload).
+    job_opts.request_timeout_ms = request_timeout_ms_;
 
     pipeline::PdfJobResult job;
     try {
@@ -734,6 +737,13 @@ public:
         return grpc_error(ctx, grpc::StatusCode::INTERNAL, "PAGE_DECODE_FAILED",
             std::format("{} of {} rendered pages could not be decoded; retry",
                         job.decode_failures, job.num_pages));
+      case pipeline::PdfJobStatus::PageFailed:
+        return grpc_error(ctx, grpc::StatusCode::INTERNAL, "PAGE_FAILED",
+            std::format("{} of {} pages failed during OCR; retry",
+                        job.page_failures, job.num_pages));
+      case pipeline::PdfJobStatus::TimedOut:
+        return grpc_error(ctx, grpc::StatusCode::DEADLINE_EXCEEDED,
+            "INFERENCE_TIMEOUT", "PDF job exceeded the request deadline");
     }
 
     // Build response

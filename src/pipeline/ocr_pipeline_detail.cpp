@@ -1,8 +1,10 @@
 #include "ocr_pipeline_detail.h"
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cstdlib>
+#include <future>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -73,6 +75,24 @@ namespace turbo_ocr::pipeline {
 // See pipeline_result.h. No-op when out.pending is empty (sync path).
 void finalize_deferred(OcrPipelineResult &out) {
   auto &pe = out.pending;
+  // Backstop the future joins: the crop pool resolves every promise (success or
+  // its own per-crop timeout), so this only fires if a pool worker itself died/
+  // wedged. The promise-backed futures are safe to abandon (no blocking dtor),
+  // so a timed-out crop is left empty -> tagged degraded rather than hanging the
+  // GPU worker. Configurable via FINALIZE_DEFERRED_TIMEOUT_MS (default 120000).
+  static const long kFinalizeTimeoutMs = [] {
+    const char *e = std::getenv("FINALIZE_DEFERRED_TIMEOUT_MS");
+    long v = e ? std::atol(e) : 120000;
+    if (v <= 0) v = 120000;
+    // The backstop must never outlive the per-request deadline: a wedged remote
+    // crop would otherwise keep the GPU worker waiting long past the point the
+    // client already got its 504. Cap at REQUEST_TIMEOUT_MS (same env the server
+    // reads; default 60s, 0 == unbounded so the cap is skipped).
+    const char *rt = std::getenv("REQUEST_TIMEOUT_MS");
+    const long req = rt ? std::atol(rt) : 60000;
+    if (req > 0 && v > req) v = req;
+    return v;
+  }();
   // The deferred (async) path is what the DEFAULT vlm backend uses. Mirror the
   // synchronous path's no-silent-failure contract: every region here was a
   // table/formula crop dispatched to the backend, so an empty parse result —
@@ -87,8 +107,15 @@ void finalize_deferred(OcrPipelineResult &out) {
     for (auto &pc : pe.formula) {
       std::string latex;
       try {
-        std::string raw = pc.fut.get();         // the only blocking point
-        latex = pe.formula_rec->parse_async_result(raw);
+        if (pc.fut.wait_for(std::chrono::milliseconds(kFinalizeTimeoutMs)) ==
+            std::future_status::ready) {
+          std::string raw = pc.fut.get();
+          latex = pe.formula_rec->parse_async_result(raw);
+        } else {
+          std::cerr << "[finalize_deferred] formula future timed out after "
+                    << kFinalizeTimeoutMs << " ms (crop-pool worker stalled?); "
+                       "tagging degraded\n";
+        }
       } catch (const std::exception &e) {
         std::cerr << "[finalize_deferred] formula future threw: " << e.what() << '\n';
       }
@@ -115,8 +142,15 @@ void finalize_deferred(OcrPipelineResult &out) {
     for (auto &pc : pe.table) {
       std::string html;
       try {
-        std::string raw = pc.fut.get();
-        html = pe.table_rec->parse_async_result(raw);
+        if (pc.fut.wait_for(std::chrono::milliseconds(kFinalizeTimeoutMs)) ==
+            std::future_status::ready) {
+          std::string raw = pc.fut.get();
+          html = pe.table_rec->parse_async_result(raw);
+        } else {
+          std::cerr << "[finalize_deferred] table future timed out after "
+                    << kFinalizeTimeoutMs << " ms (crop-pool worker stalled?); "
+                       "tagging degraded\n";
+        }
       } catch (const std::exception &e) {
         std::cerr << "[finalize_deferred] table future threw: " << e.what() << '\n';
       }

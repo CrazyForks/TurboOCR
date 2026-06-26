@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <set>
@@ -81,6 +82,14 @@ public:
   // autorotate as unavailable).
   [[nodiscard]] bool load_doc_ori_model(const std::string &doc_ori_trt_path);
   [[nodiscard]] bool has_doc_ori() const noexcept { return use_doc_ori_; }
+
+  // True once (and clears) when a recoverable CUDA fault in the table/formula
+  // stage flagged this pipeline for rebuild. The dispatcher worker consumes it
+  // after each task and recycles the entry, so a wedge-free slot self-heals
+  // instead of returning 500s on every subsequent request.
+  [[nodiscard]] bool consume_recycle_request() noexcept {
+    return recycle_requested_.exchange(false, std::memory_order_relaxed);
+  }
 
   // --- Per-request routing (Tier-A/B) introspection + ad-hoc inference -----
 
@@ -310,6 +319,10 @@ private:
   cudaStream_t formula_stream_     = nullptr;
   cudaEvent_t  table_done_event_   = nullptr;
   cudaEvent_t  formula_done_event_ = nullptr;
+
+  // Set by dispatch_router_ on a recoverable CUDA fault in the table/formula
+  // stage; consumed by the dispatcher worker to trigger an entry rebuild.
+  std::atomic<bool> recycle_requested_{false};
 
   // Lazily create the table/formula stream + done-event on first use. The
   // pipeline owns and destroys these CUDA resources; the recognizer-registry

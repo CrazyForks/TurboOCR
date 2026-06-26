@@ -18,14 +18,16 @@
 // PipelineDispatcher queue (the model the HTTP path already used). Backpressure
 // is the dispatcher queue depth (PoolExhaustedError -> the caller maps to 503 /
 // RESOURCE_EXHAUSTED); there is no per-page std::async / counting_semaphore.
-// Every page task captures the handler-scoped PdfPageSink (and its inputs) and
-// the JobState that owns the render StreamHandle, both of which outlive all
-// futures because run_pdf_job joins them before returning — so a task that is
-// still running when the deadline elapses never references a dead object. This
-// is exactly the C4-pdf safety rule documented on the legacy HTTP path.
+// The GPU job bounds its page-future join against ONE job-wide deadline
+// (request_timeout_ms) so a worker wedged on a single page can't hang the whole
+// request. A future that overruns is ABANDONED — its task keeps running — so
+// every page task co-owns the PdfPageSink and the render StreamHandle by
+// shared_ptr (captured by value): the shared state lives until the last task,
+// including any abandoned one, drops it, and no task ever touches a dead object.
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <future>
 #include <memory>
@@ -91,6 +93,9 @@ struct PdfJobOptions {
   pdf::EncodeOptions encode_opts{};
   // pdf_only batched-chunk size (GPU only; 0 = per-page path).
   int pdf_only_batch = 0;
+  // Per-request deadline (ms; 0 = unbounded). The GPU job bounds its page-future
+  // join against this so a worker wedged mid-page can't hang the whole request.
+  long request_timeout_ms = 0;
 };
 
 // Outcome category for run_pdf_job. The transport maps each to its own error
@@ -101,6 +106,8 @@ enum class PdfJobStatus {
   RenderFailed,    // renderer threw -> PDF_RENDER_FAILED
   Dropped,         // GPU queue full mid-stream -> SERVER_BUSY (503 / RES_EXH)
   DecodeFailed,    // rendered PPM unreadable -> PAGE_DECODE_FAILED (500 / INTERNAL)
+  PageFailed,      // a page's OCR/inference threw -> PAGE_FAILED (500 / INTERNAL)
+  TimedOut,        // job-wide deadline overrun -> INFERENCE_TIMEOUT (504 / DEADLINE_EXCEEDED)
 };
 
 struct PdfJobResult {
@@ -110,6 +117,7 @@ struct PdfJobResult {
   int dropped_pages = 0;   // count, for the SERVER_BUSY message
   int first_dropped = -1;  // first dropped page index, for the HTTP message
   int decode_failures = 0;
+  int page_failures = 0;   // pages whose inference threw; any > 0 fails the job
 };
 
 // ── Text-layer helpers (shared) ──────────────────────────────────────────
@@ -266,23 +274,27 @@ serialize_page_results(PdfPageResult &pg, bool want_blocks) {
 
 namespace detail {
 
-// Shared state every page task writes into. Lives at run_pdf_job scope (which
-// joins all futures before returning), so tasks may hold a reference to it.
+// Shared state every page task writes into. Held by shared_ptr and captured BY
+// VALUE into every page task, so a task abandoned on a deadline timeout (its
+// future get()-with-timeout abandons it) safely outlives run_pdf_job: the sink
+// stays alive until the last task that holds it finishes. It therefore OWNS the
+// mutex / results / text cache / document outright (rather than referencing
+// run_pdf_job locals that would die at return).
 struct PdfPageSink {
-  // Reference members bound at aggregate-init by run_pdf_job (cannot and must
-  // not carry default initializers); cppcheck's uninitMemberVarNoCtor here is
-  // a false positive for references.
-  // cppcheck-suppress uninitMemberVarNoCtor
-  std::mutex &results_mutex;
-  std::vector<PdfPageResult> &page_results;
-  pdf::PdfDocument *pdf_doc = nullptr;  // null when no text layer was opened
-  const std::vector<pdf::PdfPageText> &page_text_cache;
+  std::mutex results_mutex;
+  std::vector<PdfPageResult> page_results;
+  std::unique_ptr<pdf::PdfDocument> pdf_doc;  // null when no text layer was opened
+  std::vector<pdf::PdfPageText> page_text_cache;
   int dpi = 0;
   PdfImageMode image_mode = PdfImageMode::None;
   pdf::EncodeOptions encode_opts{};
   bool autorotate = false;
   // Rendered pages whose PPM could not be read back (a server-side fault).
   std::atomic<int> decode_failures{0};
+  // Pages whose OCR/inference threw — counted by the true page count (the whole
+  // chunk on the batched path), so any > 0 fails the job rather than returning a
+  // silently-empty page in a 200.
+  std::atomic<int> page_failures{0};
 };
 
 [[nodiscard]] inline std::vector<uint8_t>
@@ -370,28 +382,36 @@ inline void ocr_single_page(GpuPipelineEntry &e, PdfPageSink &sink,
     return;
   }
 
-  if (page_mode_of(sink, page_idx) == pdf::PdfMode::Geometric) {
-    // Geometric pages are born-digital/upright with pt-space text boxes;
-    // autorotate does not apply (rotating would desync the boxes). Encode +
-    // run layout-only when requested.
-    auto encoded = maybe_encode_page(sink, img);
-    auto layout = layout_enabled
-        ? e.pipeline->run_layout_only(img, e.stream).layout
-        : std::vector<layout::LayoutBox>{};
-    store_geometric_page(sink, page_idx, std::move(layout),
-                         img.cols, img.rows, want_reading_order,
-                         std::move(encoded));
-  } else {
-    // OCR page: de-rotate upright FIRST (autorotate=1) so det/rec, the boxes,
-    // and the encoded image all share one upright frame.
-    int orient = sink.autorotate
-        ? e.pipeline->detect_orientation(img, e.stream) : 0;
-    if (orient) classification::rotate_upright(img, orient);
-    auto encoded = maybe_encode_page(sink, img);
-    auto out = e.pipeline->run_with_layout(img, e.stream, layout_enabled,
-                                           want_reading_order);
-    store_ocr_page(sink, page_idx, std::move(out), img.cols, img.rows,
-                   std::move(encoded), orient);
+  try {
+    if (page_mode_of(sink, page_idx) == pdf::PdfMode::Geometric) {
+      // Geometric pages are born-digital/upright with pt-space text boxes;
+      // autorotate does not apply (rotating would desync the boxes). Encode +
+      // run layout-only when requested.
+      auto encoded = maybe_encode_page(sink, img);
+      auto layout = layout_enabled
+          ? e.pipeline->run_layout_only(img, e.stream).layout
+          : std::vector<layout::LayoutBox>{};
+      store_geometric_page(sink, page_idx, std::move(layout),
+                           img.cols, img.rows, want_reading_order,
+                           std::move(encoded));
+    } else {
+      // OCR page: de-rotate upright FIRST (autorotate=1) so det/rec, the boxes,
+      // and the encoded image all share one upright frame.
+      int orient = sink.autorotate
+          ? e.pipeline->detect_orientation(img, e.stream) : 0;
+      if (orient) classification::rotate_upright(img, orient);
+      auto encoded = maybe_encode_page(sink, img);
+      auto out = e.pipeline->run_with_layout(img, e.stream, layout_enabled,
+                                             want_reading_order);
+      store_ocr_page(sink, page_idx, std::move(out), img.cols, img.rows,
+                     std::move(encoded), orient);
+    }
+  } catch (const std::exception &ex) {
+    // Leave the slot default (empty); the orchestrator turns any page_failures
+    // into a job-level PAGE_FAILED rather than a 200 with a blank page.
+    sink.page_failures.fetch_add(1, std::memory_order_relaxed);
+    TOCR_LOG_ERROR("PDF page inference error", "route", "/ocr/pdf",
+                   "page", page_idx, "error", std::string_view(ex.what()));
   }
 }
 
@@ -425,23 +445,36 @@ inline void ocr_page_chunk(GpuPipelineEntry &e, PdfPageSink &sink,
   }
   if (imgs.empty()) return;
 
-  auto outs = e.pipeline->run_batch_with_layout(imgs, e.stream, layout_enabled,
-                                                want_reading_order);
-  for (size_t j = 0; j < outs.size(); ++j)
-    store_ocr_page(sink, live[j], std::move(outs[j]),
-                   imgs[j].cols, imgs[j].rows,
-                   maybe_encode_page(sink, imgs[j]), orients[j]);
+  try {
+    auto outs = e.pipeline->run_batch_with_layout(imgs, e.stream, layout_enabled,
+                                                  want_reading_order);
+    for (size_t j = 0; j < outs.size(); ++j)
+      store_ocr_page(sink, live[j], std::move(outs[j]),
+                     imgs[j].cols, imgs[j].rows,
+                     maybe_encode_page(sink, imgs[j]), orients[j]);
+  } catch (const std::exception &ex) {
+    // The whole batch shares one execute — a throw blanks every live page in
+    // the chunk, so count them all (not 1) for an accurate PAGE_FAILED.
+    sink.page_failures.fetch_add(static_cast<int>(live.size()),
+                                 std::memory_order_relaxed);
+    TOCR_LOG_ERROR("PDF page chunk inference error", "route", "/ocr/pdf",
+                   "first_page", live.front(), "pages", live.size(),
+                   "error", std::string_view(ex.what()));
+  }
 }
 
 // GPU streamed render: per rendered page, accumulate into a pdf_only batch
 // chunk or submit a single-page task directly onto the dispatcher (H3 — no
-// per-page OS thread). Returns the StreamHandle by value: the caller MUST keep
-// it alive until every future in page_futures has completed (the handle owns
-// the scratch tmpdir the workers read).
-[[nodiscard]] inline render::PdfRenderer::StreamHandle run_streamed_render_gpu(
+// per-page OS thread). `sink` and `stream_handle` are shared_ptrs captured BY
+// VALUE into every task so an abandoned (timed-out) task safely outlives this
+// call: the sink and the scratch tmpdir live until the last task drops them.
+// Populates *stream_handle with the render result and returns its num_pages.
+[[nodiscard]] inline int run_streamed_render_gpu(
     PipelineDispatcher &dispatcher, render::PdfRenderer &pdf_renderer,
     const uint8_t *pdf_data, size_t pdf_len, bool layout_enabled,
-    bool want_reading_order, pdf::PdfMode mode, PdfPageSink &sink,
+    bool want_reading_order, pdf::PdfMode mode,
+    const std::shared_ptr<PdfPageSink> &sink,
+    const std::shared_ptr<render::PdfRenderer::StreamHandle> &stream_handle,
     std::vector<uint8_t> &need_render,
     std::vector<std::future<void>> &page_futures, std::mutex &futures_mutex,
     int pdf_only_batch, std::vector<int> &dropped_pages) {
@@ -456,9 +489,9 @@ inline void ocr_page_chunk(GpuPipelineEntry &e, PdfPageSink &sink,
       // consumes the move BEFORE it can throw PoolExhausted, and the catch
       // below still needs the indices.
       fut = dispatcher.submit(
-          [&sink, layout_enabled, want_reading_order,
+          [sink, stream_handle, layout_enabled, want_reading_order,
            idxs, paths = std::move(paths)](auto &e) {
-            ocr_page_chunk(e, sink, layout_enabled, want_reading_order,
+            ocr_page_chunk(e, *sink, layout_enabled, want_reading_order,
                            idxs, paths);
           });
     } catch (const turbo_ocr::PoolExhaustedError &) {
@@ -471,12 +504,12 @@ inline void ocr_page_chunk(GpuPipelineEntry &e, PdfPageSink &sink,
     page_futures.push_back(std::move(fut));
   };
 
-  auto handle = pdf_renderer.render_streamed(pdf_data, pdf_len, sink.dpi,
+  auto handle = pdf_renderer.render_streamed(pdf_data, pdf_len, sink->dpi,
       [&](int page_idx, std::string ppm_path) {
         bool is_geometric = false;
         {
-          std::lock_guard<std::mutex> rlock(sink.results_mutex);
-          auto &page_results = sink.page_results;
+          std::lock_guard<std::mutex> rlock(sink->results_mutex);
+          auto &page_results = sink->page_results;
           if (page_idx >= static_cast<int>(page_results.size())) {
             page_results.resize(page_idx + 1);
             if (mode != pdf::PdfMode::Ocr &&
@@ -505,9 +538,9 @@ inline void ocr_page_chunk(GpuPipelineEntry &e, PdfPageSink &sink,
         std::future<void> fut;
         try {
           fut = dispatcher.submit(
-              [&sink, layout_enabled, want_reading_order, page_idx,
+              [sink, stream_handle, layout_enabled, want_reading_order, page_idx,
                path = std::move(ppm_path)](auto &e) {
-                ocr_single_page(e, sink, layout_enabled, want_reading_order,
+                ocr_single_page(e, *sink, layout_enabled, want_reading_order,
                                 page_idx, path);
               });
         } catch (const turbo_ocr::PoolExhaustedError &) {
@@ -525,7 +558,10 @@ inline void ocr_page_chunk(GpuPipelineEntry &e, PdfPageSink &sink,
   if (!acc_idxs.empty())
     submit_ocr_chunk(std::move(acc_idxs), std::move(acc_paths));
 
-  return handle;
+  // Hand the tmpdir-owning handle to the shared object the tasks co-own; the
+  // tmpdir now lives until the last task (including any abandoned one) drops it.
+  *stream_handle = std::move(handle);
+  return stream_handle->num_pages;
 }
 #endif // !USE_CPU_ONLY
 
@@ -543,7 +579,8 @@ inline int run_streamed_render_cpu(
     bool want_reading_order, pdf::PdfMode mode,
     std::vector<PdfPageResult> &page_results,
     const std::vector<uint8_t> &need_render, int &decode_failures,
-    PdfImageMode image_mode, const pdf::EncodeOptions &encode_opts,
+    int &page_failures, PdfImageMode image_mode,
+    const pdf::EncodeOptions &encode_opts,
     bool autorotate, const server::OrientFunc &orient_fn) {
   auto stream_handle = pdf_renderer.render_streamed(pdf_data, pdf_len, dpi,
       [&](int page_idx, const std::string &ppm_path) noexcept {
@@ -616,9 +653,11 @@ inline int run_streamed_render_cpu(
           for (auto &item : pg.results) item.source = "ocr";
         }
        } catch (const std::exception &e) {
+        ++page_failures;
         TOCR_LOG_ERROR("PDF page inference error", "route", "/ocr/pdf",
                        "page", page_idx, "error", std::string_view(e.what()));
        } catch (...) {
+        ++page_failures;
         TOCR_LOG_ERROR("PDF page inference error (unknown)",
                        "route", "/ocr/pdf", "page", page_idx);
        }
@@ -632,39 +671,39 @@ inline int run_streamed_render_cpu(
 
 #ifndef USE_CPU_ONLY
 // GPU PDF job. Submits page work directly onto the dispatcher (H3). Page tasks
-// capture the handler-scoped sink + read PPMs owned by the StreamHandle, both
-// of which outlive every future (joined before return) — the C4-pdf safety
-// rule. Backpressure is the dispatcher queue depth: PoolExhaustedError mid-
-// stream sets status=Dropped (caller -> SERVER_BUSY).
+// co-own the sink + StreamHandle by shared_ptr, so a task abandoned when its
+// future overruns the job-wide deadline (request_timeout_ms) is memory-safe:
+// the shared state outlives this call until that task finishes. Backpressure is
+// the dispatcher queue depth: PoolExhaustedError mid-stream sets status=Dropped
+// (caller -> SERVER_BUSY).
 [[nodiscard]] inline PdfJobResult run_pdf_job(
     PipelineDispatcher &dispatcher, render::PdfRenderer &pdf_renderer,
     const uint8_t *pdf_data, size_t pdf_len, const PdfJobOptions &opts) {
   PdfJobResult job;
 
-  pdf::PdfMode mode = opts.mode;
-  std::unique_ptr<pdf::PdfDocument> pdf_doc;
-  std::vector<pdf::PdfPageText> page_text_cache;
-  open_pdf_for_text_layer(pdf_data, pdf_len, mode, pdf_doc, page_text_cache);
+  // The sink OWNS every piece of state a page task touches (results, mutex,
+  // text cache, document), heap-allocated and co-owned by the tasks, so an
+  // abandoned task never dereferences a dead run_pdf_job local.
+  auto sink = std::make_shared<detail::PdfPageSink>();
+  sink->dpi = opts.dpi;
+  sink->image_mode = opts.image_mode;
+  sink->encode_opts = opts.encode_opts;
+  sink->autorotate = opts.autorotate;
 
-  std::mutex results_mutex;
-  std::vector<PdfPageResult> page_results;
+  pdf::PdfMode mode = opts.mode;
+  open_pdf_for_text_layer(pdf_data, pdf_len, mode, sink->pdf_doc,
+                          sink->page_text_cache);
+
   std::vector<uint8_t> need_render;
   bool any_need_render = (mode == pdf::PdfMode::Ocr);
 
   if (mode != pdf::PdfMode::Ocr)
-    prepopulate_pages(mode, opts.want_layout, page_text_cache, page_results,
-                      need_render, &any_need_render,
+    prepopulate_pages(mode, opts.want_layout, sink->page_text_cache,
+                      sink->page_results, need_render, &any_need_render,
                       opts.image_mode == PdfImageMode::Inline);
 
-  // Everything the page tasks reference is declared BEFORE page_futures so it
-  // outlives the futures' blocking destructors on EVERY unwind path: `sink`
-  // (the decode_failures atomic), `dropped_pages`, and `stream_handle` (owns
-  // the PPM tmpdir). Reverse-destruction then joins the futures first.
-  detail::PdfPageSink sink{results_mutex, page_results, pdf_doc.get(),
-                           page_text_cache, opts.dpi, opts.image_mode,
-                           opts.encode_opts, opts.autorotate};
   std::vector<int> dropped;
-  render::PdfRenderer::StreamHandle stream_handle;
+  auto stream_handle = std::make_shared<render::PdfRenderer::StreamHandle>();
 
   std::mutex futures_mutex;
   std::vector<std::future<void>> page_futures;
@@ -672,40 +711,76 @@ inline int run_streamed_render_cpu(
 
   if (any_need_render) {
     try {
-      stream_handle = detail::run_streamed_render_gpu(
+      num_pages = detail::run_streamed_render_gpu(
           dispatcher, pdf_renderer, pdf_data, pdf_len, opts.want_layout,
-          opts.want_reading_order, mode, sink, need_render, page_futures,
-          futures_mutex, opts.pdf_only_batch, dropped);
-      num_pages = stream_handle.num_pages;
+          opts.want_reading_order, mode, sink, stream_handle, need_render,
+          page_futures, futures_mutex, opts.pdf_only_batch, dropped);
     } catch (const std::exception &e) {
-      // Drain in-flight page futures before returning so their worker threads
-      // finish touching the render handle; per-page errors here are secondary
-      // to the primary render failure (e) we report below.
-      for (auto &f : page_futures) { try { f.get(); } catch (...) { /* secondary to (e), see above */ } }
+      // No drain needed: every in-flight page task co-owns the sink/handle via
+      // shared_ptr, so abandoning the futures here is memory-safe (a still-running
+      // task can't dereference a dead local). An unbounded f.get() drain would
+      // instead let one wedged worker hang the whole render-failure response.
       TOCR_LOG_ERROR("PDF render failed", "route", "/ocr/pdf",
                      "error", std::string_view(e.what()));
       job.status = PdfJobStatus::RenderFailed;
       return job;
     }
   } else {
-    num_pages = pdf_doc ? pdf_doc->page_count() : 0;
+    num_pages = sink->pdf_doc ? sink->pdf_doc->page_count() : 0;
   }
 
   {
-    std::lock_guard<std::mutex> rlock(results_mutex);
-    if (static_cast<int>(page_results.size()) < num_pages)
-      page_results.resize(num_pages);
+    std::lock_guard<std::mutex> rlock(sink->results_mutex);
+    if (static_cast<int>(sink->page_results.size()) < num_pages)
+      sink->page_results.resize(num_pages);
   }
 
+  // Bounded join against ONE job-wide deadline: a worker wedged on a single page
+  // can't hang the whole request. The deadline is SCALED by page count — each
+  // page gets request_timeout_ms, the whole job num_pages * that — so a flat 60s
+  // budget can't kill a big-but-healthy PDF. On a per-future throw the future is
+  // abandoned (the task keeps its shared_ptr copies, so this is safe) and the page
+  // is counted as failed; the catch also backstops any UNEXPECTED escape (the
+  // worker bodies catch their own) so nothing slips through as a silently-empty
+  // page in a 200. A pure deadline overrun (TimeoutError) is NOT an inference page
+  // failure: it surfaces as a distinct 504 / DEADLINE_EXCEEDED.
+  const long per_page_budget = opts.request_timeout_ms;  // 0 == unbounded
+  const long long job_budget =
+      per_page_budget > 0
+          ? static_cast<long long>(per_page_budget) * std::max(1, num_pages)
+          : 0;
+  const auto job_deadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(job_budget);
+  bool deadline_exceeded = false;
   for (auto &f : page_futures) {
-    try { f.get(); } catch (const std::exception &e) {
+    try {
+      if (job_budget > 0) {
+        const auto now = std::chrono::steady_clock::now();
+        long long remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                job_deadline - now).count();
+        if (remaining < 1) remaining = 1;  // already past: near-instant abandon
+        get_with_timeout(f, static_cast<long>(remaining));
+      } else {
+        f.get();
+      }
+    } catch (const turbo_ocr::TimeoutError &) {
+      // Job-wide deadline overrun, not a page-level inference failure. Abandon the
+      // remaining futures (their tasks co-own the sink) and report a 504.
+      deadline_exceeded = true;
+      break;
+    } catch (const std::exception &e) {
+      sink->page_failures.fetch_add(1, std::memory_order_relaxed);
       TOCR_LOG_ERROR("PDF page error", "route", "/ocr/pdf",
                      "error", std::string_view(e.what()));
+      continue;
     }
   }
 
   job.num_pages = num_pages;
   if (num_pages == 0) { job.status = PdfJobStatus::EmptyPdf; return job; }
+
+  if (deadline_exceeded) { job.status = PdfJobStatus::TimedOut; return job; }
 
   if (!dropped.empty()) {
     job.status = PdfJobStatus::Dropped;
@@ -714,20 +789,27 @@ inline int run_streamed_render_cpu(
     return job;
   }
 
-  if (const int failed = sink.decode_failures.load(std::memory_order_relaxed);
+  if (const int failed = sink->decode_failures.load(std::memory_order_relaxed);
       failed > 0) {
     job.status = PdfJobStatus::DecodeFailed;
     job.decode_failures = failed;
     return job;
   }
 
+  if (const int failed = sink->page_failures.load(std::memory_order_relaxed);
+      failed > 0) {
+    job.status = PdfJobStatus::PageFailed;
+    job.page_failures = failed;
+    return job;
+  }
+
   // num_pages may have grown the vector under page_futures completion; trim to
   // the renderer-reported count.
   {
-    std::lock_guard<std::mutex> rlock(results_mutex);
+    std::lock_guard<std::mutex> rlock(sink->results_mutex);
     job.pages.reserve(num_pages);
-    for (int i = 0; i < num_pages && i < static_cast<int>(page_results.size()); ++i)
-      job.pages.push_back(std::move(page_results[i]));
+    for (int i = 0; i < num_pages && i < static_cast<int>(sink->page_results.size()); ++i)
+      job.pages.push_back(std::move(sink->page_results[i]));
   }
   return job;
 }
@@ -755,6 +837,7 @@ inline int run_streamed_render_cpu(
                       opts.image_mode == PdfImageMode::Inline);
 
   int decode_failures = 0;
+  int page_failures = 0;
   try {
     bool any_need_render = (mode == pdf::PdfMode::Ocr) ||
         std::any_of(need_render.begin(), need_render.end(),
@@ -763,8 +846,8 @@ inline int run_streamed_render_cpu(
       int num_pages = detail::run_streamed_render_cpu(
           infer, pdf_renderer, pdf_data, pdf_len, opts.dpi, opts.want_layout,
           opts.want_reading_order, mode, page_results, need_render,
-          decode_failures, opts.image_mode, opts.encode_opts, opts.autorotate,
-          orient_fn);
+          decode_failures, page_failures, opts.image_mode, opts.encode_opts,
+          opts.autorotate, orient_fn);
       if (static_cast<int>(page_results.size()) < num_pages)
         page_results.resize(num_pages);
     }
@@ -780,6 +863,13 @@ inline int run_streamed_render_cpu(
   if (decode_failures > 0) {
     job.status = PdfJobStatus::DecodeFailed;
     job.decode_failures = decode_failures;
+    job.num_pages = static_cast<int>(page_results.size());
+    return job;
+  }
+
+  if (page_failures > 0) {
+    job.status = PdfJobStatus::PageFailed;
+    job.page_failures = page_failures;
     job.num_pages = static_cast<int>(page_results.size());
     return job;
   }

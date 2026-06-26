@@ -10,19 +10,27 @@
 
 namespace turbo_ocr::layout {
 
-enum class MergeMode { kUnion, kLarge, kSmall };
+// How nested layout boxes are reconciled. The model intentionally emits some
+// classes (formulas, tables, titles, footnotes) nested inside a larger region;
+// the mode decides which copy survives.
+//   kKeepAll   ("all")   = keep every box, outer and nested. Default: nothing
+//                          the model emitted is dropped.
+//   kKeepOuter ("outer") = keep the outer/larger region, drop boxes nested in
+//                          it. On forms (every field is a box inside an outer
+//                          frame) this collapses the page to a few containers.
+//   kKeepInner ("inner") = keep the innermost boxes, drop the pure containers.
+enum class MergeMode { kKeepAll, kKeepOuter, kKeepInner };
 
-// How nested layout boxes are reconciled. Default "large" keeps outer regions
-// and drops boxes nested inside them; on forms (every field is a box inside an
-// outer frame) that collapses the page to a few containers, so those callers
-// set "small" (keep innermost) or "union" (keep all).
+// Canonical strings are "all"/"outer"/"inner". The old "union"/"large"/"small"
+// names are still accepted as deprecated aliases so existing configs keep
+// working.
 inline MergeMode layout_merge_mode() {
   static const MergeMode mode = [] {
     const char *v = std::getenv("LAYOUT_MERGE_MODE");
-    const std::string s = v ? v : "large";
-    if (s == "union") return MergeMode::kUnion;
-    if (s == "small") return MergeMode::kSmall;
-    return MergeMode::kLarge;
+    const std::string s = v ? v : "all";
+    if (s == "outer" || s == "large") return MergeMode::kKeepOuter;
+    if (s == "inner" || s == "small") return MergeMode::kKeepInner;
+    return MergeMode::kKeepAll; // "all" / "union" / unset
   }();
   return mode;
 }
@@ -106,12 +114,13 @@ postfilter_layout_boxes(std::vector<LayoutBox> out, int orig_h, int orig_w) {
     return box_area > area_thresh * img_area;
   });
 
-  // 3. Reconcile nested boxes per LAYOUT_MERGE_MODE. union keeps everything.
-  //    large drops boxes nested in another (keep containers). small drops the
-  //    pure containers (keep innermost). A is "inside" B when >=90% of A's area
-  //    overlaps B; formula boxes are never counted as inside a non-formula box.
+  // 3. Reconcile nested boxes per LAYOUT_MERGE_MODE. "all" keeps everything.
+  //    "outer" drops boxes nested in another (keep containers). "inner" drops
+  //    the pure containers (keep innermost). A is "inside" B when >=90% of A's
+  //    area overlaps B; formula boxes are never counted as inside a non-formula
+  //    box.
   const MergeMode mode = layout_merge_mode();
-  if (mode != MergeMode::kUnion) {
+  if (mode != MergeMode::kKeepAll) {
     auto inside = [&](const LayoutBox &a, const LayoutBox &b) -> bool {
       auto [ax0, ay0, ax1, ay1] = box_coords(a);
       auto [bx0, by0, bx1, by1] = box_coords(b);
@@ -138,7 +147,7 @@ postfilter_layout_boxes(std::vector<LayoutBox> out, int orig_h, int orig_w) {
     std::vector<LayoutBox> merged;
     merged.reserve(n);
     for (size_t i = 0; i < n; ++i) {
-      const bool keep = (mode == MergeMode::kLarge)
+      const bool keep = (mode == MergeMode::kKeepOuter)
                             ? !inside_other[i]
                             : (!contains_other[i] || inside_other[i]);
       if (keep) merged.push_back(std::move(nms_out[i]));

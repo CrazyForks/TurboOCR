@@ -258,13 +258,15 @@ TEST_CASE("GRPC_RESPONSE_MODE validates", "[server_config]") {
 }
 
 TEST_CASE("LAYOUT_MERGE_MODE validates", "[server_config]") {
-  for (const char *ok : {"large", "small", "union"}) {
+  // Canonical names plus the deprecated "large"/"small"/"union" aliases.
+  for (const char *ok :
+       {"all", "outer", "inner", "large", "small", "union"}) {
     reset_env();
     ::setenv("LAYOUT_MERGE_MODE", ok, 1);
     CHECK(ServerConfig::from_env().errors.empty());
   }
   reset_env();
-  ::setenv("LAYOUT_MERGE_MODE", "largee", 1);  // typo must be fatal, not silent
+  ::setenv("LAYOUT_MERGE_MODE", "outerr", 1);  // typo must be fatal, not silent
   REQUIRE_FALSE(ServerConfig::from_env().errors.empty());
 }
 

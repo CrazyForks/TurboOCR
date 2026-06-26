@@ -133,9 +133,10 @@ bool TrtEngine::launch_baked(int slot, cudaStream_t stream) {
 }
 
 bool TrtEngine::load() {
-  // Deserialize the engine once per .trt path (process-global cache) and share
-  // it across all pool workers — only the IExecutionContext below is
-  // per-instance/per-thread.
+  // By default get_or_load_engine() deserializes a PRIVATE engine per caller:
+  // concurrent enqueueV3() across multiple IExecutionContexts of one shared
+  // engine corrupts recognition output under load (see engine_cache.cpp). The
+  // IExecutionContext below is always per-instance/per-thread.
   engine_ = engine::get_or_load_engine(model_path_);
   if (!engine_) [[unlikely]] {
     // get_or_load_engine already logged the specific read/deserialize failure.

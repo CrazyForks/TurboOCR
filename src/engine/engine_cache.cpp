@@ -50,17 +50,41 @@ std::vector<char> read_file(const std::string &path) {
 
 } // namespace
 
+// Cross-pipeline engine sharing is OFF by default.
+//
+// Sharing ONE deserialized ICudaEngine across all pool workers and giving each
+// worker its own IExecutionContext is the textbook-"supported" TensorRT pattern
+// — but in practice, concurrent enqueueV3() on multiple contexts of the SAME
+// engine corrupts recognition output under load: detection still finds the text
+// boxes, yet rec decodes them to blank (empty/partial text on ~0.5-0.8% of
+// requests at concurrency ~150, the exact "silent text loss" failure). Private
+// per-worker engines eliminate the shared mutable engine state entirely AND run
+// ~2x faster (no contention on shared engine internals). Each pool stage loads a
+// distinct .trt path, so the cache deduped nothing WITHIN a pipeline anyway —
+// it only ever shared ACROSS pipelines, which is precisely the unsafe case.
+//
+// TURBO_OCR_SHARE_ENGINES=1 restores the old shared-engine behaviour; only safe
+// when pool concurrency is 1 (e.g. a single-worker, VRAM-constrained deploy).
+[[nodiscard]] static bool engine_sharing_enabled() {
+  static const bool v = std::getenv("TURBO_OCR_SHARE_ENGINES") != nullptr;
+  return v;
+}
+
 std::shared_ptr<nvinfer1::ICudaEngine>
 get_or_load_engine(const std::string &trt_path) {
   CacheState &s = state();
   std::lock_guard<std::mutex> lock(s.mu);
 
+  const bool share = engine_sharing_enabled();
+
+  if (share) {
   if (auto it = s.engines.find(trt_path); it != s.engines.end()) {
     if (auto eng = it->second.lock())
       return eng;
     // weak_ptr expired (last sharing instance died): drop the dead entry so the
     // map can't accumulate stale keys, then re-deserialize below.
     s.engines.erase(it);
+  }
   }
 
   if (!s.runtime) {
@@ -89,7 +113,8 @@ get_or_load_engine(const std::string &trt_path) {
   std::shared_ptr<nvinfer1::ICudaEngine> eng(
       raw, [rt = s.runtime](nvinfer1::ICudaEngine *p) { delete p; });
 
-  s.engines[trt_path] = eng;
+  if (share)
+    s.engines[trt_path] = eng;
   return eng;
 }
 

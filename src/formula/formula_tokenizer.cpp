@@ -268,7 +268,7 @@ std::optional<FormulaTokenizer> FormulaTokenizer::load(const std::string& json_p
     return tok;
 }
 
-std::string FormulaTokenizer::decode(std::span<const int64_t> ids) const {
+std::string FormulaTokenizer::decode(std::span<const int64_t> ids, bool post_process) const {
     std::string raw;
     raw.reserve(ids.size() * 2);
     for (int64_t id : ids) {
@@ -282,7 +282,8 @@ std::string FormulaTokenizer::decode(std::span<const int64_t> ids) const {
     with_spaces = replace_all(std::move(with_spaces), "[EOS]", "");
     with_spaces = replace_all(std::move(with_spaces), "[BOS]", "");
     with_spaces = replace_all(std::move(with_spaces), "[PAD]", "");
-    return latex_post_process(trim(with_spaces));
+    std::string trimmed = trim(with_spaces);
+    return post_process ? latex_post_process(trimmed) : trimmed;
 }
 
 }  // namespace turbo_ocr::formula

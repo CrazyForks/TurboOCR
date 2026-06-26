@@ -19,8 +19,10 @@ public:
     // Decode token ids into a normalised LaTeX string.
     // Trims at first EOS, skips specials, looks up id_to_token, concatenates,
     // remaps the BPE space marker 'Ġ' (UTF-8 0xC4 0xA0) to ' ', strips
-    // BOS/EOS/PAD literals, trims, then applies latex_post_process.
-    std::string decode(std::span<const int64_t> ids) const;
+    // BOS/EOS/PAD literals, trims, then (if post_process) applies latex_post_process.
+    // The OmniDocBench/PaddleX reference scores the RAW HF decode (space-separated
+    // tokens), so the in-process formula path passes post_process=false to match it.
+    std::string decode(std::span<const int64_t> ids, bool post_process = true) const;
 
     std::size_t vocab_size() const noexcept { return id_to_token_.size(); }
 

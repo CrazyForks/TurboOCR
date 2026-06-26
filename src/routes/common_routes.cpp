@@ -65,6 +65,12 @@ using decode::max_image_dim;
                       d->width, d->height, max_image_dim(), max_image_dim())));
       return true;
     }
+    if (decode::exceeds_pixel_cap(d->width, d->height)) {
+      cb(server::error_response(drogon::k400BadRequest, "PIXELS_TOO_LARGE",
+          std::format("Image area {}x{} exceeds maximum of {} pixels",
+                      d->width, d->height, decode::max_image_pixels())));
+      return true;
+    }
   }
   return false;
 }
@@ -74,6 +80,12 @@ using decode::max_image_dim;
     cb(server::error_response(drogon::k400BadRequest, "DIMENSIONS_TOO_LARGE",
         std::format("Image dimensions {}x{} exceed maximum of {}x{}",
                     img.cols, img.rows, max_image_dim(), max_image_dim())));
+    return true;
+  }
+  if (decode::exceeds_pixel_cap(img.cols, img.rows)) {
+    cb(server::error_response(drogon::k400BadRequest, "PIXELS_TOO_LARGE",
+        std::format("Image area {}x{} exceeds maximum of {} pixels",
+                    img.cols, img.rows, decode::max_image_pixels())));
     return true;
   }
   return false;

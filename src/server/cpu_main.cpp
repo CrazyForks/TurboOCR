@@ -298,6 +298,15 @@ int main(int argc, char **argv) try {
                           width, height, kMaxPixelDim, kMaxPixelDim)));
           return;
         }
+        // Pixel-AREA cap, mirroring the GPU /ocr/pixels handler. The body-size
+        // check below bounds RAM only as long as MAX_BODY_MB stays small;
+        // raising it would let a 268 MP body allocate ~805 MB without this.
+        if (turbo_ocr::decode::exceeds_pixel_cap(width, height)) {
+          callback(turbo_ocr::server::error_response(drogon::k400BadRequest,
+              "PIXELS_TOO_LARGE", std::format("Image area {}x{} exceeds maximum of {} pixels",
+                          width, height, turbo_ocr::decode::max_image_pixels())));
+          return;
+        }
 
         size_t expected = static_cast<size_t>(width) * height * channels;
         if (req->body().size() != expected) {
@@ -413,7 +422,12 @@ int main(int argc, char **argv) try {
           }
 
           // Pre-decode dim sniff: refuses oversized PNG/JPEG/WebP per-slot
-          // before the decoder allocates a buffer. Mirrors GPU /ocr/batch.
+          // before the decoder allocates a buffer. Mirrors GPU /ocr/batch:
+          // per-side cap, per-image pixel-AREA cap, and an aggregate
+          // decoded-pixel budget so the per-image cap is not silently
+          // multiplied by the batch size into a host-RAM OOM.
+          int64_t cumulative_pixels = 0;
+          const int64_t batch_pixel_budget = turbo_ocr::decode::max_batch_pixels();
           for (size_t i = 0; i < n; ++i) {
             if (!batch_items[i].error.empty()) continue;
             const auto &raw = (*raw_bytes)[i];
@@ -423,6 +437,19 @@ int main(int argc, char **argv) try {
                 batch_items[i].error = std::format(
                     "dimensions_too_large ({}x{} > {}x{})",
                     d->width, d->height, kMaxImageDim, kMaxImageDim);
+              } else if (turbo_ocr::decode::exceeds_pixel_cap(d->width, d->height)) {
+                batch_items[i].error = std::format(
+                    "pixels_too_large ({}x{} > {} px)",
+                    d->width, d->height, turbo_ocr::decode::max_image_pixels());
+              } else {
+                const int64_t pix = static_cast<int64_t>(d->width) * d->height;
+                if (cumulative_pixels + pix > batch_pixel_budget) {
+                  batch_items[i].error = std::format(
+                      "batch_pixels_exceeded (batch sum > {} px)",
+                      batch_pixel_budget);
+                } else {
+                  cumulative_pixels += pix;
+                }
               }
             }
           }
@@ -438,11 +465,18 @@ int main(int argc, char **argv) try {
               batch_items[i].error = "decode_failed";
               continue;
             }
-            // Post-decode safety net for BMP/TIFF/GIF (non-sniffed formats).
+            // Post-decode safety net for residual non-sniffed formats
+            // (BMP/PNM): per-side and per-image pixel-AREA cap, matching GPU
+            // /ocr/batch. PNG/JPEG/WebP/TIFF/GIF are bounded pre-decode above.
             if (imgs[i].cols > kMaxImageDim || imgs[i].rows > kMaxImageDim) {
               batch_items[i].error = std::format(
                   "dimensions_too_large ({}x{} > {}x{})",
                   imgs[i].cols, imgs[i].rows, kMaxImageDim, kMaxImageDim);
+              imgs[i].release();
+            } else if (turbo_ocr::decode::exceeds_pixel_cap(imgs[i].cols, imgs[i].rows)) {
+              batch_items[i].error = std::format(
+                  "pixels_too_large ({}x{} > {} px)",
+                  imgs[i].cols, imgs[i].rows, turbo_ocr::decode::max_image_pixels());
               imgs[i].release();
             }
           }

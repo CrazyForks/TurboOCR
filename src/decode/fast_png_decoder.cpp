@@ -35,6 +35,11 @@ cv::Mat FastPngDecoder::decode(const unsigned char *data, std::size_t len) {
   const uint32_t cap = static_cast<uint32_t>(decode::max_image_dim());
   if (w == 0 || h == 0 || w > cap || h > cap)
     return {};
+  // Pixel-AREA cap (MAX_IMAGE_PIXELS_MP): a solid-colour PNG can pass the
+  // per-side cap yet still decode to hundreds of MB. Refuse before allocating
+  // the cv::Mat below, so a decompression bomb never reaches the host buffer.
+  if (decode::exceeds_pixel_cap(w, h))
+    return {};
 
   // 4. Set up pixel buffer — decode directly to BGR (OpenCV CV_8UC3)
   wuffs_base__pixel_config pc;

@@ -273,10 +273,21 @@ int main(int argc, char **argv) try {
           return e.pipeline->run_with_layout(img, e.stream, want_layout,
                                              want_reading_order, routing_override);
         });
+    // dispatch_router_ ran synchronously (defer_external defaults false on this
+    // path), so out carries any table/formula structure + degradation flags.
+    // Forward all of them — emit_infer_result_json emits these keys, and
+    // dropping the *_degraded signal would make a degraded backend look
+    // byte-identical to a clean empty result (silent failure).
     return turbo_ocr::server::InferResult{
-        .results       = std::move(out.results),
-        .layout        = std::move(out.layout),
-        .reading_order = std::move(out.reading_order),
+        .results          = std::move(out.results),
+        .layout           = std::move(out.layout),
+        .reading_order    = std::move(out.reading_order),
+        .tables           = std::move(out.tables),
+        .formulas         = std::move(out.formulas),
+        .formula_degraded = out.formula_degraded,
+        .formula_warning  = std::move(out.formula_warning),
+        .table_degraded   = out.table_degraded,
+        .table_warning    = std::move(out.table_warning),
     };
   };
 

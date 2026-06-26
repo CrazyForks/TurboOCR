@@ -109,6 +109,12 @@ grpc_pre_decode_dim_check(grpc::ServerContext *ctx,
           std::format("Image dimensions {}x{} exceed maximum of {}x{}",
                       d->width, d->height, cap, cap));
     }
+    if (decode::exceeds_pixel_cap(d->width, d->height)) {
+      return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+          "PIXELS_TOO_LARGE",
+          std::format("Image area {}x{} exceeds maximum of {} pixels",
+                      d->width, d->height, decode::max_image_pixels()));
+    }
   }
   return std::nullopt;
 }
@@ -147,10 +153,15 @@ grpc_jpeg_decode_and_infer(pipeline::PipelineDispatcher &dispatcher,
         if (nvjpeg.available()) {
           auto [w, h] = nvjpeg.get_dimensions(d, n);
           // Bomb guard for JPEGs the caller's pre-decode sniff couldn't
-          // parse: reject before allocating GPU memory for them.
+          // parse: reject (per-side AND total area) before allocating GPU
+          // memory for them.
           if (w > cap || h > cap)
             throw turbo_ocr::ImageTooLargeError(std::format(
                 "Image dimensions {}x{} exceed maximum of {}x{}", w, h, cap, cap));
+          if (decode::exceeds_pixel_cap(w, h))
+            throw turbo_ocr::ImageTooLargeError(std::format(
+                "Image area {}x{} exceeds maximum of {} pixels", w, h,
+                decode::max_image_pixels()));
           if (w > 0 && h > 0) {
             auto [d_buf, pitch] = e.pipeline->ensure_gpu_buf(h, w);
             if (nvjpeg.decode_to_gpu(d, n, d_buf, pitch, w, h, e.stream)) {
@@ -183,6 +194,10 @@ grpc_jpeg_decode_and_infer(pipeline::PipelineDispatcher &dispatcher,
           throw turbo_ocr::ImageTooLargeError(std::format(
               "Image dimensions {}x{} exceed maximum of {}x{}",
               img.cols, img.rows, cap, cap));
+        if (decode::exceeds_pixel_cap(img.cols, img.rows))
+          throw turbo_ocr::ImageTooLargeError(std::format(
+              "Image area {}x{} exceeds maximum of {} pixels",
+              img.cols, img.rows, decode::max_image_pixels()));
         return e.pipeline->run_with_layout(img, e.stream, want_layout,
                                            want_reading_order);
       });
@@ -293,6 +308,11 @@ public:
             "DIMENSIONS_TOO_LARGE",
             std::format("Dimensions {}x{} exceed maximum of {}x{}",
                         width, height, cap, cap));
+      if (decode::exceeds_pixel_cap(width, height))
+        return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+            "PIXELS_TOO_LARGE",
+            std::format("Image area {}x{} exceeds maximum of {} pixels",
+                        width, height, decode::max_image_pixels()));
 
       size_t expected = static_cast<size_t>(width) * height * channels;
       if (request->pixels().size() != expected)
@@ -395,6 +415,11 @@ public:
             "DIMENSIONS_TOO_LARGE",
             std::format("Image dimensions {}x{} exceed maximum of {}x{}",
                         img.cols, img.rows, cap, cap));
+      if (decode::exceeds_pixel_cap(img.cols, img.rows))
+        return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+            "PIXELS_TOO_LARGE",
+            std::format("Image area {}x{} exceeds maximum of {} pixels",
+                        img.cols, img.rows, decode::max_image_pixels()));
     }
 
     try {
@@ -453,12 +478,30 @@ public:
     // decode-failure path. Pre-decode header sniff refuses bombs before any
     // decode cost.
     const int dim_cap = decode::max_image_dim();
+    // Aggregate decoded-pixel budget: the per-image caps below bound a single
+    // slot, but every non-JPEG slot is decoded up front and held alive at once,
+    // so a batch of highly-compressible bomb PNGs can still OOM the host. Tag
+    // sniffable slots once the running sum would exceed the budget so they are
+    // never decoded. Mirrors batch_check_dims_pre on the HTTP /ocr/batch routes
+    // (image_routes.cpp / cpu_main.cpp), keeping all three batch surfaces in
+    // lockstep.
+    int64_t cumulative_pixels = 0;
+    const int64_t batch_pixel_budget = decode::max_batch_pixels();
     std::vector<bool> too_large(n, false);
     for (int i = 0; i < n; ++i) {
       auto *p = reinterpret_cast<const unsigned char *>(request->images(i).data());
-      if (auto d = decode::peek_image_dimensions(p, request->images(i).size()))
-        if (d->width > dim_cap || d->height > dim_cap)
+      if (auto d = decode::peek_image_dimensions(p, request->images(i).size())) {
+        if (d->width > dim_cap || d->height > dim_cap ||
+            decode::exceeds_pixel_cap(d->width, d->height)) {
           too_large[i] = true;
+        } else {
+          const int64_t pix = static_cast<int64_t>(d->width) * d->height;
+          if (cumulative_pixels + pix > batch_pixel_budget)
+            too_large[i] = true;
+          else
+            cumulative_pixels += pix;
+        }
+      }
     }
 
     // JPEGs decode inside the dispatcher lambda (see grpc_jpeg_decode_and_infer);
@@ -478,10 +521,11 @@ public:
       imgs[i] = grpc_decode_image(bytes);
     }
 
-    // Post-decode safety net for formats we didn't sniff (BMP/TIFF/WebP).
+    // Post-decode safety net for residual formats we don't sniff (BMP/PNM).
     for (int i = 0; i < n; ++i) {
       if (imgs[i].empty()) continue;
-      if (imgs[i].cols > dim_cap || imgs[i].rows > dim_cap) {
+      if (imgs[i].cols > dim_cap || imgs[i].rows > dim_cap ||
+          decode::exceeds_pixel_cap(imgs[i].cols, imgs[i].rows)) {
         too_large[i] = true;
         imgs[i].release();  // drop to empty slot
       }

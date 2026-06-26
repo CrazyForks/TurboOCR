@@ -136,12 +136,22 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
               std::format("Image dimensions {}x{} exceed maximum of {}x{}",
                           w, h, kMaxImageDim, kMaxImageDim)));
         };
+        auto reject_too_many_pixels = [&](int w, int h) {
+          cb(server::error_response(drogon::k400BadRequest, "PIXELS_TOO_LARGE",
+              std::format("Image area {}x{} exceeds maximum of {} pixels",
+                          w, h, decode::max_image_pixels())));
+        };
 
         // Pre-decode header sniff (PNG IHDR / JPEG SOFn). Refuses
-        // decompression bombs without ever calling the decoder.
+        // decompression bombs (per-side AND total pixel area) without ever
+        // calling the decoder.
         if (auto d = turbo_ocr::decode::peek_image_dimensions(data, len)) {
           if (d->width > kMaxImageDim || d->height > kMaxImageDim) {
             reject_too_large(d->width, d->height);
+            return;
+          }
+          if (decode::exceeds_pixel_cap(d->width, d->height)) {
+            reject_too_many_pixels(d->width, d->height);
             return;
           }
         }
@@ -165,6 +175,10 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
               throw turbo_ocr::ImageTooLargeError(std::format(
                   "Image dimensions {}x{} exceed maximum of {}x{}",
                   w, h, kMaxImageDim, kMaxImageDim));
+            if (decode::exceeds_pixel_cap(w, h))
+              throw turbo_ocr::ImageTooLargeError(std::format(
+                  "Image area {}x{} exceeds maximum of {} pixels",
+                  w, h, decode::max_image_pixels()));
             if (w > 0 && h > 0) {
               auto [d_buf, pitch] = e.pipeline->ensure_gpu_buf(h, w);
               if (nvjpeg.decode_to_gpu(data, len, d_buf, pitch, w, h, e.stream)) {
@@ -202,6 +216,10 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
               throw turbo_ocr::ImageTooLargeError(std::format(
                   "Image dimensions {}x{} exceed maximum of {}x{}",
                   img.cols, img.rows, kMaxImageDim, kMaxImageDim));
+            if (decode::exceeds_pixel_cap(img.cols, img.rows))
+              throw turbo_ocr::ImageTooLargeError(std::format(
+                  "Image area {}x{} exceeds maximum of {} pixels",
+                  img.cols, img.rows, decode::max_image_pixels()));
             return e.pipeline->run_with_layout(img, e.stream,
                                                opts.want_layout,
                                                opts.want_reading_order,
@@ -228,6 +246,10 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
         // Post-decode safety net for formats we didn't sniff (BMP/TIFF/WEBP).
         if (img.cols > kMaxImageDim || img.rows > kMaxImageDim) {
           reject_too_large(img.cols, img.rows);
+          return;
+        }
+        if (decode::exceeds_pixel_cap(img.cols, img.rows)) {
+          reject_too_many_pixels(img.cols, img.rows);
           return;
         }
 
@@ -290,6 +312,15 @@ void batch_check_dims_pre(const std::vector<std::string> &raw_bytes,
                            int max_image_dim,
                            std::vector<std::string> &errors) {
   size_t n = raw_bytes.size();
+  // Aggregate decoded-pixel budget: the per-image cap below bounds one slot,
+  // but the route holds every decoded image alive at once, so a batch of
+  // highly-compressible bomb images can still OOM the host. Tag sniffable
+  // slots once the running sum would exceed the budget so they are never
+  // decoded. Covers every compressible bomb vector (PNG/JPEG/WebP/TIFF/GIF);
+  // residual uncompressed formats (BMP/PNM) are body-cap-bounded and fall to
+  // the per-image post-decode cap.
+  int64_t cumulative_pixels = 0;
+  const int64_t batch_pixel_budget = decode::max_batch_pixels();
   for (size_t i = 0; i < n; ++i) {
     if (!errors[i].empty()) continue;
     const auto &raw = raw_bytes[i];
@@ -299,6 +330,17 @@ void batch_check_dims_pre(const std::vector<std::string> &raw_bytes,
         errors[i] = std::format("dimensions_too_large ({}x{} > {}x{})",
                                  d->width, d->height,
                                  max_image_dim, max_image_dim);
+      } else if (decode::exceeds_pixel_cap(d->width, d->height)) {
+        errors[i] = std::format("pixels_too_large ({}x{} > {} px)",
+                                 d->width, d->height, decode::max_image_pixels());
+      } else {
+        const int64_t pix = static_cast<int64_t>(d->width) * d->height;
+        if (cumulative_pixels + pix > batch_pixel_budget) {
+          errors[i] = std::format("batch_pixels_exceeded (batch sum > {} px)",
+                                   batch_pixel_budget);
+        } else {
+          cumulative_pixels += pix;
+        }
       }
     }
   }
@@ -334,6 +376,10 @@ void batch_decode_images(const std::vector<std::string> &raw_bytes,
           errors[i] = "dimensions_too_large";
           continue;
         }
+        if (decode::exceeds_pixel_cap(jw, jh)) {
+          errors[i] = "pixels_too_large";
+          continue;
+        }
         jpeg_indices.push_back(i);
         jpeg_buffers.emplace_back(p, raw.size());
       }
@@ -356,8 +402,8 @@ void batch_decode_images(const std::vector<std::string> &raw_bytes,
   }
 }
 
-// Stage 4: post-decode safety net for formats we didn't header-sniff
-// (BMP/TIFF/GIF). Releases the image so it doesn't get fed to the pipeline.
+// Stage 4: post-decode safety net for residual formats we don't header-sniff
+// (BMP/PNM). Releases the image so it doesn't get fed to the pipeline.
 void batch_check_dims_post(std::vector<cv::Mat> &imgs,
                             int max_image_dim,
                             std::vector<std::string> &errors) {
@@ -368,6 +414,11 @@ void batch_check_dims_post(std::vector<cv::Mat> &imgs,
       errors[i] = std::format("dimensions_too_large ({}x{} > {}x{})",
                                imgs[i].cols, imgs[i].rows,
                                max_image_dim, max_image_dim);
+      imgs[i].release();
+    } else if (decode::exceeds_pixel_cap(imgs[i].cols, imgs[i].rows)) {
+      errors[i] = std::format("pixels_too_large ({}x{} > {} px)",
+                               imgs[i].cols, imgs[i].rows,
+                               decode::max_image_pixels());
       imgs[i].release();
     }
   }
@@ -695,6 +746,12 @@ void register_ocr_pixels_route_gpu(server::WorkPool &pool,
           std::format("Dimensions {}x{} exceed maximum of {}x{}", width, height, kMaxPixelDim, kMaxPixelDim)));
       return;
     }
+    if (decode::exceeds_pixel_cap(width, height)) {
+      callback(server::error_response(drogon::k400BadRequest, "PIXELS_TOO_LARGE",
+          std::format("Image area {}x{} exceeds maximum of {} pixels",
+                      width, height, decode::max_image_pixels())));
+      return;
+    }
 
     size_t expected = static_cast<size_t>(width) * height * channels;
     if (req->body().size() != expected) {
@@ -779,6 +836,11 @@ void register_ocr_markdown_route_gpu(server::WorkPool &pool,
             if (img.cols > kMaxImageDim || img.rows > kMaxImageDim) {
               cb(server::error_response(drogon::k400BadRequest,
                   "DIMENSIONS_TOO_LARGE", "Image dimensions exceed maximum"));
+              return;
+            }
+            if (decode::exceeds_pixel_cap(img.cols, img.rows)) {
+              cb(server::error_response(drogon::k400BadRequest,
+                  "PIXELS_TOO_LARGE", "Image area exceeds maximum pixel count"));
               return;
             }
 
@@ -931,6 +993,12 @@ void register_infer_route_gpu(server::WorkPool &pool,
                                 d->width, d->height, kMaxImageDim, kMaxImageDim)));
                 return;
               }
+              if (decode::exceeds_pixel_cap(d->width, d->height)) {
+                cb(server::error_response(drogon::k400BadRequest, "PIXELS_TOO_LARGE",
+                    std::format("Image area {}x{} exceeds maximum of {} pixels",
+                                d->width, d->height, decode::max_image_pixels())));
+                return;
+              }
             }
             cv::Mat img = decode(raw, bytes.size());
             if (img.empty()) {
@@ -941,6 +1009,12 @@ void register_infer_route_gpu(server::WorkPool &pool,
               cb(server::error_response(drogon::k400BadRequest, "DIMENSIONS_TOO_LARGE",
                   std::format("Image dimensions {}x{} exceed maximum of {}x{}",
                               img.cols, img.rows, kMaxImageDim, kMaxImageDim)));
+              return;
+            }
+            if (decode::exceeds_pixel_cap(img.cols, img.rows)) {
+              cb(server::error_response(drogon::k400BadRequest, "PIXELS_TOO_LARGE",
+                  std::format("Image area {}x{} exceeds maximum of {} pixels",
+                              img.cols, img.rows, decode::max_image_pixels())));
               return;
             }
             std::string result;

@@ -10,16 +10,6 @@
 
 namespace turbo_ocr::table {
 
-std::string resolve_table_backend_env() {
-  const char *env = std::getenv("TABLE_BACKEND");
-  if (env != nullptr && env[0] != '\0') return std::string(env);
-  // Infer from the configured backend env (backward compat for env-only usage).
-  auto set = [](const char *k) { const char *v = std::getenv(k); return v && v[0]; };
-  if (set("TABLE_SLANEXT_ENCODER_ONNX")) return "slanext";
-  if (set("VLLM_TABLE_BASE_URL"))        return "vlm";
-  return "slanext";
-}
-
 std::unique_ptr<ITableRecognizer> make_table_recognizer(std::string_view backend) {
   if (backend == "slanext")  return std::make_unique<SlanextTableRecognizer>();
   if (backend == "vlm")      return std::make_unique<VLMTableRecognizer>();

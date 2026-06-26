@@ -82,7 +82,4 @@ std::unique_ptr<ITableRecognizer> make_table_recognizer(std::string_view backend
 // OpenAIEndpoint; kind==Local -> the engine-keyed factory above.
 std::unique_ptr<ITableRecognizer> make_table_recognizer(const routing::BackendSpec &spec);
 
-// Read TABLE_BACKEND; defaults to "slanext" when unset/empty.
-std::string resolve_table_backend_env();
-
 } // namespace turbo_ocr::table

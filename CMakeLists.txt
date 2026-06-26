@@ -578,6 +578,7 @@ else()
     # test binary links turbo_ocr_common only).
     target_sources(turbo_ocr_tests PRIVATE
         tests/pipeline/test_finalize_deferred.cpp
+        tests/pipeline/test_multi_rec.cpp
         tests/table/test_cell_matcher.cpp
         tests/table/test_otsl_to_html.cpp
         tests/table/test_html_reconstruct.cpp
@@ -586,6 +587,7 @@ else()
         tests/table/test_slanext_postprocess_aabb.cpp
         tests/router/test_cua_router.cpp
         tests/formula/test_formula_tokenizer.cpp
+        tests/formula/test_formula_preprocess.cpp
         tests/formula/test_formulanet_ar_loop.cpp
         tests/cpp/test_openai_parsers.cpp
     )

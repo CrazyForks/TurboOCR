@@ -23,7 +23,13 @@ std::string env_or(const char *k, const std::string &dflt) {
 // "formulanet" is retained as a recognized config name for back-compat (so an
 // old routing file still parses), but the factory no longer constructs it —
 // resolving FORMULA_BACKEND=formulanet yields a null recognizer (unavailable).
-const std::array<const char *, 3> kFormulaEngines{"formulanet", "ppformulanet_s", "vlm"};
+// ppformulanet_s     = small 2-layer model, in-process C++ FAST host-loop, ~10 pg/s,
+//                      English/Latin only (the default — fastest).
+// ppformulanet_plus_m = 6-layer MBart model, in-process C++ FAST host-loop, the only
+//                      backend that reads CHINESE formulas (CJK-F1 0.73); slower.
+// Swap with FORMULA_BACKEND + point FORMULA_ONNX/FORMULA_TOKENIZER at the chosen model.
+const std::array<const char *, 4> kFormulaEngines{"formulanet", "ppformulanet_s",
+                                                  "ppformulanet_plus_m", "vlm"};
 const std::array<const char *, 2> kTableEngines{"slanext", "vlm"};
 
 bool engine_valid_for(const std::string &modality, const std::string &engine) {
@@ -68,6 +74,8 @@ RoutingTable synth_from_env() {
   // (violates the no-silent-failure contract). The factory no longer constructs
   // it, so an explicit FORMULA_BACKEND=formulanet now resolves to a null
   // recognizer (formula unavailable) instead of serving silent-empty.
+  // Default = the fast English/Latin -S model. FORMULA_BACKEND=ppformulanet_plus_m
+  // swaps in the slower Chinese-capable model (point FORMULA_ONNX/FORMULA_TOKENIZER at it).
   std::string fb = env_or("FORMULA_BACKEND", "ppformulanet_s");
   {
     BackendSpec b; b.name = "formula-env"; b.kind = Kind::Local; b.engine = fb;

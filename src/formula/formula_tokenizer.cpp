@@ -1,7 +1,9 @@
 #include "turbo_ocr/formula/formula_tokenizer.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <regex>
 #include <sstream>
@@ -14,7 +16,75 @@ namespace turbo_ocr::formula {
 
 namespace {
 
-constexpr std::string_view kGUtf8 = "\xC4\xA0";  // U+0120 — BPE space marker.
+// GPT-2/HF byte-level BPE reverse map: each codepoint in a token string encodes ONE
+// original byte (the inverse of bytes_to_unicode); concatenating those bytes and reading
+// them as UTF-8 yields the real text. Printable ASCII bytes map to themselves (so English
+// is unchanged) and Ġ (U+0120) -> byte 0x20 (space); multi-byte UTF-8 (all Chinese,
+// accented Latin) is reconstructed instead of left as byte-level mojibake (投 -> "æĬķ").
+const std::array<int, 324>& byte_decoder_table() {
+    static const std::array<int, 324> tbl = [] {
+        std::array<int, 324> m{};
+        m.fill(-1);
+        auto printable = [](int b) {
+            return (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
+        };
+        int n = 0;
+        for (int b = 0; b < 256; ++b) {
+            int cp = printable(b) ? b : (256 + n++);
+            if (cp >= 0 && cp < static_cast<int>(m.size())) m[cp] = b;
+        }
+        return m;
+    }();
+    return tbl;
+}
+
+// Replace malformed UTF-8 byte sequences with U+FFFD (HF tokenizer's errors="replace").
+// A backend run on text it cannot model (e.g. -S on Chinese) can emit byte-level tokens
+// whose reconstructed bytes are not valid UTF-8; left raw they would make nlohmann::json
+// throw when serializing the response. Always returning valid UTF-8 keeps the server safe.
+std::string utf8_sanitize(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    std::size_t i = 0, n = s.size();
+    auto cont = [&](std::size_t k) {
+        return k < n && (static_cast<unsigned char>(s[k]) & 0xC0) == 0x80;
+    };
+    while (i < n) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        int len = (c < 0x80) ? 1 : ((c >> 5) == 0x6) ? 2 : ((c >> 4) == 0xE) ? 3
+                                : ((c >> 3) == 0x1E) ? 4 : 0;
+        bool ok = len >= 1;
+        for (int k = 1; k < len && ok; ++k) ok = cont(i + k);
+        if (ok) { out.append(s, i, len); i += static_cast<std::size_t>(len); }
+        else { out.append("\xEF\xBF\xBD"); ++i; }  // U+FFFD
+    }
+    return out;
+}
+
+// Map a byte-level token string (UTF-8 of byte-level codepoints) back to real UTF-8 text.
+std::string byte_level_to_utf8(const std::string& s) {
+    const auto& inv = byte_decoder_table();
+    std::string out;
+    out.reserve(s.size());
+    std::size_t i = 0, n = s.size();
+    while (i < n) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        std::uint32_t cp;
+        int len;
+        if (c < 0x80) { cp = c; len = 1; }
+        else if ((c >> 5) == 0x6 && i + 1 < n) { cp = c & 0x1Fu; len = 2; }
+        else if ((c >> 4) == 0xE && i + 2 < n) { cp = c & 0x0Fu; len = 3; }
+        else if ((c >> 3) == 0x1E && i + 3 < n) { cp = c & 0x07u; len = 4; }
+        else { out.push_back(s[i]); ++i; continue; }
+        for (int k = 1; k < len; ++k)
+            cp = (cp << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3Fu);
+        i += len;
+        int b = (cp < inv.size()) ? inv[cp] : -1;
+        if (b >= 0) out.push_back(static_cast<char>(b));
+        else out.append(s, i - len, len);  // not a byte-level codepoint — pass through
+    }
+    return utf8_sanitize(out);  // reconstructed bytes may be invalid UTF-8 (mismatched model)
+}
 
 std::string replace_all(std::string s, std::string_view needle, std::string_view repl) {
     if (needle.empty()) return s;
@@ -278,11 +348,12 @@ std::string FormulaTokenizer::decode(std::span<const int64_t> ids, bool post_pro
         raw.append(id_to_token_[static_cast<std::size_t>(id)]);
     }
 
-    std::string with_spaces = replace_all(std::move(raw), kGUtf8, " ");
-    with_spaces = replace_all(std::move(with_spaces), "[EOS]", "");
-    with_spaces = replace_all(std::move(with_spaces), "[BOS]", "");
-    with_spaces = replace_all(std::move(with_spaces), "[PAD]", "");
-    std::string trimmed = trim(with_spaces);
+    // Byte-level BPE -> real UTF-8 (Ġ -> space falls out of the map automatically).
+    std::string text = byte_level_to_utf8(raw);
+    text = replace_all(std::move(text), "[EOS]", "");
+    text = replace_all(std::move(text), "[BOS]", "");
+    text = replace_all(std::move(text), "[PAD]", "");
+    std::string trimmed = trim(text);
     return post_process ? latex_post_process(trimmed) : trimmed;
 }
 

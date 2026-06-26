@@ -18,11 +18,18 @@ make_formula_recognizer(std::string_view backend) {
     // PPFNS_EXACT=1 for the fused graph, FORMULA_DEVICE=cpu for ORT-CPU.
     return std::make_unique<PPFormulaNetOrt>();
   }
+  if (backend == "ppformulanet_plus_m") {
+    // PP-FormulaNet_plus-M (B6 encoder + 512-d x 6-layer MBart decoder): the
+    // Chinese-formula model. In-process ORT FAST host-loop (encoder.onnx + prep.onnx +
+    // static-KV decoder_step.onnx, single greedy token/step), falling back to the fused
+    // inference_trt.onnx if the split graphs are missing. force_fused=false -> FAST.
+    return std::make_unique<PPFormulaNetOrt>("ppformulanet_plus_m", /*force_fused=*/false);
+  }
   if (backend == "vlm") {
     return std::make_unique<VLMFormula>();
   }
   std::cerr << "[FormulaRecognizer] unknown FORMULA_BACKEND='" << backend
-            << "' (expected 'ppformulanet_s' or 'vlm')\n";
+            << "' (expected 'ppformulanet_s', 'ppformulanet_plus_m', or 'vlm')\n";
   return nullptr;
 }
 

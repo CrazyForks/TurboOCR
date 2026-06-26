@@ -504,7 +504,6 @@ else()
         src/router/cua_router.cpp
         src/router/region_features.cpp
         src/router/routing_plan.cpp
-        src/table/table_cls.cpp
         src/table/table_cell.cpp
         src/table/slanext_enc_split.cpp
         src/table/slanext_dict.cpp
@@ -610,6 +609,16 @@ else()
         ${GRPC_LIBRARIES}
         protobuf::libprotobuf
     )
+
+    # Dev/CI-only drivers — EXCLUDE_FROM_ALL so the default `make` (and the Docker image build)
+    # never compiles them into the production image; build explicitly when needed.
+    # plus-M FAST-path golden self-test driver (no server boot; gate_bench).
+    add_executable(plusm_selftest EXCLUDE_FROM_ALL tools/plusm_selftest.cpp)
+    target_link_libraries(plusm_selftest PRIVATE turbo_ocr_gpu)
+
+    # Formula backend swap check: FORMULA_BACKEND -> resolved routing engine.
+    add_executable(formula_swap_check EXCLUDE_FROM_ALL tools/formula_swap_check.cpp)
+    target_link_libraries(formula_swap_check PRIVATE turbo_ocr_gpu)
 
     # Legacy standalone gRPC server removed — gRPC now runs from the main
     # binary via start_grpc_server() in grpc_service.h.

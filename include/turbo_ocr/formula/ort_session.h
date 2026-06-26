@@ -39,7 +39,8 @@ public:
   // load_cpu() below is available there.
 #if !defined(TURBO_CPU_ONLY)
   [[nodiscard]] bool load(const std::string &onnx_path, int device_id,
-                          void *cuda_stream = nullptr, bool do_copy_default_stream = true);
+                          void *cuda_stream = nullptr, bool do_copy_default_stream = true,
+                          bool enable_cuda_graph = false);
 #endif
 
   // Load on ORT's CPUExecutionProvider (no CUDA provider, no user stream). run()/
@@ -56,6 +57,16 @@ public:
   // Does NOT block the host or sync the stream — the caller orders/sync's.
   [[nodiscard]] bool run(const std::vector<OrtTensor> &inputs,
                          const std::vector<OrtTensor> &outputs);
+
+  // Persistent-binding run for a STATIC-shape, FIXED-ADDRESS step (the plus-M decoder
+  // step). Builds the IoBinding once from the first call's tensors and reuses it every
+  // call — so a session loaded with enable_cuda_graph captures the CUDA graph on the
+  // first call and replays it after, eliminating per-step kernel-launch + binding
+  // overhead. The caller MUST pass the SAME device buffers on every call (only their
+  // contents change); call reset_graph() before changing any buffer or shape.
+  [[nodiscard]] bool run_graph(const std::vector<OrtTensor> &inputs,
+                               const std::vector<OrtTensor> &outputs);
+  void reset_graph();  // drop the cached binding/captured graph
 
   // Run a single-input (device float) model whose ONE output is a dynamic int64
   // token tensor [B, L] (the fused PP-FormulaNet-S graph, batched). ORT allocates

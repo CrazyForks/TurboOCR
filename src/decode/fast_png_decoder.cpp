@@ -1,6 +1,10 @@
 #include "turbo_ocr/decode/fast_png_decoder.h"
 #include "turbo_ocr/decode/image_config.h"
 
+#include <climits>
+
+#include <opencv2/imgcodecs.hpp>
+
 // Wuffs — Google's fastest PNG decoder (Apache 2.0 / MIT)
 // Single-file C library, used in Chrome
 #define WUFFS_IMPLEMENTATION
@@ -9,7 +13,34 @@
 
 using namespace turbo_ocr::decode;
 
+namespace {
+// The IHDR bit-depth byte lives at a fixed offset: 8-byte PNG signature +
+// 4-byte chunk length + 4-byte "IHDR" type + 4-byte width + 4-byte height,
+// i.e. offset 24 (color type follows at 25). A 16-bit-depth PNG (PIL mode
+// 'I;16' grayscale, or 16-bit RGB/RGBA) reports bit_depth == 16 here.
+[[nodiscard]] bool png_is_16bit(const unsigned char *data, std::size_t len) noexcept {
+  return len >= 26 && data[24] == 16;
+}
+
+// OpenCV fallback for inputs the BGR-8 Wuffs fast path can't represent
+// losslessly (16-bit depth). cv::imdecode(IMREAD_COLOR) routes through libpng,
+// which strips 16->8 bit and emits an 8-bit BGR Mat just like the 8-bit path.
+[[nodiscard]] cv::Mat opencv_png_decode(const unsigned char *data, std::size_t len) {
+  if (len > static_cast<std::size_t>(INT_MAX))
+    return {};
+  return cv::imdecode(
+      cv::Mat(1, static_cast<int>(len), CV_8UC1, const_cast<unsigned char *>(data)),
+      cv::IMREAD_COLOR);
+}
+} // namespace
+
 cv::Mat FastPngDecoder::decode(const unsigned char *data, std::size_t len) {
+  // 16-bit-depth PNGs can't be decoded by the BGR-8 Wuffs fast path below
+  // (it produces a blank Mat that would silently pass the empty() guard).
+  // Route them through OpenCV/libpng, which downconverts 16->8 correctly.
+  if (png_is_16bit(data, len))
+    return opencv_png_decode(data, len);
+
   // 1. Initialize Wuffs PNG decoder
   wuffs_png__decoder dec;
   wuffs_base__status status = wuffs_png__decoder__initialize(

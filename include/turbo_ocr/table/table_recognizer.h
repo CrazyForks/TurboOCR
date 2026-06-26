@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <future>
 #include <memory>
 #include <string>
@@ -67,6 +68,14 @@ public:
   // Convert one raw endpoint response into the cell HTML (OTSL->HTML etc.).
   [[nodiscard]] virtual std::string
   parse_async_result(const std::string &raw) const { return raw; }
+
+  // Self-contained parser snapshot for the deferred (async) path — mirrors
+  // IFormulaRecognizer::async_result_parser. Captures only value-state so the
+  // deferred finalize can outlive a pipeline recycle that frees the recognizer.
+  [[nodiscard]] virtual std::function<std::string(const std::string &)>
+  async_result_parser() const {
+    return [](const std::string &raw) { return raw; };
+  }
 
   [[nodiscard]] virtual bool is_ready() const noexcept = 0;
 

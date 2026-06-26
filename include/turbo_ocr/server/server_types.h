@@ -32,9 +32,11 @@
 namespace turbo_ocr::server {
 
 /// Combined result of one inference: text OCR results + optional layout +
-/// optional table/formula structure (populated by the CPU pipeline's
-/// CUDA-free structure stages; empty on the GPU path, which emits via the
-/// full OcrPipelineResult emitter in image_routes.cpp directly).
+/// optional table/formula structure. Populated on both the CPU pipeline and
+/// the GPU /ocr (base64) path (whose infer lambda forwards the synchronous
+/// dispatch_router_ output); emit_infer_result_json serializes these keys.
+/// The GPU /ocr/raw + /ocr/batch routes bypass this struct and emit via the
+/// full OcrPipelineResult emitter in image_routes.cpp directly.
 struct InferResult {
   std::vector<OCRResultItem>            results;
   std::vector<layout::LayoutBox>        layout;

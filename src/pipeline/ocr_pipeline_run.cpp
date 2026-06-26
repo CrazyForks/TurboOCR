@@ -98,11 +98,25 @@ void OcrPipeline::dispatch_router_(OcrPipelineResult &out,
       // report supports_async()==false and never reach here, so the
       // cell-fill-from-page_ocr path is unchanged for them.
       auto futs = table_rec->submit_async(gpu_img, tboxes, table_stream_);
-      out.pending.table_rec = table_rec;
+      out.pending.table_parse = table_rec->async_result_parser();
       out.pending.table.reserve(futs.size());
       for (std::size_t i = 0; i < futs.size() && i < tlids.size(); ++i)
         out.pending.table.push_back(
             {tlids[i], tboxes[i], out.layout[tlids[i]].score, std::move(futs[i])});
+      // Async submit can under-return (e.g. an empty vector on a transient
+      // page-D2H failure): every dispatched region that got no future is then
+      // silently dropped, and finalize_deferred (which keys off pe.table.size())
+      // would never see it. Flag the gap loud here so the stage can't return a
+      // clean 200 with no table — same no-silent-failure contract the sync path
+      // enforces.
+      if (futs.size() < tlids.size()) {
+        out.table_degraded = true;
+        out.table_warning =
+            "table stage degraded: " + std::to_string(tlids.size() - futs.size()) +
+            " of " + std::to_string(tlids.size()) +
+            " region(s) were not dispatched (async submit returned no future: "
+            "page D2H copy or backend transport failure, not empty input)";
+      }
     } else {
       // Local structure backends fill empty grid cells via per-cell crop OCR.
       table_rec->set_cell_recognizer(rec_.get());
@@ -146,12 +160,23 @@ void OcrPipeline::dispatch_router_(OcrPipelineResult &out,
       // finalize_deferred() off the worker. Local engines (FormulaNet, PP-
       // FormulaNet-S) report supports_async()==false and keep the sync path.
       auto futs = formula_rec->submit_async(gpu_img, fboxes, formula_stream_);
-      out.pending.formula_rec = formula_rec;
+      out.pending.formula_parse = formula_rec->async_result_parser();
       out.pending.formula.reserve(futs.size());
       for (std::size_t i = 0; i < futs.size() && i < flids.size(); ++i) {
         const int lid = flids[i];
         out.pending.formula.push_back(
             {lid, out.layout[lid].box, out.layout[lid].score, std::move(futs[i])});
+      }
+      // Under-return guard (mirrors the sync path's eng_res.size()<flids.size()
+      // check + the table branch above): a dropped region must degrade loud,
+      // never silently vanish behind a clean 200.
+      if (futs.size() < flids.size()) {
+        out.formula_degraded = true;
+        out.formula_warning =
+            "formula stage degraded: " + std::to_string(flids.size() - futs.size()) +
+            " of " + std::to_string(flids.size()) +
+            " region(s) were not dispatched (async submit returned no future: "
+            "page D2H copy or backend transport failure, not empty input)";
       }
     } else {
       auto eng_res = formula_rec->run(gpu_img, fboxes, formula_stream_);

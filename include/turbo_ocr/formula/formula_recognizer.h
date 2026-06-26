@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <future>
 #include <memory>
 #include <string>
@@ -71,6 +72,17 @@ public:
   // the final LaTeX. Default identity; remote backends apply their parser.
   [[nodiscard]] virtual std::string
   parse_async_result(const std::string &raw) const { return raw; }
+
+  // Return a SELF-CONTAINED parser for the deferred (async) path. Obtained on
+  // the GPU worker while this recognizer is alive; the returned callable must
+  // capture only value-state (no pointer back into the recognizer), so the
+  // deferred finalize can outlive a pipeline recycle that frees the recognizer.
+  // Default: identity (matches parse_async_result's default). Async backends
+  // override to snapshot their parser.
+  [[nodiscard]] virtual std::function<std::string(const std::string &)>
+  async_result_parser() const {
+    return [](const std::string &raw) { return raw; };
+  }
 
   [[nodiscard]] virtual bool is_ready() const noexcept = 0;
 

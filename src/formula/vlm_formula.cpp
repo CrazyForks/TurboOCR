@@ -462,6 +462,13 @@ std::string VLMFormula::parse_async_result(const std::string &raw) const {
   return extract_latex(raw);
 }
 
+std::function<std::string(const std::string &)>
+VLMFormula::async_result_parser() const {
+  // extract_latex is a free function (no recognizer state), so the snapshot
+  // holds no pointer back into this object.
+  return [](const std::string &raw) { return extract_latex(raw); };
+}
+
 // ---------------------------------------------------------------------------
 // run() — legacy backend (original code, no call_mu_ on outer scope)
 // ---------------------------------------------------------------------------

@@ -8,11 +8,25 @@
 
 #include "turbo_ocr/common/cuda_check.h"
 #include "turbo_ocr/kernels/kernels.h"
+#include "turbo_ocr/table/slanext_host_decode.h"
 #include "turbo_ocr/table/slanext_postprocess.h"
 
 namespace turbo_ocr::table {
 
 using engine::TrtEngine;
+
+// The GRU+attention host decoder is implemented twice (this GPU TU's inline
+// loop in SlanextEncSplit::infer and the CPU sibling slanext_host_decode), each
+// with its own copy of these arch constants. Bind the two sets so any drift
+// fails the build instead of silently diverging GPU vs CPU table structure
+// output. (The decode-loop duplication itself is tracked separately.)
+static_assert(SlanextEncSplit::kTenc      == SlanextDecoderWeights::kTenc);
+static_assert(SlanextEncSplit::kCtx       == SlanextDecoderWeights::kCtx);
+static_assert(SlanextEncSplit::kHidden    == SlanextDecoderWeights::kHidden);
+static_assert(SlanextEncSplit::kVocab     == SlanextDecoderWeights::kVocab);
+static_assert(SlanextEncSplit::kLoc       == SlanextDecoderWeights::kLoc);
+static_assert(SlanextEncSplit::kMaxTokens == SlanextDecoderWeights::kMaxTokens);
+static_assert(SlanextEncSplit::kInputSize == SlanextDecoderWeights::kInputSize);
 
 namespace {
 

@@ -105,6 +105,22 @@ std::string otsl_or_html(const std::string &raw) {
   return raw.empty() ? "" : table::otsl_to_html(raw);
 }
 
+// Stateless dispatch keyed on the parser enum only — no recognizer state — so
+// both parse_one and the self-contained async_result_parser() snapshot share it.
+std::string parse_with(routing::Parser parser, const std::string &raw) {
+  switch (parser) {
+  case routing::Parser::Otsl:
+    return otsl_or_html(raw);
+  case routing::Parser::Latex:
+    return extract_latex(raw);
+  case routing::Parser::Text:
+    return trim(raw);
+  case routing::Parser::Raw:
+  default:
+    return raw;
+  }
+}
+
 } // namespace
 
 OpenAIEndpoint::OpenAIEndpoint(routing::BackendSpec spec)
@@ -138,17 +154,15 @@ bool OpenAIEndpoint::health_check() {
 }
 
 std::string OpenAIEndpoint::parse_one(const std::string &raw) const {
-  switch (spec_.parser) {
-  case routing::Parser::Otsl:
-    return otsl_or_html(raw);
-  case routing::Parser::Latex:
-    return extract_latex(raw);
-  case routing::Parser::Text:
-    return trim(raw);
-  case routing::Parser::Raw:
-  default:
-    return raw;
-  }
+  return parse_with(spec_.parser, raw);
+}
+
+std::function<std::string(const std::string &)>
+OpenAIEndpoint::async_result_parser() const {
+  // Capture the parser enum by value — the returned callable holds no pointer
+  // back into this endpoint, so it stays valid after a pipeline recycle.
+  const routing::Parser parser = spec_.parser;
+  return [parser](const std::string &raw) { return parse_with(parser, raw); };
 }
 
 std::vector<std::future<std::string>>

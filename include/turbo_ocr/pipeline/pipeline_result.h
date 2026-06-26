@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <future>
 #include <string>
 #include <vector>
@@ -8,9 +9,6 @@
 #include "turbo_ocr/common/types.h"
 #include "turbo_ocr/layout/layout_types.h"
 #include "turbo_ocr/router/router_types.h"
-
-namespace turbo_ocr::formula { class IFormulaRecognizer; }
-namespace turbo_ocr::table   { class ITableRecognizer; }
 
 namespace turbo_ocr::pipeline {
 
@@ -28,8 +26,16 @@ struct PendingCrop {
   std::future<std::string> fut;   // raw endpoint response (pre-parse)
 };
 struct PendingExternal {
-  const formula::IFormulaRecognizer *formula_rec = nullptr; // for parse_async_result
-  const table::ITableRecognizer     *table_rec   = nullptr;
+  // Self-contained parser snapshots captured at dispatch time, ON the GPU
+  // worker while the recognizer is still alive (recognizer->async_result_
+  // parser()). They copy only value-state (e.g. the parser enum) and hold NO
+  // pointer back into the recognizer, so finalize_deferred() — which runs later
+  // on the work-pool thread and can block on a slow VLM future — stays valid
+  // even if the owning pipeline is recycled (its recognizers freed) meanwhile.
+  // Storing the raw recognizer pointer here was a cross-thread use-after-free.
+  using AsyncParser = std::function<std::string(const std::string &)>;
+  AsyncParser formula_parse;
+  AsyncParser table_parse;
   std::vector<PendingCrop> formula;
   std::vector<PendingCrop> table;
   [[nodiscard]] bool empty() const noexcept {

@@ -101,7 +101,7 @@ void finalize_deferred(OcrPipelineResult &out) {
   // stage produced nothing for a region it was asked to handle. Count those and
   // surface a degradation flag so a remote timeout can never look byte-identical
   // to a page that genuinely had no table/formula.
-  if (pe.formula_rec && !pe.formula.empty()) {
+  if (pe.formula_parse && !pe.formula.empty()) {
     out.formulas.reserve(out.formulas.size() + pe.formula.size());
     std::size_t degraded = 0;
     for (auto &pc : pe.formula) {
@@ -110,7 +110,7 @@ void finalize_deferred(OcrPipelineResult &out) {
         if (pc.fut.wait_for(std::chrono::milliseconds(kFinalizeTimeoutMs)) ==
             std::future_status::ready) {
           std::string raw = pc.fut.get();
-          latex = pe.formula_rec->parse_async_result(raw);
+          latex = pe.formula_parse(raw);
         } else {
           std::cerr << "[finalize_deferred] formula future timed out after "
                     << kFinalizeTimeoutMs << " ms (crop-pool worker stalled?); "
@@ -136,7 +136,7 @@ void finalize_deferred(OcrPipelineResult &out) {
           "empty response, not empty input)";
     }
   }
-  if (pe.table_rec && !pe.table.empty()) {
+  if (pe.table_parse && !pe.table.empty()) {
     out.tables.reserve(out.tables.size() + pe.table.size());
     std::size_t degraded = 0;
     for (auto &pc : pe.table) {
@@ -145,7 +145,7 @@ void finalize_deferred(OcrPipelineResult &out) {
         if (pc.fut.wait_for(std::chrono::milliseconds(kFinalizeTimeoutMs)) ==
             std::future_status::ready) {
           std::string raw = pc.fut.get();
-          html = pe.table_rec->parse_async_result(raw);
+          html = pe.table_parse(raw);
         } else {
           std::cerr << "[finalize_deferred] table future timed out after "
                     << kFinalizeTimeoutMs << " ms (crop-pool worker stalled?); "

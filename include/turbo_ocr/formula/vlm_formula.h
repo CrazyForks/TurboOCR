@@ -63,6 +63,10 @@ public:
                cudaStream_t stream) override;
   [[nodiscard]] std::string
   parse_async_result(const std::string &raw) const override;
+  // Self-contained LaTeX parser snapshot (no `this` capture) so the deferred
+  // finalize survives a pipeline recycle that frees this recognizer.
+  [[nodiscard]] std::function<std::string(const std::string &)>
+  async_result_parser() const override;
 
   [[nodiscard]] bool is_ready() const noexcept override { return ready_; }
   [[nodiscard]] std::string_view backend_name() const noexcept override {

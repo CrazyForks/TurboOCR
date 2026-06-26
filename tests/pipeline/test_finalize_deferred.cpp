@@ -66,7 +66,7 @@ TEST_CASE("finalize_deferred flags a formula region that resolved to empty",
           "[finalize_deferred]") {
   StubFormula stub;
   OcrPipelineResult out;
-  out.pending.formula_rec = &stub;
+  out.pending.formula_parse = stub.async_result_parser();
   out.pending.formula.push_back(crop(0, ready("E = mc^2")));
   out.pending.formula.push_back(crop(1, ready("")));  // transport failure shape
 
@@ -84,7 +84,7 @@ TEST_CASE("finalize_deferred flags a table region that resolved to empty",
           "[finalize_deferred]") {
   StubTable stub;
   OcrPipelineResult out;
-  out.pending.table_rec = &stub;
+  out.pending.table_parse = stub.async_result_parser();
   out.pending.table.push_back(crop(0, ready("<table><tr><td>a</td></tr></table>")));
   out.pending.table.push_back(crop(1, ready("")));
 
@@ -102,9 +102,9 @@ TEST_CASE("finalize_deferred treats a broken-promise future as degraded",
   StubFormula sf;
   StubTable st;
   OcrPipelineResult out;
-  out.pending.formula_rec = &sf;
+  out.pending.formula_parse = sf.async_result_parser();
   out.pending.formula.push_back(crop(0, broken()));  // .get() throws
-  out.pending.table_rec = &st;
+  out.pending.table_parse = st.async_result_parser();
   out.pending.table.push_back(crop(0, broken()));
 
   finalize_deferred(out);  // must not propagate the exception
@@ -122,9 +122,9 @@ TEST_CASE("finalize_deferred leaves a clean async batch undegraded",
   StubFormula sf;
   StubTable st;
   OcrPipelineResult out;
-  out.pending.formula_rec = &sf;
+  out.pending.formula_parse = sf.async_result_parser();
   out.pending.formula.push_back(crop(0, ready("x^2")));
-  out.pending.table_rec = &st;
+  out.pending.table_parse = st.async_result_parser();
   out.pending.table.push_back(crop(0, ready("<table></table>")));
 
   finalize_deferred(out);
@@ -133,4 +133,27 @@ TEST_CASE("finalize_deferred leaves a clean async batch undegraded",
   CHECK_FALSE(out.table_degraded);
   CHECK(out.formula_warning.empty());
   CHECK(out.table_warning.empty());
+}
+
+// Regression: the parser snapshot must be self-contained, so finalize_deferred
+// stays valid even if the recognizer that produced it is destroyed first (the
+// pipeline-recycle use-after-free the snapshot replaces a raw pointer to fix).
+TEST_CASE("finalize_deferred parser snapshot outlives the recognizer",
+          "[finalize_deferred]") {
+  OcrPipelineResult out;
+  {
+    StubFormula sf;
+    StubTable st;
+    out.pending.formula_parse = sf.async_result_parser();
+    out.pending.table_parse = st.async_result_parser();
+  }  // recognizers destroyed here — snapshots must NOT dangle
+  out.pending.formula.push_back(crop(0, ready("a+b")));
+  out.pending.table.push_back(crop(0, ready("<table></table>")));
+
+  finalize_deferred(out);  // must not touch the freed recognizers
+
+  REQUIRE(out.formulas.size() == 1);
+  REQUIRE(out.tables.size() == 1);
+  CHECK(out.formulas[0].latex == "a+b");
+  CHECK_FALSE(out.tables[0].html.empty());
 }

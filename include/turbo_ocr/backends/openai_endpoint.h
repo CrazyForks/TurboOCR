@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <future>
 #include <string>
 #include <string_view>
@@ -47,6 +48,11 @@ public:
   parse_async_result(const std::string &raw) const override {
     return parse_one(raw);
   }
+  // Snapshot the configured parser (by value) into a self-contained callable so
+  // the deferred finalize never dereferences this object after a pipeline
+  // recycle frees it. Defined in the .cpp to reuse the file-local parsers.
+  [[nodiscard]] std::function<std::string(const std::string &)>
+  async_result_parser() const override;
 
   // GET <base_url>/v1/models; resolves the served-model-name when unset.
   // Returns false (=> caller disables the modality cleanly) if unreachable.

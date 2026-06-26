@@ -109,11 +109,13 @@ void register_capabilities_route(const CapabilitiesInfo &info) {
   body += std::to_string(info.max_body_mb);
   body += R"(,"max_image_dim":)";  body += std::to_string(info.max_image_dim);
   body += R"(,"max_batch_images":)"; body += std::to_string(info.max_batch_images);
-  // Endpoints both builds register, in stable order. /profile is CPU-only,
-  // so it is appended only when this build registered it.
+  // Endpoints both builds register, in stable order. Build-specific endpoints are
+  // appended only when this build registered them: /ocr/markdown is GPU-only
+  // (register_ocr_markdown_route_gpu), /profile is CPU-only.
   body += R"(},"endpoints":["/health","/health/live","/health/ready",)"
           R"("/metrics","/capabilities","/ocr","/ocr/raw","/ocr/batch",)"
           R"("/ocr/pixels","/ocr/pdf")";
+  if (info.is_gpu) body += R"(,"/ocr/markdown")";
   if (info.profile_endpoint) body += R"(,"/profile")";
   body += "]";
 
@@ -273,7 +275,7 @@ void register_ocr_base64_route(server::WorkPool &pool,
 
             auto inf = infer(img, opts);
             cb(server::json_response(
-                turbo_ocr::emit_results_json(inf.results, inf.layout, inf.reading_order, opts.want_blocks)));
+                turbo_ocr::server::emit_infer_result_json(inf, opts.want_blocks)));
           });
         });
       },
@@ -323,7 +325,7 @@ void register_ocr_raw_route(server::WorkPool &pool,
 
             auto inf = infer(img, opts);
             cb(server::json_response(
-                turbo_ocr::emit_results_json(inf.results, inf.layout, inf.reading_order, opts.want_blocks)));
+                turbo_ocr::server::emit_infer_result_json(inf, opts.want_blocks)));
           });
         });
       },

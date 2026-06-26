@@ -31,12 +31,46 @@
 
 namespace turbo_ocr::server {
 
-/// Combined result of one inference: text OCR results + optional layout.
+/// Combined result of one inference: text OCR results + optional layout +
+/// optional table/formula structure (populated by the CPU pipeline's
+/// CUDA-free structure stages; empty on the GPU path, which emits via the
+/// full OcrPipelineResult emitter in image_routes.cpp directly).
 struct InferResult {
   std::vector<OCRResultItem>            results;
   std::vector<layout::LayoutBox>        layout;
   std::vector<int>                      reading_order;
+  std::vector<router::TableResult>      tables;
+  std::vector<router::FormulaResult>    formulas;
+  bool                                  formula_degraded = false;
+  std::string                           formula_warning;
+  bool                                  table_degraded = false;
+  std::string                           table_warning;
 };
+
+// Serialize an InferResult, emitting `tables`/`formulas` (+ degraded signals)
+// when present. Reuses the shared OcrPipelineResult emitter so the CPU `/ocr`
+// + `/ocr/raw` responses are byte-identical to the GPU server's structure JSON.
+// On a text-only result the structure vectors are empty and their keys are
+// omitted — byte-identical to the legacy emit_results_json output.
+[[nodiscard]] inline std::string
+emit_infer_result_json(InferResult &inf, bool want_blocks) {
+  if (inf.tables.empty() && inf.formulas.empty() && !inf.formula_degraded &&
+      !inf.table_degraded) {
+    return turbo_ocr::emit_results_json(inf.results, inf.layout,
+                                        inf.reading_order, want_blocks);
+  }
+  pipeline::OcrPipelineResult out;
+  out.results = std::move(inf.results);
+  out.layout = std::move(inf.layout);
+  out.reading_order = std::move(inf.reading_order);
+  out.tables = std::move(inf.tables);
+  out.formulas = std::move(inf.formulas);
+  out.formula_degraded = inf.formula_degraded;
+  out.formula_warning = std::move(inf.formula_warning);
+  out.table_degraded = inf.table_degraded;
+  out.table_warning = std::move(inf.table_warning);
+  return turbo_ocr::emit_pipeline_result_json(out, want_blocks);
+}
 
 /// Per-request feature flags parsed from query parameters.
 struct InferOptions {

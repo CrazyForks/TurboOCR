@@ -7,11 +7,13 @@
 #include "turbo_ocr/classification/cpu_paddle_cls.h"
 #include "turbo_ocr/common/types.h"
 #include "turbo_ocr/detection/cpu_paddle_det.h"
+#include "turbo_ocr/formula/cpu_formula_recognizer.h"
 #include "turbo_ocr/layout/cpu_paddle_layout.h"
 #include "turbo_ocr/layout/layout_types.h"
 #include "turbo_ocr/pipeline/i_ocr_pipeline.h"
 #include "turbo_ocr/pipeline/pipeline_result.h"
 #include "turbo_ocr/recognition/cpu_paddle_rec.h"
+#include "turbo_ocr/table/cpu_slanext_table.h"
 
 namespace turbo_ocr::pipeline {
 
@@ -27,6 +29,16 @@ public:
                                turbo_ocr::detection::kDbDefaults}) override;
 
   [[nodiscard]] bool load_layout_model(const std::string &onnx_path);
+
+  // Load the CUDA-free PP-FormulaNet-S recognizer (fused graph on ORT-CPU).
+  // `model_path` is inference_trt.onnx (or its parent dir); `tokenizer_json`
+  // is tokenizer.json. Enables per-formula-region LaTeX in run_with_layout.
+  [[nodiscard]] bool load_formula_model(const std::string &model_path,
+                                        const std::string &tokenizer_json);
+
+  // Load the CUDA-free SLANeXt table backend (ORT-CPU encoder + host decode).
+  // Reads TABLE_SLANEXT_* env knobs internally. Enables per-table-region HTML.
+  [[nodiscard]] bool load_table_backend();
 
   // Load the document-orientation model (ONNX). Optional; powers autorotate.
   [[nodiscard]] bool load_doc_ori_model(const std::string &onnx_path);
@@ -47,11 +59,18 @@ public:
                                                    bool want_reading_order = false);
 
 private:
+  // Recognize formula + table regions of `img` from its layout boxes, filling
+  // out.formulas / out.tables. No-op when the respective backend is unloaded
+  // or no matching layout region exists.
+  void run_structure_stages(const cv::Mat &img, OcrPipelineResult &out);
+
   std::unique_ptr<detection::CpuPaddleDet> det_;
   std::unique_ptr<classification::CpuPaddleCls> cls_;
   std::unique_ptr<recognition::CpuPaddleRec> rec_;
   std::unique_ptr<layout::CpuPaddleLayout> layout_;
   std::unique_ptr<classification::CpuDocOrientation> doc_ori_;
+  std::unique_ptr<formula::CpuFormulaRecognizer> formula_;
+  std::unique_ptr<table::CpuSlanextTableRecognizer> table_;
 
   bool use_cls_ = false;
   bool use_doc_ori_ = false;

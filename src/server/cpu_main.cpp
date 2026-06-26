@@ -119,6 +119,34 @@ int main(int argc, char **argv) try {
     TOCR_LOG_INFO("Layout detection disabled");
   }
 
+  // CUDA-FREE formula + table stages (optional, env-gated, same knobs as the
+  // GPU server). FORMULA_ONNX + FORMULA_TOKENIZER enable PP-FormulaNet-S on
+  // ORT-CPU; TABLE_SLANEXT_ENCODER_ONNX enables the SLANeXt ORT-CPU encoder +
+  // host GRU decode. A configured-but-unloadable backend is fatal (never serve
+  // a silently structure-less pipeline). Loaded into every pipeline in the pool.
+  {
+    const std::string formula_onnx = turbo_ocr::server::env_or("FORMULA_ONNX", "");
+    const std::string formula_tok = turbo_ocr::server::env_or("FORMULA_TOKENIZER", "");
+    const bool want_formula = !formula_onnx.empty() && !formula_tok.empty();
+    const bool want_table = !turbo_ocr::server::env_or("TABLE_SLANEXT_ENCODER_ONNX", "").empty();
+    if (want_formula || want_table) {
+      for (size_t i = 0; i < static_cast<size_t>(pool_size); ++i) {
+        auto handle = pool->acquire();
+        if (want_formula && !handle->load_formula_model(formula_onnx, formula_tok)) {
+          TOCR_LOG_ERROR("CPU formula backend failed to load — refusing to start",
+                         "model", std::string_view(formula_onnx));
+          return 1;
+        }
+        if (want_table && !handle->load_table_backend()) {
+          TOCR_LOG_ERROR("CPU table backend failed to load — refusing to start");
+          return 1;
+        }
+      }
+      if (want_formula) TOCR_LOG_INFO("Formula stage enabled (CPU/ONNX Runtime)");
+      if (want_table) TOCR_LOG_INFO("Table stage enabled (CPU/ONNX Runtime)");
+    }
+  }
+
   // Load the document-orientation model into each pipeline (optional). Powers
   // /ocr/pdf?autorotate=1. Absent model -> autorotate requests are rejected.
   bool doc_ori_available = false;
@@ -149,9 +177,15 @@ int main(int argc, char **argv) try {
     auto out = handle->run_with_layout(img, opts.want_layout,
                                         opts.want_reading_order);
     return turbo_ocr::server::InferResult{
-        .results       = std::move(out.results),
-        .layout        = std::move(out.layout),
-        .reading_order = std::move(out.reading_order),
+        .results          = std::move(out.results),
+        .layout           = std::move(out.layout),
+        .reading_order    = std::move(out.reading_order),
+        .tables           = std::move(out.tables),
+        .formulas         = std::move(out.formulas),
+        .formula_degraded = out.formula_degraded,
+        .formula_warning  = std::move(out.formula_warning),
+        .table_degraded   = out.table_degraded,
+        .table_warning    = std::move(out.table_warning),
     };
   };
 
@@ -286,7 +320,7 @@ int main(int argc, char **argv) try {
               cv::cvtColor(img, img, cv::COLOR_GRAY2BGR);
             auto inf = infer(img, opts);
             cb(turbo_ocr::server::json_response(
-                turbo_ocr::emit_results_json(inf.results, inf.layout, inf.reading_order, opts.want_blocks)));
+                turbo_ocr::server::emit_infer_result_json(inf, opts.want_blocks)));
           });
         });
       },

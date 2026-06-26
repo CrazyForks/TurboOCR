@@ -26,6 +26,8 @@ enum Stage {
   SORT,
   COMBINE,
   LAYOUT,
+  FORMULA,
+  TABLE,
   N_STAGES
 };
 
@@ -43,6 +45,8 @@ inline const char *name(Stage s) {
   case SORT: return "sort";
   case COMBINE: return "combine";
   case LAYOUT: return "layout";
+  case FORMULA: return "formula";
+  case TABLE: return "table";
   default: return "?";
   }
 }

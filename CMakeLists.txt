@@ -192,6 +192,7 @@ add_library(turbo_ocr_common STATIC
     src/docassembly/title_level.cpp
     src/docassembly/table_merge.cpp
     src/routing/routing_config.cpp
+    src/output/markdown_export.cpp
     third_party/clipper/clipper.cpp
     third_party/simdutf/simdutf.cpp
 )
@@ -354,7 +355,28 @@ if(USE_CPU_ONLY)
         src/render/pdf_renderer.cpp
         src/pdf/pdf_text_layer.cpp
         src/pdf/page_image_encoder.cpp
+        # CUDA-FREE formula (PP-FormulaNet-S fused graph on ORT-CPU) +
+        # table (SLANeXt ORT-CPU encoder + host GRU decode) stages. The
+        # CUDA-tied PPFormulaNetOrt/SlanextEncSplit GPU TUs are NOT built here;
+        # these are their pure-C++ siblings sharing the bit-exact preprocess /
+        # tokenizer / host decoder / dict / cell-matcher / html code.
+        src/formula/ort_session.cpp
+        src/formula/ppformulanet_preprocess.cpp
+        src/formula/cpu_formula_recognizer.cpp
+        src/formula/formula_tokenizer.cpp
+        src/table/cpu_slanext_table.cpp
+        src/table/slanext_host_decode.cpp
+        src/table/slanext_postprocess.cpp
+        src/table/slanext_dict.cpp
+        src/table/cell_matcher.cpp
+        src/table/html_reconstruct.cpp
     )
+    # The SLANeXt host GRU decoder is a tight scalar GEMV/attention loop; let the
+    # compiler vectorize the dot-product reductions (FP reassociation only —
+    # accuracy-neutral, verified) under the default AVX2 target. Same flags the
+    # GPU build applies to slanext_enc_split.cpp.
+    set_source_files_properties(src/table/slanext_host_decode.cpp PROPERTIES
+        COMPILE_OPTIONS "-ffast-math;-fopenmp-simd")
     # libjpeg-turbo: fast JPEG encode for inline page-image export.
     find_library(TURBOJPEG_LIB turbojpeg REQUIRED)
     target_include_directories(turbo_ocr_cpu PUBLIC
@@ -365,7 +387,11 @@ if(USE_CPU_ONLY)
         ${TURBO_PDFIUM_DIR}/lib/libpdfium.so pthread
         ${TURBOJPEG_LIB})
     target_compile_options(turbo_ocr_cpu PRIVATE ${TURBO_OCR_CXX_FLAGS})
-    target_compile_definitions(turbo_ocr_cpu PUBLIC USE_CPU_ONLY)
+    # USE_CPU_ONLY: existing CPU-build switch (page_image_encoder etc.).
+    # TURBO_CPU_ONLY: compiles the CUDA execution provider out of the shared
+    # OrtSession TU (src/formula/ort_session.cpp) so the CUDA-free CPU library
+    # links only load_cpu() — the GPU build leaves it undefined and keeps load().
+    target_compile_definitions(turbo_ocr_cpu PUBLIC USE_CPU_ONLY TURBO_CPU_ONLY)
     add_library(turbo_ocr::cpu ALIAS turbo_ocr_cpu)
 
     # CPU HTTP + gRPC server
@@ -481,7 +507,6 @@ else()
         src/table/table_cls.cpp
         src/table/table_cell.cpp
         src/table/slanext_enc_split.cpp
-        src/table/slanext.cpp
         src/table/slanext_dict.cpp
         src/table/slanext_postprocess.cpp
         src/table/cell_matcher.cpp
@@ -495,7 +520,9 @@ else()
         src/formula/formula_tokenizer.cpp
         src/formula/formula_recognizer.cpp
         src/formula/vlm_formula.cpp
-        src/formula/ppformulanet_s.cpp
+        src/formula/ppformulanet_ort.cu
+        src/formula/ppformulanet_preprocess.cpp
+        src/formula/ort_session.cpp
         src/vlm/crop_pool.cpp
         src/backends/openai_endpoint.cpp
         src/formula/kernels/formula_kernels.cu
@@ -510,6 +537,7 @@ else()
         ${TENSORRT_DIR}/include
         ${PROTO_GEN_DIR}
         ${TURBO_PDFIUM_DIR}/include
+        ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/include   # ort_session.cpp: formula encoder+prep+step via ORT-CUDA-13
     )
     target_link_directories(turbo_ocr_gpu PUBLIC ${TENSORRT_DIR}/lib)
     # Link libpdfium.so directly for in-process text-layer extraction.
@@ -534,6 +562,7 @@ else()
         ${TURBO_PDFIUM_DIR}/lib/libpdfium.so
         ${TURBOJPEG_LIB}
         ${CURL_LIB}
+        ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/lib/libonnxruntime.so
     )
     target_compile_options(turbo_ocr_gpu PRIVATE ${TURBO_OCR_CXX_FLAGS})
     add_library(turbo_ocr::gpu ALIAS turbo_ocr_gpu)

@@ -64,16 +64,15 @@ StructureResult decode_structure(
         if (dict.is_td_token(best_i)) {
             const float* lrow = loc_preds + step * 8;
             std::array<int, 8> bbox{};
-            bool blank = true;
             for (std::size_t k = 0; k < 8; ++k) {
                 bbox[k] = static_cast<int>(lrow[k] * scales[k]);
-                if (bbox[k] != 0) blank = false;
             }
-            // RapidAI filter_blank_bbox: keep the structure token but drop an
-            // all-zero quad so a degenerate prediction never becomes a phantom cell.
-            if (!blank) {
-                cells.push_back(StructureCell{best_i, bbox});
-            }
+            // A blank (all-zero) quad means "no detected cell box". Push it as a
+            // POSITIONAL PLACEHOLDER anyway so `cells` stays index-aligned with the
+            // <td> tokens in `structure`: dropping the slot shifts every later
+            // cell's text by one (silent content corruption on tables with empty
+            // cells). A zero-area quad matches no OCR line and renders <td></td>.
+            cells.push_back(StructureCell{best_i, bbox});
         }
         structure.emplace_back(token);
         score_sum += best_v;

@@ -8,6 +8,7 @@
 #include <iostream>
 #include <string>
 
+#include "turbo_ocr/common/cuda_check.h"       // abort_on_sticky_cuda_fault
 #include "turbo_ocr/engine/onnx_to_trt.h"
 #include "turbo_ocr/recognition/paddle_rec.h"  // per-cell crop OCR fill
 #include "turbo_ocr/table/cell_matcher.h"      // OcrLine, match_cells_to_ocr
@@ -92,10 +93,25 @@ SlanextTableRecognizer::run(const GpuImage &page, const std::vector<Box> &region
   out.reserve(regions.size());
 
   std::vector<TableVariant> tvars;
-  if (cls_ && wireless_ && !regions.empty())
-    tvars = cls_->classify_batch(page, regions, stream);
+  if (cls_ && wireless_ && !regions.empty()) {
+    try {
+      tvars = cls_->classify_batch(page, regions, stream);
+    } catch (const std::exception &e) {
+      // The wired/wireless classifier is only a router; a classifier hiccup
+      // must not discard every table. Sticky CUDA faults still exit the process
+      // (poisoned context); a recoverable failure falls back to the common case
+      // (all regions wired) — an empty tvars makes the loop below default to
+      // wired_ for every region.
+      turbo_ocr::abort_on_sticky_cuda_fault("table_cls classify_batch");
+      cudaGetLastError();  // clear the recoverable error before the run loop
+      std::cerr << "[slanext] table_cls classify_batch FAILED (" << e.what()
+                << ") — defaulting all regions to wired\n";
+      tvars.clear();
+    }
+  }
 
   for (std::size_t ti = 0; ti < regions.size(); ++ti) {
+   try {
     const Box &region = regions[ti];
     int rx = INT_MAX, ry = INT_MAX, rax2 = INT_MIN, ray2 = INT_MIN;
     for (const auto &p : region.pts) {
@@ -174,6 +190,22 @@ SlanextTableRecognizer::run(const GpuImage &page, const std::vector<Box> &region
     tr.score     = sr.structure_score;
     tr.box       = region;
     out.push_back(std::move(tr));
+   } catch (const std::exception &e) {
+    // Per-region degrade: a CUDA/inference fault on ONE table region must not
+    // abort the whole page (every other table lost) — mirror the graceful
+    // "table region DROPPED" path inside infer(). Sticky faults still exit the
+    // process; a recoverable error degrades just this region (empty html ->
+    // counted degraded upstream) and we continue. One TableResult per region is
+    // pushed unconditionally so the caller's layout_id stamping stays aligned.
+    turbo_ocr::abort_on_sticky_cuda_fault("slanext_table_recognizer region");
+    cudaGetLastError();  // clear the recoverable error before the next region
+    std::cerr << "[slanext] table region " << ti << " FAILED (" << e.what()
+              << ") — region DROPPED, continuing\n";
+    router::TableResult tr;
+    tr.layout_id = -1;
+    tr.box       = regions[ti];  // html left empty -> degraded accounting
+    out.push_back(std::move(tr));
+   }
   }
   return out;
 }

@@ -129,7 +129,8 @@ TEST_CASE("vocab boundary tokens decode to slanet-plus indices",
     REQUIRE(find_token(dict, " colspan=\"20\"") == dict.len());
 }
 
-TEST_CASE("blank quad is filtered out", "[slanext_postprocess_aabb]") {
+TEST_CASE("blank quad keeps an index-aligned placeholder cell",
+          "[slanext_postprocess_aabb]") {
     auto dict = default_dict();
     const std::size_t v = dict.len();
     const std::size_t td = find_token(dict, "<td></td>");
@@ -140,9 +141,12 @@ TEST_CASE("blank quad is filtered out", "[slanext_postprocess_aabb]") {
     std::vector<float> loc(3 * 8, 0.0f);  // all zeros — blank quad
     auto r = decode_structure(probs.data(), loc.data(), 3, v, dict, 488,
                               488, 244, 244);
-    // Token is still emitted, but the all-zero quad is dropped to match
-    // RapidAI `filter_blank_bbox`.
-    REQUIRE(r.cells.empty());
+    // The all-zero quad is KEPT as a positional placeholder (zero quad) so
+    // `cells` stays index-aligned with the <td> tokens in `structure` — dropping
+    // it would shift every later cell's text by one (M1). The zero-area quad
+    // matches no OCR line and renders as an empty <td></td>.
+    REQUIRE(r.cells.size() == 1);
+    for (int k = 0; k < 8; ++k) REQUIRE(r.cells[0].bbox[k] == 0);
     REQUIRE(r.structure.size() == 7);
     REQUIRE(r.structure[3] == "<td></td>");
 }

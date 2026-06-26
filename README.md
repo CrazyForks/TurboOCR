@@ -86,10 +86,11 @@ curl -X POST http://localhost:8000/ocr/raw \
 
 ## Benchmarks
 
-Like-for-like against the common OCR engines on a single RTX 5090. Two comparisons,
-because the two classes of engine are built for different jobs.
+Like-for-like against the common OCR engines on a single RTX 5090. Two comparisons:
+**whole-page OCR on English forms & receipts** (every engine), and **full-pipeline parsing
+of complex English documents** — text, formulas and tables scored together on OmniDocBench.
 
-### Forms & receipts — whole-page OCR
+### Forms & receipts — English (whole-page OCR)
 
 Same images, same word-F1 metric for every engine; FUNSD (English forms) and CORD (English receipts), 50 pages each. Word-F1 = lowercased ≥2-char token overlap.
 
@@ -110,24 +111,27 @@ Same images, same word-F1 metric for every engine; FUNSD (English forms) and COR
 
 TurboOCR has the best accuracy **and** is 15–90× faster than every other engine on forms and receipts.
 
-### Complex documents — full pipeline
+### Complex documents — English (full pipeline, all metrics)
 
-Papers and books need layout-aware parsing, so each TurboOCR tier and PaddleOCR-VL are run
-through their **full pipeline** (layout → region recognition → reading order) and scored by
-the **official OmniDocBench scorer** (text-block edit distance, OmniDocBench-125, EN+ZH):
+Papers and books need layout-aware parsing, so each pipeline is run end-to-end
+(layout → region recognition → reading order) and scored by the **official OmniDocBench
+scorer** on **English** documents (125 docs · 67 tables · 66 formulas). Every metric —
+text, formula and table — is measured, so the Latin-only v5 path is a fair comparison and
+is included.
 
-![Complex-document text accuracy and speed per model](tests/benchmark/comparison/images/compare_complex_pipeline.png)
+| Pipeline | Text | Formula CDM | Table TEDS | Overall | Speed |
+|---|---:|---:|---:|---:|---:|
+| PaddleOCR-VL-1.6 | 97.1% | 0.973 | 0.915 | 0.953 | 0.94 pg/s |
+| TurboOCR-medium | 95.6% | 0.917 | 0.819 | 0.897 | 35 pg/s |
+| TurboOCR-small | 95.6% | 0.917 | 0.819 | 0.897 | 70 pg/s |
+| TurboOCR-tiny *(default)* | 95.4% | 0.917 | 0.819 | 0.897 | **108 pg/s** |
+| TurboOCR-v5 *(legacy)* | 95.8% | 0.917 | 0.819 | 0.898 | 108 pg/s |
 
-| Pipeline | OmniDocBench-125 text accuracy | Throughput |
-|---|---:|---:|
-| **PaddleOCR-VL-1.5** (PP-DocLayoutV3 + 0.9B VLM) | **95.5%** | 0.94 pages/s |
-| TurboOCR-small (PP-OCRv6 + PP-DocLayoutV3) | 91.3% | 70 pages/s |
-| TurboOCR-medium | 91.0% | 35 pages/s |
-| TurboOCR-tiny | 89.9% | 108 pages/s |
-
-On complex full-page documents the PaddleOCR-VL vision-language model is the most accurate,
-but TurboOCR's CNN pipeline is within ~4–6 points while running **35–115× faster**.
-Use the VLM when every point of accuracy matters; use TurboOCR when throughput matters.
+Text = 1 − text-block edit distance; Table TEDS = structure-only; Overall = mean of the three.
+Formula CDM and Table TEDS are **identical across the TurboOCR rows** — every tier (and v5)
+shares the same PP-FormulaNet-S and SLANet-Plus stages; only the text recognizer differs. On
+English text TurboOCR lands within **~1.5 points** of PaddleOCR-VL while running **35–115×
+faster**; the rest of the Overall gap is table/formula recognition, where the VLM leads.
 
 → Full tables, metric definitions, languages, and how each pipeline is run: [Engine comparison](https://aiptimizer.github.io/TurboOCR/benchmarks/comparison/)
 
@@ -145,27 +149,18 @@ opt-in and only load when configured. Each stage links to its own model page.
 | **Text recognition** | PP-OCRv6 rec (CRNN + CTC, Latin + Chinese + Japanese) | 4.3 / 20 / 73 MB | `OCR_MODEL` tier — default `tiny` | [recognition](docs/models/recognition.md) · [selection](docs/models/selection.md) |
 | **Orientation** | PP-LCNet textline angle classifier | ~1 MB | always on (runs only on vertical lines) | [classification](docs/models/classification.md) |
 | **Layout** | PP-DocLayoutV3 (RT-DETR-L, 25 classes) | ~124 MB | per request via `?layout=1`; disable with `DISABLE_LAYOUT=1` | [layout](docs/models/layout.md) |
-| **Table → HTML** | SLANeXt (wired + wireless TRT encoder + hand-written C++ GRU decoder) | ~5 MB/encoder | `TABLE_BACKEND=slanext` *(default backend)* + encoder paths | [table](docs/models/table.md) |
+| **Table → HTML** | SLANet-Plus (TRT FP16 CNN encoder + hand-written C++ GRU decoder) | ~5 MB | `TABLE_BACKEND=slanext` *(default backend)* + encoder paths | [table](docs/models/table.md) |
 | **Formula → LaTeX** | PP-FormulaNet-S, in-process pure-C++ (ORT-CUDA-13, no Python) | ~294 MB | `FORMULA_BACKEND=ppformulanet_s` | [formula](docs/models/formula.md) |
-| **External VLM** *(optional)* | PaddleOCR-VL-1.6 (0.9B) on cropped table/formula regions | served separately | `TABLE_BACKEND=vlm` / `FORMULA_BACKEND=vlm` or a routing `kind:openai` entry | [VL on a separate GPU](docs/deployment_vl_separate_gpu.md) |
 
 The three OCR tiers (`tiny`/`small`/`medium`) all cover the same Latin + Chinese +
-Japanese scripts via `OCR_MODEL` — they trade accuracy for speed, not language
-coverage:
+Japanese scripts via `OCR_MODEL` — they trade accuracy for speed, not language coverage:
+`tiny` (default) for max throughput, `small` for a balance, `medium` for best accuracy
+(per-tier FUNSD F1 + throughput are in the forms benchmark above). Other scripts use
+retained PP-OCRv5 recognizers, also via `OCR_MODEL`: `arabic`, `eslav` (Cyrillic),
+`korean`, `thai`, `greek`.
 
-| `OCR_MODEL` | FUNSD F1 | Throughput | Use it for |
-|---|---:|---:|---|
-| `tiny` *(default)* | 85.4% | ~481 img/s | Max throughput — edge / high-volume |
-| `small` | 90.8% | ~234 img/s | Balanced accuracy/speed |
-| `medium` | **92.3%** | ~89 img/s | Best accuracy |
-
-Other scripts use retained PP-OCRv5 recognizers, also via `OCR_MODEL`: `arabic`,
-`eslav` (Cyrillic), `korean`, `thai`, `greek`.
-
-The table/formula stages always run **locally** in C++ by default (SLANeXt, and
-PP-FormulaNet-S on ORT-CUDA-13). The external **PaddleOCR-VL-1.6** backend is an
-opt-in accuracy lever for math/table-heavy pages: it runs on cropped regions only,
-typically on its own GPU/process, and is reached over an OpenAI-compatible endpoint.
+The table/formula stages always run **locally** in C++ by default (SLANet-Plus, and
+PP-FormulaNet-S on ORT-CUDA-13).
 
 → [Model selection guide](https://aiptimizer.github.io/TurboOCR/models/selection/)
 
@@ -181,7 +176,7 @@ backend is set, run any request with `layout` enabled and the response gains
 | Capability | Enable at startup | Recognizer |
 |---|---|---|
 | Formula → LaTeX | `FORMULA_BACKEND=ppformulanet_s` | PP-FormulaNet-S |
-| Table → HTML | `TABLE_BACKEND=slanext` (+ SLANeXt model paths) | SLANeXt |
+| Table → HTML | `TABLE_BACKEND=slanext` (+ SLANet-Plus model paths) | SLANet-Plus |
 
 ```bash
 docker run --gpus all -p 8000:8000 \
@@ -193,6 +188,35 @@ curl -X POST "http://localhost:8000/ocr/raw?layout=1" \
 ```
 
 → [Tables](https://aiptimizer.github.io/TurboOCR/models/table/) · [Formulas](https://aiptimizer.github.io/TurboOCR/models/formula/)
+
+---
+
+## Running the legacy PP-OCRv5 models
+
+The previous-generation **PP-OCRv5** detection + recognition models are retained
+alongside the v6 default (`models/det_v5.onnx`, `models/rec_v5.onnx`,
+`models/keys_v5.txt`). Select them by pointing the three per-stage path overrides
+at the v5 files — everything else (layout, table, formula, orientation) is
+unchanged, so it is a drop-in swap of just the text detector + recognizer:
+
+```bash
+DET_ONNX=models/det_v5.onnx \
+REC_ONNX=models/rec_v5.onnx \
+REC_DICT=models/keys_v5.txt \
+LD_LIBRARY_PATH=/usr/local/tensorrt/lib ./build/paddle_highspeed_cpp
+```
+
+`DET_ONNX` / `REC_ONNX` / `REC_DICT` override `OCR_MODEL` per stage; the TensorRT
+engine cache rebuilds for the v5 ONNX on first start (clear `~/.cache/turbo-ocr`
+if v6 engines were cached under the default model names).
+
+**Coverage caveat — Latin only.** The retained PP-OCRv5 recognizer dictionary
+(`keys_v5.txt`) is 836 characters with **no CJK**. On English forms/receipts v5 is
+within ~1.5–2 points of PP-OCRv6-medium (measured this release: FUNSD 90.3% vs
+91.9%, CORD 91.7% vs 93.4% word-F1), but on the EN+ZH **OmniDocBench-125** set it
+scores far lower (**52.7% vs 91.0%** text accuracy) because it cannot read the
+Chinese pages. Use the v6 default for mixed-script documents; the v5 path is for
+Latin-only workloads or direct A/B comparison.
 
 ---
 
@@ -302,5 +326,5 @@ MIT. See [LICENSE](LICENSE).
 
 <p align="center">
   <a href="https://github.com/aiptimizer/TurboOCR"><strong>⭐ Star TurboOCR on GitHub</strong></a><br>
-  <sub>Main Sponsor: <a href="https://miruiq.com"><strong>Miruiq</strong></a> — AI-powered data extraction from PDFs and documents.</sub>
+  <sub>Sponsored by <a href="https://miruiq.com"><strong>Miruiq</strong></a> — AI-powered data extraction from PDFs and documents — and <a href="https://diaiq.com"><strong>DiaIQ</strong></a>.</sub>
 </p>

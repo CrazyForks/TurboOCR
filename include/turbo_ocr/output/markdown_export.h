@@ -55,6 +55,30 @@ struct MarkdownOptions {
   // or a \left|\right not followed by a delimiter) emit it as inline code / a
   // fenced block rather than a $…$ / $$…$$ that throws in KaTeX/MathJax.
   bool safe_formula_fallback = true;
+  // Drop runaway / mode-collapsed formula LaTeX from the Markdown body.
+  // PP-FormulaNet-S degenerates on Chinese-text-in-formula crops into
+  // repetitive 1000+ char garbage (a short unit repeated dozens of times) that
+  // is still brace-balanced, so safe_formula_fallback lets it through. This
+  // gate is Markdown-VIEW-only: the JSON / scorer path keeps every formula,
+  // because dropping collapsed strings pipeline-wide also drops legitimate long
+  // matrices (measured CDM loss).
+  bool drop_collapsed_formulas = true;
+  // Placeholder emitted in place of a dropped collapsed formula. Empty => emit
+  // nothing (the region vanishes). Default: a short marker so the omission is
+  // visible rather than silent.
+  std::string collapsed_formula_note = "*(formula not recognized)*";
+  // Re-order the BODY blocks column-major for emission when the page bboxes
+  // describe a clear multi-column layout. PaddleX's XY-cut reading_order weaves
+  // a two-column page by horizontal band (L,R,L,R…), so a faithful render
+  // zig-zags between columns; this pass detects a clean column split (well-
+  // separated x-clusters with a real vertical gutter, side-by-side vertical
+  // overlap, both columns a fair share of blocks) and emits each column
+  // top→bottom, left→right, with full-width blocks (titles / spanning tables /
+  // figures) kept as section breaks at their vertical position. Strictly
+  // conservative: single-column / ambiguous / complex pages fall back to the
+  // reading_order sequence untouched. Markdown-VIEW-only — the JSON envelope's
+  // reading_order is never modified.
+  bool column_aware_order = true;
 };
 
 // Resolve the Markdown `src` for an image asset (a path or a `data:` URI).

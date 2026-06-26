@@ -4,7 +4,6 @@
 #include <array>
 #include <climits>
 #include <cstdlib>
-#include <filesystem>
 #include <iostream>
 #include <string>
 
@@ -21,8 +20,7 @@ std::string env_or(const char *k, const std::string &dflt) {
   const char *v = std::getenv(k);
   return (v && v[0]) ? std::string(v) : dflt;
 }
-// Derive the decoder.bin / dict path that sits next to the encoder ONNX,
-// mirroring the prior maybe_load_router_models default derivation.
+// Derive the decoder.bin / dict path that sits next to the encoder ONNX.
 std::string default_decoder_bin(const std::string &enc) {
   const std::string suf = "_encoder.onnx";
   std::string d = enc;
@@ -61,27 +59,11 @@ bool SlanextTableRecognizer::load() {
   wired_ = build_enc(enc, dec, dict);
   if (!wired_) return false;
 
-  // Optional wireless encoder + table_cls router (wired/wireless routing).
-  const std::string wenc = env_or("TABLE_SLANEXT_WIRELESS_ENCODER_ONNX", "");
-  if (!wenc.empty()) {
-    const std::string wdec = env_or("TABLE_SLANEXT_WIRELESS_DECODER_BIN", default_decoder_bin(wenc));
-    const std::string wdict = env_or("TABLE_SLANEXT_DICT", default_dict(wenc));
-    wireless_ = build_enc(wenc, wdec, wdict);  // soft: routing falls back to wired
-    if (wireless_) {
-      const std::string cls_onnx = env_or("TABLE_CLS_ONNX", "models/table/table_cls.onnx");
-      if (std::filesystem::exists(cls_onnx)) {
-        const std::string ctrt = engine::ensure_trt_engine(cls_onnx, "table_cls");
-        if (!ctrt.empty()) {
-          auto c = std::make_unique<TableCls>();
-          if (c->load_model(ctrt)) cls_ = std::move(c);
-        }
-      }
-      std::cout << "[Pipeline] Table backend=slanext (wired+wireless"
-                << (cls_ ? "+cls router" : ", no cls -> wired only") << ")\n";
-    }
-  } else {
-    std::cout << "[Pipeline] Table backend=slanext (wired, TRT FP16 encoder + host decode)\n";
-  }
+  if (std::getenv("TABLE_SLANEXT_WIRELESS_ENCODER_ONNX"))
+    std::cerr << "[slanext] wired/wireless routing removed — ignoring "
+                 "TABLE_SLANEXT_WIRELESS_ENCODER_ONNX\n";
+
+  std::cout << "[Pipeline] Table backend=slanext (wired, TRT FP16 encoder + host decode)\n";
   return true;
 }
 
@@ -91,24 +73,6 @@ SlanextTableRecognizer::run(const GpuImage &page, const std::vector<Box> &region
                             cudaStream_t stream) {
   std::vector<router::TableResult> out;
   out.reserve(regions.size());
-
-  std::vector<TableVariant> tvars;
-  if (cls_ && wireless_ && !regions.empty()) {
-    try {
-      tvars = cls_->classify_batch(page, regions, stream);
-    } catch (const std::exception &e) {
-      // The wired/wireless classifier is only a router; a classifier hiccup
-      // must not discard every table. Sticky CUDA faults still exit the process
-      // (poisoned context); a recoverable failure falls back to the common case
-      // (all regions wired) — an empty tvars makes the loop below default to
-      // wired_ for every region.
-      turbo_ocr::abort_on_sticky_cuda_fault("table_cls classify_batch");
-      cudaGetLastError();  // clear the recoverable error before the run loop
-      std::cerr << "[slanext] table_cls classify_batch FAILED (" << e.what()
-                << ") — defaulting all regions to wired\n";
-      tvars.clear();
-    }
-  }
 
   for (std::size_t ti = 0; ti < regions.size(); ++ti) {
    try {
@@ -120,10 +84,7 @@ SlanextTableRecognizer::run(const GpuImage &page, const std::vector<Box> &region
     }
     rx = std::max(rx, 0); ry = std::max(ry, 0);  // match infer()'s clamp origin
 
-    SlanextEncSplit *enc = wired_.get();
-    if (ti < tvars.size() && tvars[ti] == TableVariant::Wireless && wireless_)
-      enc = wireless_.get();
-    const auto sr = enc->infer(page, region, stream);
+    const auto sr = wired_->infer(page, region, stream);
 
     // Cells from the page text-OCR: geometry-match each structure-order cell
     // quad to OCR lines inside the region, then reconstruct_html substitutes.

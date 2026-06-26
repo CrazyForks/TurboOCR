@@ -31,7 +31,7 @@ public:
   virtual ~ITableRecognizer() noexcept = default;
 
   // Load every artefact the backend needs. Backends read their own paths
-  // from env (TABLE_SLANEXT_*, TABLE_CLS_ONNX, VLLM_TABLE_*)
+  // from env (TABLE_SLANEXT_*, VLLM_TABLE_*)
   // so this signature stays uniform; remote VLM uses it as a health-check +
   // model resolve. Return false => pipeline disables tables cleanly.
   [[nodiscard]] virtual bool load() = 0;

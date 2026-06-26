@@ -201,26 +201,11 @@ bool CpuSlanextTableRecognizer::load() {
     return false;
   }
 
-  const std::string wenc = env_or("TABLE_SLANEXT_WIRELESS_ENCODER_ONNX", "");
-  if (!wenc.empty()) {
-    // A CONFIGURED wireless encoder that won't load is a soft downgrade to
-    // wired-only — but never SILENTLY. Warn loudly so an operator who set the env
-    // knows the wireless path is inactive (no-silent-failure).
-    if (!std::filesystem::exists(wenc)) {
-      std::cerr << "[slanext-cpu] WARNING: configured wireless encoder ONNX missing ("
-                << wenc << ") — downgrading to wired-only\n";
-    } else {
-      const std::string wdec = env_or("TABLE_SLANEXT_WIRELESS_DECODER_BIN", default_decoder_bin(wenc));
-      const std::string wdict = env_or("TABLE_SLANEXT_DICT", default_dict(wenc));
-      auto w = std::make_unique<CpuSlanextEncoder>();
-      if (w->load(wenc, wdec, wdict)) wireless_ = std::move(w);
-      else
-        std::cerr << "[slanext-cpu] WARNING: configured wireless encoder failed to load ("
-                  << wenc << ") — downgrading to wired-only\n";
-    }
-  }
-  std::cout << "[Pipeline] Table backend=slanext-cpu (ORT-CPU encoder + host decode"
-            << (wireless_ ? ", wired+wireless" : ", wired") << ")\n";
+  if (std::getenv("TABLE_SLANEXT_WIRELESS_ENCODER_ONNX"))
+    std::cerr << "[slanext-cpu] wired/wireless routing removed — ignoring "
+                 "TABLE_SLANEXT_WIRELESS_ENCODER_ONNX\n";
+
+  std::cout << "[Pipeline] Table backend=slanext-cpu (ORT-CPU encoder + host decode, wired)\n";
   return true;
 }
 

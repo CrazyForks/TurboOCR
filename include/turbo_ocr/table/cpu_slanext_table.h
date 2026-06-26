@@ -52,8 +52,8 @@ class CpuSlanextEncoder {
 class CpuSlanextTableRecognizer {
  public:
   // Reads the same env knobs as the GPU path: TABLE_SLANEXT_ENCODER_ONNX
-  // (+ derived decoder/dict), TABLE_SLANEXT_WIRELESS_ENCODER_ONNX,
-  // TABLE_SLANEXT_DICT. Returns false (tables disabled) when unconfigured/unloadable.
+  // (+ derived decoder/dict), TABLE_SLANEXT_DICT. Returns false (tables
+  // disabled) when unconfigured/unloadable.
   [[nodiscard]] bool load();
   [[nodiscard]] bool ready() const noexcept { return wired_ != nullptr; }
 
@@ -67,7 +67,6 @@ class CpuSlanextTableRecognizer {
 
  private:
   std::unique_ptr<CpuSlanextEncoder> wired_;
-  std::unique_ptr<CpuSlanextEncoder> wireless_;  // optional; routing falls back to wired
   recognition::CpuPaddleRec *cell_rec_ = nullptr;  // not owned
 };
 

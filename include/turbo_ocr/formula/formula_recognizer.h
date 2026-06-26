@@ -95,7 +95,6 @@ public:
 // Supported keys:
 //   "ppformulanet_s"  — PP-FormulaNet-S, in-process ONNX Runtime (CUDA/CPU);
 //                       FAST split-graph host loop, PPFNS_EXACT forces the fused graph
-//   "formulanet"      — legacy split encoder + decoder + host AR loop
 //   "vlm"             — OpenAI-compatible vLLM endpoint (env-configured)
 std::unique_ptr<IFormulaRecognizer>
 make_formula_recognizer(std::string_view backend);

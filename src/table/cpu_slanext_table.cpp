@@ -230,7 +230,9 @@ CpuSlanextTableRecognizer::run(const cv::Mat &page, const std::vector<Box> &regi
   std::vector<router::TableResult> out;
   out.reserve(regions.size());
 
-  for (const Box &region : regions) {
+  for (std::size_t ti = 0; ti < regions.size(); ++ti) {
+   try {
+    const Box &region = regions[ti];
     int rx = INT_MAX, ry = INT_MAX, rax2 = INT_MIN, ray2 = INT_MIN;
     for (const auto &p : region.pts) {
       rx = std::min(rx, p[0]); ry = std::min(ry, p[1]);
@@ -299,6 +301,20 @@ CpuSlanextTableRecognizer::run(const cv::Mat &page, const std::vector<Box> &regi
     tr.score = sr.structure_score;
     tr.box = region;
     out.push_back(std::move(tr));
+   } catch (const std::exception &e) {
+    // Per-region degrade, mirroring the GPU SlanextTableRecognizer: an ORT /
+    // decode fault on ONE table region must not abort the whole page (every
+    // other table lost) — also mirrors infer()'s graceful "region DROPPED"
+    // path. One TableResult per region is pushed unconditionally so the
+    // caller's layout_id stamping stays aligned; the empty html is counted as
+    // degraded upstream.
+    std::cerr << "[slanext-cpu] table region " << ti << " FAILED (" << e.what()
+              << ") — region DROPPED, continuing\n";
+    router::TableResult tr;
+    tr.layout_id = -1;
+    tr.box = regions[ti];  // html left empty -> degraded accounting
+    out.push_back(std::move(tr));
+   }
   }
   return out;
 }

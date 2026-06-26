@@ -516,7 +516,6 @@ else()
         src/table/vlm_table_recognizer.cpp
         src/table/vlm_table.cpp
         src/table/kernels/table_kernels.cu
-        src/formula/formulanet.cpp
         src/formula/formula_tokenizer.cpp
         src/formula/formula_recognizer.cpp
         src/formula/vlm_formula.cpp
@@ -525,7 +524,6 @@ else()
         src/formula/ort_session.cpp
         src/vlm/crop_pool.cpp
         src/backends/openai_endpoint.cpp
-        src/formula/kernels/formula_kernels.cu
     )
     # The SLANeXt host GRU decoder is a tight scalar GEMV/attention loop; let the
     # compiler vectorize the dot-product reductions (FP reassociation only —
@@ -589,6 +587,7 @@ else()
         tests/formula/test_formula_tokenizer.cpp
         tests/formula/test_formula_preprocess.cpp
         tests/formula/test_formulanet_ar_loop.cpp
+        tests/lang_cls/test_script_id.cpp
         tests/cpp/test_openai_parsers.cpp
     )
 

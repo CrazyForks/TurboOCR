@@ -20,6 +20,9 @@ std::string env_or(const char *k, const std::string &dflt) {
 
 // Valid local engine keys per modality (mirrors the factories; kept as a
 // static list so this module stays free of the GPU recognizer libs).
+// "formulanet" is retained as a recognized config name for back-compat (so an
+// old routing file still parses), but the factory no longer constructs it —
+// resolving FORMULA_BACKEND=formulanet yields a null recognizer (unavailable).
 const std::array<const char *, 3> kFormulaEngines{"formulanet", "ppformulanet_s", "vlm"};
 const std::array<const char *, 2> kTableEngines{"slanext", "vlm"};
 
@@ -59,12 +62,12 @@ RoutingTable synth_from_env() {
   // builds the TESTED VLMFormula client (byte-identical to before this module).
   // The generic OpenAIEndpoint is reached ONLY via an explicit
   // TURBO_ROUTING_CONFIG kind:openai entry — opt-in, never the env default.
-  // Default to the WORKING ORT-sidecar backend. "formulanet" (single fused-Loop
-  // TRT engine) is inert on TRT 10.15 — its decode never runs and it returns
-  // empty LaTeX while is_ready()==true, which would silently disable formula
-  // out of the box (violates the no-silent-failure contract). formulanet now
-  // also fails its own load() so an explicit FORMULA_BACKEND=formulanet aborts
-  // boot loudly rather than serving silent-empty.
+  // Default to the WORKING ORT-sidecar backend. The legacy "formulanet" backend
+  // (single fused-Loop TRT engine, inert on TRT 10.15) has been removed: its
+  // decode never ran and it would have silently disabled formula out of the box
+  // (violates the no-silent-failure contract). The factory no longer constructs
+  // it, so an explicit FORMULA_BACKEND=formulanet now resolves to a null
+  // recognizer (formula unavailable) instead of serving silent-empty.
   std::string fb = env_or("FORMULA_BACKEND", "ppformulanet_s");
   {
     BackendSpec b; b.name = "formula-env"; b.kind = Kind::Local; b.engine = fb;

@@ -110,7 +110,7 @@ using DrogonCallback = std::function<void(const drogon::HttpResponsePtr &)>;
 //
 // Request-id only — used for log correlation / X-Request-Id, never as a
 // security token. mt19937_64 is fast but predictable; do NOT reuse these IDs
-// to gate access or authorize anything (auth is the fronting gateway's job).
+// to gate access or authorize anything.
 [[nodiscard]] inline std::string generate_uuid_v7() {
   auto ms = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(

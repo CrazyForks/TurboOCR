@@ -19,7 +19,17 @@ using engine::TrtEngine;
 // loop in SlanextEncSplit::infer and the CPU sibling slanext_host_decode), each
 // with its own copy of these arch constants. Bind the two sets so any drift
 // fails the build instead of silently diverging GPU vs CPU table structure
-// output. (The decode-loop duplication itself is tracked separately.)
+// output.
+//
+// The decode-loop duplication itself is left INTENTIONALLY un-deduped: the two
+// copies never link into one binary (slanext_host_decode.cpp is CPU-build-only;
+// the GPU lib compiles only this inline loop), this loop only runs behind a live
+// TRT engine + GpuImage so it cannot be driven from the standalone test runner,
+// and no test exercises it — so a merge into one shared decode cannot be proven
+// byte-identical by the suite. Both are -ffast-math, so a refactor risks a
+// silent FP-reassociation shift in the table-structure argmax with no test to
+// catch it. The static_assert wall above guards the only thing that can drift
+// (the arch constants); the arithmetic is a verbatim copy kept in sync by review.
 static_assert(SlanextEncSplit::kTenc      == SlanextDecoderWeights::kTenc);
 static_assert(SlanextEncSplit::kCtx       == SlanextDecoderWeights::kCtx);
 static_assert(SlanextEncSplit::kHidden    == SlanextDecoderWeights::kHidden);

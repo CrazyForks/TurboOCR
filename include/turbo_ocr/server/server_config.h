@@ -34,10 +34,8 @@ constexpr Profile build_profile() noexcept {
 /// for the HTTP/gRPC servers. Loaded once at startup via load_or_die().
 struct ServerConfig {
   // ---- Network ----
-  // Binds all interfaces by default (vLLM-style): this server is meant to sit
-  // behind a gateway/proxy that handles auth, TLS, and exposure. Set BIND_HOST
-  // (or TURBO_OCR_HOST / --host) to restrict, e.g. 127.0.0.1 when the proxy is
-  // co-located.
+  // Binds all interfaces by default. Set BIND_HOST (or TURBO_OCR_HOST / --host)
+  // to restrict, e.g. 127.0.0.1 when the only client is a co-located proxy.
   std::string host = "0.0.0.0";  // TURBO_OCR_HOST / BIND_HOST / --host
   int http_port = 8080;          // PORT / --http-port
   int grpc_port = 50051;         // GRPC_PORT / --grpc-port

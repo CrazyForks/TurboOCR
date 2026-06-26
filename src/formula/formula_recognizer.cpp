@@ -5,7 +5,6 @@
 #include <memory>
 
 #include "turbo_ocr/backends/openai_endpoint.h"
-#include "turbo_ocr/formula/formulanet.h"
 #include "turbo_ocr/formula/ppformulanet_ort.h"
 #include "turbo_ocr/formula/vlm_formula.h"
 #include "turbo_ocr/routing/routing_config.h"
@@ -14,9 +13,6 @@ namespace turbo_ocr::formula {
 
 std::unique_ptr<IFormulaRecognizer>
 make_formula_recognizer(std::string_view backend) {
-  if (backend == "formulanet") {
-    return std::make_unique<FormulaNet>();
-  }
   if (backend == "ppformulanet_s") {
     // Pure in-process ORT decoder (no Python sidecar). GPU FAST host-loop by default,
     // PPFNS_EXACT=1 for the fused graph, FORMULA_DEVICE=cpu for ORT-CPU.
@@ -26,7 +22,7 @@ make_formula_recognizer(std::string_view backend) {
     return std::make_unique<VLMFormula>();
   }
   std::cerr << "[FormulaRecognizer] unknown FORMULA_BACKEND='" << backend
-            << "' (expected 'formulanet', 'ppformulanet_s', or 'vlm')\n";
+            << "' (expected 'ppformulanet_s' or 'vlm')\n";
   return nullptr;
 }
 

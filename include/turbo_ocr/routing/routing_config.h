@@ -23,9 +23,9 @@
 // env. The factories (make_*_recognizer) consume a resolved BackendSpec.
 //
 // Security/open-source posture: api_key is ONLY accepted as an env-indirection
-// ("env:NAME"); a literal secret in the file/request is rejected. Auth/TLS and
-// exposure remain the fronting gateway's job. Pointing an openai backend at a
-// proprietary/account-gated endpoint is the operator's explicit choice.
+// ("env:NAME"); a literal secret in the file/request is rejected. Pointing an
+// openai backend at a proprietary/account-gated endpoint is the operator's
+// explicit choice.
 
 namespace turbo_ocr::routing {
 

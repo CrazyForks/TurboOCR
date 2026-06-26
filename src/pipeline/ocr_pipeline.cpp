@@ -10,7 +10,6 @@
 #include "turbo_ocr/decode/gpu_image.h"
 #include "turbo_ocr/common/serialization.h"
 #include "turbo_ocr/formula/formula_recognizer.h"
-#include "turbo_ocr/formula/formulanet.h"
 #include "turbo_ocr/layout/reading_order.h"
 #include "turbo_ocr/router/cua_router.h"
 #include "turbo_ocr/routing/routing_config.h"

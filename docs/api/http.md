@@ -26,7 +26,7 @@ Parsed by `server::parse_query_options()` in
 | `reading_order` | `0` | XY-cut over the layout boxes; emits `reading_order`. Auto-enables `layout`. |
 | `as_blocks` | `0` | Emit paragraph-level `blocks`. Auto-enables `layout` + `reading_order`. |
 | `tables` | startup default | Run the CUA router's table branch (SLANet+/Nemotron) and emit `tables`. Auto-enables `layout`. |
-| `formulas` | startup default | Run the 3-engine LaTeX-OCR formula branch and emit `formulas`. Auto-enables `layout`. |
+| `formulas` | startup default | Run the formula branch (PP-FormulaNet-S, in-process ORT-CUDA-13) and emit `formulas`. Auto-enables `layout`. |
 | `rec_mode` | env `OCR_REC_MODE` | Per-request recognizer override (`mobile` / `server`). |
 
 !!! note "Optional fields stay byte-identical when empty"

@@ -48,6 +48,9 @@ layout_overlay*.png
 # Benchmark outputs
 vlm_result_*.json
 
+# OmniBench browsable result trees (rendered ad hoc, never tracked)
+result/
+
 # mkdocs build output (regenerated from docs/ + mkdocs.yml)
 site/
 

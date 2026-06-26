@@ -59,13 +59,13 @@ table, 76 have a formula; mix of 1–3 column layouts, print + handwritten notes
 
 **What every benchmark number in this document actually uses:** the **`tiny`** OCR tier — `det_tiny.onnx`
 (1.7 MB) + `rec_tiny.onnx` (4.3 MB). This is the default (`OCR_MODEL` unset) and on these complex docs
-it is also the **best** tier — `medium` scored *worse* (§5). There is **no "fast" tier**; the three
-tiers are `tiny` / `small` / `medium`, selected by `OCR_MODEL`. The exact stack per configuration:
+it is also the **best** tier (medium underperforms tiny on dense/handwritten pages). There is **no
+"fast" tier**; the three tiers are `tiny` / `small` / `medium`, selected by `OCR_MODEL`. The exact stack
+per configuration:
 
 - **text** (every row): `det_tiny` + `rec_tiny` + `cls` (PP-LCNet angle) + layout (PP-DocLayoutV3)
 - **+ table (local)**: SLANeXt wired/wireless encoder+decoder + `table_cls`
-- **+ formula (local)**: PP-FormulaNet-S via the **`ppformulanet_s`** ORT sidecar — *not* `formulanet`,
-  which is encoder-only and inert (see §5)
+- **+ formula (local)**: PP-FormulaNet-S via the **`ppformulanet_s`** in-process ORT-CUDA-13 backend
 - **+ VL (hybrid or VL-only)**: **PaddleOCR-VL-1.5-0.9B** on vLLM — table/formula region crops in the
   hybrid, or the whole page in VL-only
 
@@ -80,7 +80,7 @@ Always-on = text path (det+rec+cls). Everything else is optional. Per-model deta
 | doc orientation | `models/doc_ori.onnx` | PP-LCNet | 6.5 MB | file present | yes |
 | layout | `models/layout/layout.onnx` | PP-DocLayoutV3 (RT-DETR-L) | 124 MB | `DISABLE_LAYOUT` | yes |
 | table (local) | `slanext_encoder/SLANeXt_{wired,wireless}_encoder.onnx` + `_decoder.bin` + `table_cls.onnx` | SLANeXt enc(GPU)+dec(host) | 5.3 + 2.1 + 6.5 MB | `TABLE_BACKEND=slanext` | opt-in |
-| formula (local) | `formula/ppformulanet_s/inference_trt.onnx` + `tokenizer.json` | PP-FormulaNet-S (split enc + AR dec, ORT sidecar) | 295 MB | `FORMULA_BACKEND=ppformulanet_s` (NOT inert `formulanet`) | opt-in |
+| formula (local) | `formula/ppformulanet_s/inference_trt.onnx` + `tokenizer.json` | PP-FormulaNet-S (in-process ORT-CUDA-13, FAST split enc + host AR dec) | 295 MB | `FORMULA_BACKEND=ppformulanet_s` (NOT inert `formulanet`) | opt-in |
 | table / formula (external) | **PaddleOCR-VL-1.5-0.9B** (`models/vlm/paddleocr_vl_1_5`) on vLLM | VLM | 1.8 GB | `kind:openai` routing | opt-in |
 
 OCR tiers (det+rec) trade accuracy for speed: **tiny** ~85% / ~481 img/s · **small** ~91% / ~234 ·
@@ -122,17 +122,21 @@ PaddleOCR-VL process on its own GPU (~15 GB), *not* in the C++ VRAM column.
 | + layout | 56 | 50 / 125 | 5.8 GB | – | – | – |
 | + table SLANeXt (local) | **86** | 57 / 123 | 6.0 GB | – | 127 | – |
 | + table VL | 10.3 | 278 / 1572 | 5.8 GB | +15 GB | 127 | – |
-| + formula PP-FormulaNet (local) | 92 | 49 / 99 | 6.2 GB | – | – | **0** ⚠ |
+| + formula PP-FormulaNet-S (local) | **4.6** | 164 / 5091 | 7.5 GB | – | – | 525 |
 | + formula VL | 6.7 | 613 / 3270 | 5.8 GB | +15 GB | – | 1679 |
-| + table + formula (local) | 55 | 83 / 145 | 6.3 GB | – | 127 | **0** ⚠ |
+| + table + formula (local) | **3.8** | 302 / 5284 | 7.7 GB | – | 71 | 673 |
 | + table + formula (VL) | 6.1 | 721 / 1924 | 5.8 GB | +15 GB | 127 | 1679 |
 | hybrid: local table + VL formula | 12 | 344 / 1799 | 6.0 GB | +15 GB | 127 | 1679 |
 
-Reading the coverage: SLANeXt/VL emit **127 tables ≈ 119 GT** (slight over-detect). The
-`formula_local` row used `FORMULA_BACKEND=formulanet` (encoder-only) which is **inert — 0 usable
-LaTeX** ⚠; the working local backend is **`ppformulanet_s`** (the ORT sidecar), which adds host-side
-AR-decode cost (~28 img/s, see §5). VL emits **1679 formula regions** because layout flags inline
-formulas and equation-numbers too, far more than the 489 GT *display* formulas the scorer evaluates.
+Reading the rows: text detection+recognition is **fast** (324 img/s); layout and SLANeXt table add
+modest cost (56 / 86 img/s). **The local formula backend is the throughput bottleneck** — PP-FormulaNet-S
+is a host-side autoregressive decoder running in-process on ORT-CUDA-13, so on this formula-dense subset
+(every page has a formula or table) it serializes (p90 jumps to ~5 s) and the full local pipeline drops
+to **3.8 img/s** — *slower* than VL-batched formula (both_vl 6.1), which fans crops across vLLM's
+continuous batching. Local's speed advantage is on **text/table-heavy** docs where the formula stage rarely
+fires. Coverage: SLANeXt/VL over-detect tables slightly (127 vs 119 GT); formula counts (525 / 673 /
+1679 vs 489 GT) are high because layout flags inline formulas and equation-numbers, not just the GT
+*display* formulas the scorer evaluates.
 
 **VRAM and throughput vs `PIPELINE_POOL_SIZE`** (`--pool-sizes 1 2 4 8`): VRAM ≈ base + pool × ~2 GB
 (both_local: 3.5 / 6.3 / 11.9 / 23.1 GB at pool 1/2/4/8); throughput **peaks around pool=2** at
@@ -146,66 +150,49 @@ explicitly** — auto-detect over-provisions VRAM for no throughput gain.
 `scripts/omnidoc_run_and_score_n.py` (local / hybrid) and `scripts/bench_vl_fullpage.py` (VL full
 page), all on the **same 125 docs**, scored identically (`↓` lower better, `↑` higher better).
 
-### 5a. Three bugs the first numbers exposed (and the fix)
-
-The initial local numbers were inflated by wiring/config bugs, **not** model ceilings:
-
-| bug | symptom | root cause | fix | result |
-|---|---|---|---|---|
-| reading order never requested | RO 0.558; multi-column pages scrambled (and text inflated) | `tools/omnidoc_run.py` posted only `?layout=1`; the XY-cut order the server already computes was never asked for, so markdown was dumped in `(y,x)` order | request `?layout=1&reading_order=1` + map the result-indexed order to layout blocks in `omnidoc_to_md.py` | **RO 0.558 → 0.30, text 0.150 → 0.11** |
-| local formula backend inert | formula CDM 0.414 | `FORMULA_BACKEND=formulanet` fed only `encoder.onnx`, but PP-FormulaNet-S is split (resizer+encoder+decoder) → decoder never runs → every LaTeX empty → markdown falls back to the **text recognizer** reading formulas as garbled text | `FORMULA_BACKEND=ppformulanet_s` + the ORT sidecar (`scripts/ppformulanet_s_sidecar.py`) | **CDM 0.414 → 0.811** (nearly VL's 0.874) |
-| table cell-text dropped | table TEDS 0.644 (struct 0.855) — 45% of cells empty | `cell_matcher` required ≥70% of an OCR line's area inside a cell quad (SLANeXt quads are smaller than DB line boxes → ~35% of lines dropped); and cells the page detector missed stayed empty | gate 0.5 + argmax fallback (`cell_matcher.cpp`, swept 0.3/0.4/0.5 → 0.5 optimal) **and** per-cell crop OCR — empty grid cells are recognized directly from their quad (`slanext_table_recognizer.cpp`) | **TEDS 0.644 → 0.774 (struct 0.872)** |
-
-### 5b. The full matrix (125 docs, PaddleOCR-VL-1.5)
+### 5a. The three ways to run it (125 docs, PaddleOCR-VL-1.5)
 
 | pipeline | speed | text ↓ | tbl TEDS ↑ | tbl struct ↑ | tbl edit ↓ | fml CDM ↑ | fml edit ↓ | RO ↓ |
 |---|---|---|---|---|---|---|---|---|
-| Local — as first shipped (inert formula, no RO) | 55 img/s | 0.150 | 0.644 | 0.855 | 0.191 | 0.414 † | 0.733 | 0.558 |
-| Local — + reading-order fix | 55 img/s | 0.127 | 0.646 | 0.861 | 0.184 | 0.414 † | 0.730 | 0.355 |
-| **Local — all fixes + per-cell OCR + 0.5 gate** | **28 img/s** | **0.113** | **0.774** | **0.872** | **0.152** | **0.811** | **0.296** | **0.303** |
-| Local — medium tier (tiny is better here) | 30 img/s | 0.179 | 0.611 | 0.855 | 0.204 | 0.447 | 0.720 | 0.579 |
-| Hybrid — VL on regions, as first shipped | 6.1 img/s | 0.144 | 0.892 | 0.926 | 0.082 | 0.847 | 0.148 | 0.480 |
-| **Hybrid — + reading-order fix** | 6.1 img/s | **0.118** | 0.895 | 0.928 | 0.082 | 0.843 | 0.148 | **0.313** |
-| **VL-only — whole page** | **1.3 pg/s** | **0.073** | **0.900** | **0.931** | **0.074** | **0.874** | **0.131** | **0.194** |
+| **Local** (tiny tier; SLANeXt + PP-FormulaNet-S) | 3.8 img/s | 0.113 | 0.774 | 0.872 | 0.152 | 0.811 | 0.296 | 0.303 |
+| **Hybrid** (local text+layout, VL on table/formula regions) | 6.1 img/s | 0.118 | 0.895 | 0.928 | 0.082 | 0.843 | 0.148 | 0.313 |
+| **VL-only** (PaddleOCR-VL over the whole page) | 1.3 pg/s | **0.073** | **0.900** | **0.931** | **0.074** | **0.874** | **0.131** | **0.194** |
 
-† `formulanet` was inert — 0.414 is the *text recognizer* reading formulas, not a formula model.
+### 5b. Per modality — which backend wins
 
-### 5c. Per modality — which backend, head to head
-
-| modality (metric) | local (fixed) | VL on region (hybrid) | VL full page |
+| modality (metric) | local | VL on region (hybrid) | VL full page |
 |---|---|---|---|
 | **text** (edit ↓) | 0.113 | 0.118 | **0.073** |
 | **table** (TEDS ↑) | 0.774 | 0.895 | **0.900** |
 | **table** (structure ↑) | 0.872 | 0.926 | **0.931** |
-| **formula** (CDM ↑) | **0.811** | 0.843 | **0.874** |
+| **formula** (CDM ↑) | 0.811 | 0.843 | **0.874** |
 | **reading order** (edit ↓) | 0.303 | 0.313 | **0.194** |
 
-What this actually says:
-- **The local pipeline is far stronger than the raw numbers first showed.** Four fixes plus a swept
-  matcher gate took it from "weak" (table 0.644, formula 0.414, RO 0.558) to **table 0.774, formula
-  0.811, RO 0.303, text 0.113** — at **28 img/s**, ~20× VL-only and ~5× the hybrid. **Local formula
-  (0.811) and table (0.774) are now within striking distance of VL (0.874 / 0.900).** Remaining table
-  headroom is structure decode on complex spanning/borderless grids; remaining RO gap (0.303 vs 0.194)
-  is the XY-cut algorithm itself, not wiring (four reorder algorithms were tried — none beat the tuned
+What this says:
+- **Local needs no external model and is competitive on accuracy**: formula CDM 0.811 and table TEDS
+  0.774 land within striking distance of VL (0.874 / 0.900), on one GPU with no vLLM. The remaining
+  table gap is structure decode on complex spanning/borderless grids; the reading-order gap (0.303 vs
+  0.194) is the XY-cut algorithm itself (four reorder variants were evaluated — none beat the tuned
   baseline).
-- **Memory caveat:** the local formula sidecar (ORT) needs VRAM headroom — sharing one 32 GB GPU with a
-  vLLM (15 GB) can OOM and empty some formulas (CDM drops to ~0.70). This is **no longer silent**: the
-  sidecar fails loud if it can't reach the GPU, and a per-region failure now surfaces as
-  `formula_degraded` in the response. Give the formula sidecar its own GPU or run local-only; the 0.811
-  above is the clean (vLLM-free) number.
-- **VL-only is still the most accurate on everything** (text 0.073, table 0.900, formula 0.874, RO
-  0.194) — one model over the whole page gives the most coherent result — but at **1.3 pages/s**.
-- **Hybrid ≈ VL-only on tables/formulas**, and after the RO fix it matches local on text/RO; its value
-  is VL-grade tables/formulas without paying for VL text on **text-heavy** docs (where it runs much
-  faster than on this table/formula-heavy set, where every page hits VL per region).
-- **Enabling the real local formula costs throughput** (55 → 28 img/s: the PP-FormulaNet-S decoder is a
-  host-side autoregressive loop). Formula off / inert = faster but no real formula output.
+- **But on this formula-dense subset local is throughput-bound by the formula stage** (3.8 img/s —
+  see §4): PP-FormulaNet-S is a single-instance host-side AR decoder, so it serializes and is actually
+  *slower* than VL-batched formula here. Local's speed advantage is on text/table-heavy docs (raw OCR
+  ~324 img/s, +table 86), where the formula stage rarely fires.
+- **VL-only is the most accurate on everything** (text 0.073, table 0.900, formula 0.874, RO 0.194):
+  one model over the whole page gives the most coherent result — at 1.3 pages/s.
+- **Hybrid ≈ VL-only on tables/formulas** while keeping fast local text, and at 6.1 img/s it is the
+  fastest of the three on formula-dense pages (vLLM batches the region crops). Its larger win is on
+  text-heavy docs, where most pages skip the per-region VL round-trips entirely.
+- **VRAM note:** the in-process formula stage (ORT-CUDA) needs headroom — sharing one 32 GB GPU with a
+  vLLM (15 GB) can OOM and empty some formulas (CDM drops to ~0.70). This is **not silent**: the stage
+  fails loud if it can't reach the GPU, and a per-region failure surfaces as `formula_degraded` in the
+  response. Give the formula stage its own GPU or run local-only; the 0.811 above is the clean
+  (vLLM-free) number.
 
-Pick by what you optimise: **one GPU, high throughput, good-enough accuracy → local (all fixes on)**;
-**maximum accuracy → VL-only**; **VL-grade tables/formulas + fast local text on text-heavy docs →
-hybrid**. The remaining local gap to VL is genuine model headroom (handwriting, inline-math LaTeX,
-dense-table cell content), addressable further by per-cell crop OCR + wide-line splitting in the table
-path.
+Pick by what you optimise: **one GPU, no external model, competitive accuracy → local** (best when
+formulas are sparse); **maximum accuracy → VL-only**; **VL-grade tables/formulas at the highest
+throughput on formula-dense docs → hybrid**. The local gap to VL is genuine model headroom
+(handwriting, inline-math LaTeX, dense-table cell content).
 
 ---
 
@@ -236,12 +223,14 @@ vllm serve models/vlm/paddleocr_vl_1_5 --port 8077 --trust-remote-code \
 ```
 Build recipe (clean): `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTENSORRT_DIR=<trt> -DFETCH_MODELS=OFF`.
 
-For the local pipeline, enable the working formula backend + the reading-order param:
+For the local pipeline, enable the formula backend + the reading-order param:
 ```bash
 FORMULA_BACKEND=ppformulanet_s \
   FORMULA_ONNX=models/formula/ppformulanet_s/inference_trt.onnx \
   FORMULA_TOKENIZER=models/formula/ppformulanet_s/tokenizer.json \
-  PPFNS_SIDECAR_SCRIPT=scripts/ppformulanet_s_sidecar.py ./build/paddle_highspeed_cpp ...
-# the sidecar needs cu12 ORT: PATH/LD_LIBRARY_PATH from .venv-modelopt (nvidia/*/lib)
+  ./build/paddle_highspeed_cpp ...
+# Runs in-process on ORT-CUDA-13 (no Python, no sidecar). It fails loud if it
+# can't reach the GPU and surfaces per-region failures as formula_degraded.
+# Knobs: PPFNS_CHUNK (decode batch, default 8); PPFNS_EXACT=1 forces the fused
+# graph; FORMULA_DEVICE=cpu runs the fused graph on ORT CPU.
 ```
-The `formulanet` backend (encoder-only) is inert — always use `ppformulanet_s` for real local LaTeX.

@@ -49,8 +49,9 @@ HTTP and gRPC. On forms and receipts it is both the most accurate open engine an
 - 🎯 **Most accurate on forms & receipts** &mdash; beats PaddleOCR-VL, PaddleOCR-Python, RapidOCR, EasyOCR and Tesseract ([benchmarks](#benchmarks))
 - 🧠 **PP-OCRv6** &mdash; one model covers Latin + Chinese + Japanese; pick `tiny` (default) / `small` / `medium`
 - 🌐 **More scripts** &mdash; Arabic, Cyrillic, Korean, Thai, Greek via retained PP-OCRv5 recognizers
-- 📄 **PDF native** &mdash; pages rendered and OCR'd in parallel, four extraction modes, optional page-image export & auto-rotation
+- 📄 **PDF native** &mdash; pages rendered and OCR'd in parallel, optional page-image export & auto-rotation
 - 🧩 **Layout + reading order** &mdash; PP-DocLayoutV3 (25 classes) and class-aware XY-cut, opt-in per request
+- 🔢 **Tables & formulas** &mdash; opt-in SLANet+ table → HTML and PP-FormulaNet-S formula → LaTeX, emitted alongside the text ([how to enable](#tables--formulas))
 - 🐳 **One-line Docker deploy** with TensorRT engines auto-built on first start, **Prometheus** metrics on `/metrics`
 
 Full documentation: **<https://aiptimizer.github.io/TurboOCR/>**
@@ -134,7 +135,23 @@ Use the VLM when every point of accuracy matters; use TurboOCR when throughput m
 
 ## Models
 
-PP-OCRv6 (Latin + Chinese + Japanese) in three tiers via `OCR_MODEL`:
+The pipeline is a small stack of specialised models, not one monolith. Text
+detection + recognition + orientation always run; layout, table, and formula are
+opt-in and only load when configured. Each stage links to its own model page.
+
+| Stage | Model / arch | Size | Selected by | Docs |
+|---|---|---:|---|---|
+| **Text detection** | PP-OCRv6 det (DB, three tiers) | 1.7 / 9.4 / 59 MB | `OCR_MODEL` tier (`tiny`/`small`/`medium`) | [detection](docs/models/detection.md) |
+| **Text recognition** | PP-OCRv6 rec (CRNN + CTC, Latin + Chinese + Japanese) | 4.3 / 20 / 73 MB | `OCR_MODEL` tier — default `tiny` | [recognition](docs/models/recognition.md) · [selection](docs/models/selection.md) |
+| **Orientation** | PP-LCNet textline angle classifier | ~1 MB | always on (runs only on vertical lines) | [classification](docs/models/classification.md) |
+| **Layout** | PP-DocLayoutV3 (RT-DETR-L, 25 classes) | ~124 MB | per request via `?layout=1`; disable with `DISABLE_LAYOUT=1` | [layout](docs/models/layout.md) |
+| **Table → HTML** | SLANeXt (wired + wireless TRT encoder + hand-written C++ GRU decoder) | ~5 MB/encoder | `TABLE_BACKEND=slanext` *(default backend)* + encoder paths | [table](docs/models/table.md) |
+| **Formula → LaTeX** | PP-FormulaNet-S, in-process pure-C++ (ORT-CUDA-13, no Python) | ~294 MB | `FORMULA_BACKEND=ppformulanet_s` | [formula](docs/models/formula.md) |
+| **External VLM** *(optional)* | PaddleOCR-VL-1.6 (0.9B) on cropped table/formula regions | served separately | `TABLE_BACKEND=vlm` / `FORMULA_BACKEND=vlm` or a routing `kind:openai` entry | [VL on a separate GPU](docs/deployment_vl_separate_gpu.md) |
+
+The three OCR tiers (`tiny`/`small`/`medium`) all cover the same Latin + Chinese +
+Japanese scripts via `OCR_MODEL` — they trade accuracy for speed, not language
+coverage:
 
 | `OCR_MODEL` | FUNSD F1 | Throughput | Use it for |
 |---|---:|---:|---|
@@ -145,7 +162,37 @@ PP-OCRv6 (Latin + Chinese + Japanese) in three tiers via `OCR_MODEL`:
 Other scripts use retained PP-OCRv5 recognizers, also via `OCR_MODEL`: `arabic`,
 `eslav` (Cyrillic), `korean`, `thai`, `greek`.
 
+The table/formula stages always run **locally** in C++ by default (SLANeXt, and
+PP-FormulaNet-S on ORT-CUDA-13). The external **PaddleOCR-VL-1.6** backend is an
+opt-in accuracy lever for math/table-heavy pages: it runs on cropped regions only,
+typically on its own GPU/process, and is reached over an OpenAI-compatible endpoint.
+
 → [Model selection guide](https://aiptimizer.github.io/TurboOCR/models/selection/)
+
+---
+
+## Tables & formulas
+
+Table and formula recognition are **opt-in**: the router only loads them when a
+backend is configured at startup, so the default text path is untouched. Once a
+backend is set, run any request with `layout` enabled and the response gains
+`tables` (HTML + cell quads) and/or `formulas` (LaTeX) arrays.
+
+| Capability | Enable at startup | Recognizer |
+|---|---|---|
+| Formula → LaTeX | `FORMULA_BACKEND=ppformulanet_s` | PP-FormulaNet-S |
+| Table → HTML | `TABLE_BACKEND=slanext` (+ SLANeXt model paths) | SLANet+ |
+
+```bash
+docker run --gpus all -p 8000:8000 \
+  -e FORMULA_BACKEND=ppformulanet_s -e TABLE_BACKEND=slanext \
+  -v trt-cache:/home/ocr/.cache/turbo-ocr ghcr.io/aiptimizer/turboocr:latest
+
+curl -X POST "http://localhost:8000/ocr/raw?layout=1" \
+  --data-binary @paper.png -H "Content-Type: image/png"
+```
+
+→ [Tables](https://aiptimizer.github.io/TurboOCR/models/table/) · [Formulas](https://aiptimizer.github.io/TurboOCR/models/formula/)
 
 ---
 
@@ -157,7 +204,8 @@ v3 moves the default engine from PP-OCRv5 to **PP-OCRv6**. Changes since v2.3:
 - **`OCR_MODEL` replaces `OCR_LANG`.** Select by tier/model name (`tiny`/`small`/`medium`, or `arabic`/`eslav`/`korean`/`thai`/`greek`). `OCR_LANG` still works as a **deprecated** alias (warns on use).
 - **`OCR_SERVER` removed.** PP-OCRv6 covers Latin + Chinese + Japanese in one model, so the separate Chinese-server recognizer toggle is gone. Non-Latin scripts (Arabic, Cyrillic, Korean, Thai, Greek) are served by retained PP-OCRv5 recognizers.
 - **Default tier is `tiny`** (max throughput). Set `OCR_MODEL=small` or `medium` for higher accuracy.
-- **New: `LAYOUT_MERGE_MODE`** (default `large`; `small`/`union` keep nested boxes — for forms).
+- **`LAYOUT_MERGE_MODE` values renamed and the default changed.** The nested-box modes are now `outer` / `inner` / `all` (was `large` / `small` / `union`); the old names are still accepted as **deprecated aliases**. The new **default is `all`** — it keeps every detected box and drops nothing, so formulas/tables/titles nested inside a larger region survive. To restore the previous default behaviour set `LAYOUT_MERGE_MODE=outer`. Modes: `outer` keeps the outer/container box and drops boxes nested inside it; `inner` keeps the innermost boxes and drops the pure containers; `all` keeps both.
+- **The Python formula sidecar was removed.** Formula recognition (`FORMULA_BACKEND=ppformulanet_s`) is now a fully **in-process pure-C++ PP-FormulaNet-S recognizer** on ORT-CUDA-13 — there is no separate Python process to launch or manage. For a CPU formula decode set `FORMULA_DEVICE=cpu` (ORT `CPUExecutionProvider`, no CUDA and no Python).
 
 ---
 
@@ -171,7 +219,7 @@ One binary serves HTTP and gRPC from a shared GPU pipeline pool.
 | `POST /ocr` | OCR base64 image in JSON |
 | `POST /ocr/pixels` | Zero-decode raw pixel buffer |
 | `POST /ocr/batch` | Batch of images |
-| `POST /ocr/pdf` | PDF → text (4 modes; optional page images & auto-rotate) |
+| `POST /ocr/pdf` | PDF → text (optional page images & auto-rotate) |
 | `GET /metrics` | Prometheus metrics |
 
 All endpoints accept `?layout=1` (region detection + reading order). Example:
@@ -194,9 +242,8 @@ Common ones:
 |---|---|---|
 | `OCR_MODEL` | `tiny` | `tiny` / `small` / `medium`, or a PP-OCRv5 script model |
 | `DISABLE_LAYOUT` | `0` | `1` skips the layout model (~300–500 MB VRAM) |
-| `LAYOUT_MERGE_MODE` | `large` | Nested-box policy: `large` (regions) / `small` / `union` (keep all — for forms) |
+| `LAYOUT_MERGE_MODE` | `all` | Nested-box policy: `all` (keep every box) / `outer` (outer regions only) / `inner` (innermost only). Old `large`/`small`/`union` accepted as aliases. |
 | `PIPELINE_POOL_SIZE` | auto | Concurrent GPU pipelines |
-| `ENABLE_PDF_MODE` | `ocr` | `ocr` / `geometric` / `auto` / `auto_verified` |
 
 → [Full configuration reference (35+ variables)](https://aiptimizer.github.io/TurboOCR/build/config/)
 

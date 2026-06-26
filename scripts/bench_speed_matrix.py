@@ -93,9 +93,9 @@ def make_configs(a) -> list[dict]:
         "TABLE_SLANEXT_DICT": f"{enc}/SLANeXt_dict_infer.txt",
     }
     formula_env = {
-        "FORMULA_BACKEND": "formulanet",
-        "FORMULA_ONNX": f"{a.models_dir}/formula/encoder.onnx",
-        "FORMULA_TOKENIZER": f"{a.models_dir}/formula/tokenizer.json",
+        "FORMULA_BACKEND": "ppformulanet_s",
+        "FORMULA_ONNX": f"{a.models_dir}/formula/ppformulanet_s/inference_trt.onnx",
+        "FORMULA_TOKENIZER": f"{a.models_dir}/formula/ppformulanet_s/tokenizer.json",
     }
     # (name, desc, extra_env, flags, route_table, route_formula, needs_vllm)
     raw = [
@@ -120,6 +120,13 @@ def launch_server(a, cfg, routing_path: Path, log_path: Path, pool, ext) -> subp
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"] = a.trt_lib + ":" + env.get("LD_LIBRARY_PATH", "")
     env["TURBO_ALLOW_ADHOC_BACKENDS"] = "1"
+    # The local formula backend (ppformulanet_s) runs fully in-process on
+    # ONNX Runtime CUDA — no Python sidecar, no PPFNS_* sidecar env. We still put
+    # the modelopt venv first on PATH so any external Python tooling resolves a
+    # CUDA-13-capable interpreter.
+    modelopt_bin = str(REPO / ".venv-modelopt" / "bin")
+    if os.path.isdir(modelopt_bin):
+        env["PATH"] = modelopt_bin + ":" + env.get("PATH", "")
     if pool is not None:
         env["PIPELINE_POOL_SIZE"] = str(pool)  # else the server auto-sizes by free VRAM (inconsistent)
     env.update(cfg["env"])

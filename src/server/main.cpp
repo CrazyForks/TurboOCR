@@ -10,6 +10,10 @@
 #include <string>
 #include <thread>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #include "turbo_ocr/common/logger.h"
 
 #include <opencv2/core.hpp>
@@ -50,6 +54,44 @@ int main(int argc, char **argv) try {
   // Parallelism lives at the request level (work-pool threads); OpenCV's
   // per-op thread pool on top of that just oversubscribes cores under load.
   cv::setNumThreads(0);
+
+#if defined(__GLIBC__)
+  // Host-RSS containment under sustained high-concurrency, large-image load.
+  // A burst of large pages (OmniDocBench reaches >100 MP; in-spec pages up to
+  // the MAX_IMAGE_PIXELS_MP cap decode to hundreds of MB of BGR) at concurrency
+  // ~150 transiently allocates tens of GB of host buffers. glibc keeps that
+  // memory in its per-arena free lists after the request frees it, and its
+  // DYNAMIC mmap threshold ratchets UP as large blocks are freed — so later
+  // image-sized allocations grow the arena instead of being munmap'd, and RSS
+  // climbs toward a high-water mark without returning toward baseline.
+  //
+  //  - Freeze M_MMAP_THRESHOLD so every image-sized allocation is mmap'd and
+  //    returned to the OS the instant it's freed, not parked in an arena.
+  //    Setting it explicitly ALSO disables the upward auto-tuning (the ratchet).
+  //  - Bound M_TRIM_THRESHOLD so the main arena's top is returned promptly.
+  //  - Cap M_ARENA_MAX: with the large work-thread pool the default (8*ncpu)
+  //    arenas each retain their own high-water of freed pages.
+  // NOTE: this bounds the glibc-arena component only. Grow-only per-thread
+  // (image decode scratch across the work-thread pool) and per-pipeline (pinned
+  // upload staging, nvJPEG state) buffers still saturate to the largest-image
+  // footprint; that high-water is bounded but large for very-large-image corpora.
+  mallopt(M_MMAP_THRESHOLD, 1 * 1024 * 1024);
+  mallopt(M_TRIM_THRESHOLD, 4 * 1024 * 1024);
+  mallopt(M_ARENA_MAX, 8);
+
+  // Belt-and-braces: a low-frequency reaper returns each arena's accumulated
+  // free pages to the OS (madvise) so idle RSS settles back toward baseline
+  // between load bursts instead of pinning the peak. malloc_trim only releases
+  // ALREADY-FREE memory, so it never reclaims live buffers; cheap at 5 s cadence.
+  if (!turbo_ocr::server::env_present("TURBO_OCR_DISABLE_MALLOC_REAPER")) {
+    std::thread([] {
+      for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        malloc_trim(0);
+      }
+    }).detach();
+  }
+#endif
 
   const auto &rec_paths = cfg.rec_paths;
   if (!cfg.selected_model_name.empty())
@@ -288,6 +330,8 @@ int main(int argc, char **argv) try {
         .formula_warning  = std::move(out.formula_warning),
         .table_degraded   = out.table_degraded,
         .table_warning    = std::move(out.table_warning),
+        .text_degraded    = out.text_degraded,
+        .text_warning     = std::move(out.text_warning),
     };
   };
 

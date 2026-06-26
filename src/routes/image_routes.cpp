@@ -814,11 +814,14 @@ void register_ocr_markdown_route_gpu(server::WorkPool &pool,
               "DISABLE_LAYOUT=1)"));
           return;
         }
-        // ?embed=0 -> file-ref image links (assets written by an out-of-band
-        // exporter); default true -> self-contained base64 data: URIs.
-        bool embed = true;
+        // Always self-contained base64 data: URIs over HTTP. The legacy ?embed=0 file-ref
+        // mode has render_markdown_with_assets write crop PNGs to the server CWD — which the
+        // client can never retrieve and which is a swallowed no-op under a read-only root
+        // filesystem (the markdown would then reference nonexistent files). Not served here.
+        const bool embed = true;
         if (auto p = req->getParameter("embed"); p == "0" || p == "false")
-          embed = false;
+          std::cerr << "[/ocr/markdown] embed=0 (file-ref) is not supported over HTTP — "
+                       "returning self-contained data-URIs instead\n";
 
         server::submit_work(pool, std::move(callback),
             [req, &dispatcher, &decode, embed](server::DrogonCallback &cb) {
@@ -864,6 +867,22 @@ void register_ocr_markdown_route_gpu(server::WorkPool &pool,
 
             auto resp = drogon::HttpResponse::newHttpResponse();
             resp->setStatusCode(drogon::k200OK);
+            // no-silent-failure: the markdown body intentionally drops failed/garbage regions
+            // (so a degraded stage is invisible in it). Surface degradation in a header so a
+            // caller can detect a configured-but-failed stage rather than seeing a clean page.
+            if (out.text_degraded || out.table_degraded || out.formula_degraded) {
+              std::string warn;
+              auto add = [&](bool d, const char *name, const std::string &w) {
+                if (!d) return;
+                if (!warn.empty()) warn += "; ";
+                warn += name;
+                if (!w.empty()) warn += ":" + w;
+              };
+              add(out.text_degraded, "text", out.text_warning);
+              add(out.table_degraded, "table", out.table_warning);
+              add(out.formula_degraded, "formula", out.formula_warning);
+              resp->addHeader("X-OCR-Degraded", warn);
+            }
             resp->setBody(std::move(md));
             resp->setContentTypeString("text/markdown; charset=utf-8");
             cb(resp);

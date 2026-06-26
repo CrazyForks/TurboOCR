@@ -186,6 +186,8 @@ int main(int argc, char **argv) try {
         .formula_warning  = std::move(out.formula_warning),
         .table_degraded   = out.table_degraded,
         .table_warning    = std::move(out.table_warning),
+        .text_degraded    = out.text_degraded,
+        .text_warning     = std::move(out.text_warning),
     };
   };
 

@@ -72,7 +72,7 @@ public:
       workers_.emplace_back([this, flag, start_ms, req_at,
                              entry = std::move(entries[i])]() mutable {
         while (true) {
-          WorkFn work;
+          QueuedWork work;
           {
             std::unique_lock lock(mutex_);
             // Predicate form of wait() is atomic w.r.t. notify only when
@@ -98,7 +98,12 @@ public:
           // previous task's timestamp.
           req_at->store(0, std::memory_order_relaxed);
           start_ms->store(now_ms_(), std::memory_order_relaxed);
-          work(*entry);
+          // Deadline-drop: skip work whose client deadline already elapsed while it waited in
+          // queue (the caller has its 504) — running it only wastes GPU time and deepens
+          // congestion under overload. work.fn still destructs, so its abandoned packaged_task
+          // future gets a harmless broken_promise that nobody is waiting on.
+          if (work.deadline_ms == 0 || now_ms_() <= work.deadline_ms)
+            work.fn(*entry);
           start_ms->store(0, std::memory_order_relaxed);
           req_at->store(0, std::memory_order_relaxed);
           // A recoverable CUDA fault in the table/formula stage flags the
@@ -107,6 +112,13 @@ public:
           if (recycle_enabled_ && entry->pipeline &&
               entry->pipeline->consume_recycle_request())
             flag->store(true, std::memory_order_relaxed);
+          else
+            // M4: the task COMPLETED (this worker is healthy, not wedged — a wedged worker
+            // never reaches here and is handled by the hard-kill path). Cancel any recycle the
+            // watchdog requested purely because the task was SLOW: otherwise a slow-but-
+            // successful request would trigger a wasteful full-pipeline rebuild + CUDA-graph
+            // re-warm that pulls the slot out of service right when the box is already busy.
+            flag->store(false, std::memory_order_relaxed);
         }
       });
     }
@@ -139,6 +151,14 @@ public:
   /// The callable signature must be:  R fn(GpuPipelineEntry &)
   template <typename F>
   auto submit(F &&fn) -> std::future<std::invoke_result_t<F, GpuPipelineEntry &>> {
+    return submit_with_deadline_(0, std::forward<F>(fn));  // no deadline (e.g. readiness probe)
+  }
+
+  /// submit() that stamps an absolute wall-clock deadline (ms; 0 = none) on the queued task,
+  /// so a worker can skip it if the caller's deadline elapses while it waits in queue.
+  template <typename F>
+  auto submit_with_deadline_(long long deadline_ms, F &&fn)
+      -> std::future<std::invoke_result_t<F, GpuPipelineEntry &>> {
     using R = std::invoke_result_t<F, GpuPipelineEntry &>;
     auto task = std::make_shared<std::packaged_task<R(GpuPipelineEntry &)>>(
         std::forward<F>(fn));
@@ -149,7 +169,7 @@ public:
         throw turbo_ocr::PoolExhaustedError(
             "Server at capacity (GPU queue full). Use persistent connections "
             "(HTTP keep-alive) instead of opening a new connection per request.");
-      queue_.push([task = std::move(task)](GpuPipelineEntry &e) { (*task)(e); });
+      queue_.push({[task = std::move(task)](GpuPipelineEntry &e) { (*task)(e); }, deadline_ms});
     }
     cv_.notify_one();
     return future;
@@ -167,7 +187,8 @@ public:
   template <typename F>
   auto submit_for(long timeout_ms, F &&fn)
       -> std::invoke_result_t<F, GpuPipelineEntry &> {
-    auto future = submit(std::forward<F>(fn));
+    const long long deadline = timeout_ms > 0 ? now_ms_() + timeout_ms : 0;
+    auto future = submit_with_deadline_(deadline, std::forward<F>(fn));
     return get_with_timeout(future, timeout_ms);
   }
 
@@ -224,6 +245,10 @@ public:
 
 private:
   using WorkFn = std::function<void(GpuPipelineEntry &)>;
+  // A queued task + the absolute wall-clock ms deadline (0 = none) by which its caller will
+  // already have received a 504. Workers skip a task past its deadline rather than spend GPU
+  // time on a result nobody will read — prevents goodput collapse / congestion under overload.
+  struct QueuedWork { WorkFn fn; long long deadline_ms = 0; };
 
   static long long now_ms_() noexcept {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -305,7 +330,7 @@ private:
   // so a task that finishes right at the deadline is never needlessly recycled.
   static constexpr long long kWatchdogGraceMs = 2000;
 
-  std::queue<WorkFn> queue_;
+  std::queue<QueuedWork> queue_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::condition_variable watchdog_cv_;

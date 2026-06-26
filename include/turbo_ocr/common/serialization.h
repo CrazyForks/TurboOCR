@@ -146,25 +146,39 @@ inline void append_reading_order_array(std::string &j,
 // formulas emit LaTeX (backslashes, braces) — both need every escape
 // the OCR text branch uses. Caller writes the surrounding quotes.
 inline void append_escaped_string(std::string &j, const std::string &s) {
-  for (char c : s) {
-    auto uc = static_cast<unsigned char>(c);
-    switch (c) {
-      case '"':  j += "\\\""; break;
-      case '\\': j += "\\\\"; break;
-      case '\b': j += "\\b";  break;
-      case '\f': j += "\\f";  break;
-      case '\n': j += "\\n";  break;
-      case '\r': j += "\\r";  break;
-      case '\t': j += "\\t";  break;
-      default:
-        if (uc < 0x20) {
-          char buf[7];
-          snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(uc));
-          j += buf;
-        } else {
-          j += c;
-        }
+  const size_t n = s.size();
+  for (size_t i = 0; i < n;) {
+    const auto uc = static_cast<unsigned char>(s[i]);
+    if (uc < 0x80) {  // ASCII: JSON-escape control/special chars, pass the rest through
+      const char c = s[i++];
+      switch (c) {
+        case '"':  j += "\\\""; break;
+        case '\\': j += "\\\\"; break;
+        case '\b': j += "\\b";  break;
+        case '\f': j += "\\f";  break;
+        case '\n': j += "\\n";  break;
+        case '\r': j += "\\r";  break;
+        case '\t': j += "\\t";  break;
+        default:
+          if (uc < 0x20) {
+            char buf[7];
+            snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(uc));
+            j += buf;
+          } else {
+            j += c;
+          }
+      }
+      continue;
     }
+    // Multi-byte: copy a well-formed UTF-8 sequence verbatim, else emit U+FFFD. A backstop so
+    // no producer can ever ship RFC-8259-invalid bytes that a strict JSON client would reject
+    // (valid output is byte-identical to before).
+    const int len = (uc >> 5) == 0x6 ? 2 : (uc >> 4) == 0xE ? 3 : (uc >> 3) == 0x1E ? 4 : 0;
+    bool ok = len >= 2 && i + static_cast<size_t>(len) <= n;
+    for (int k = 1; k < len && ok; ++k)
+      ok = (static_cast<unsigned char>(s[i + k]) & 0xC0) == 0x80;
+    if (ok) { j.append(s, i, static_cast<size_t>(len)); i += static_cast<size_t>(len); }
+    else { j += "\xEF\xBF\xBD"; ++i; }
   }
 }
 
@@ -612,6 +626,16 @@ emit_pipeline_result_json(pipeline::OcrPipelineResult &out,
     if (!out.table_warning.empty()) {
       j += ",\"table_warning\":\"";
       detail::append_escaped_string(j, out.table_warning);
+      j += '"';
+    }
+  }
+  // Same additive contract for the base OCR/recognition stage: detection found
+  // text regions but recognition produced no usable text (see text_degraded).
+  if (out.text_degraded) {
+    j += ",\"text_degraded\":true";
+    if (!out.text_warning.empty()) {
+      j += ",\"text_warning\":\"";
+      detail::append_escaped_string(j, out.text_warning);
       j += '"';
     }
   }

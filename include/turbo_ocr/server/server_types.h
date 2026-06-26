@@ -47,6 +47,11 @@ struct InferResult {
   std::string                           formula_warning;
   bool                                  table_degraded = false;
   std::string                           table_warning;
+  // Detection found text regions but recognition produced nothing usable — the no-silent-
+  // failure signal for the TEXT stage (the pipeline computes it via flag_text_degraded; it
+  // was previously dropped here, so /ocr + CPU /ocr/raw returned a clean empty 200).
+  bool                                  text_degraded = false;
+  std::string                           text_warning;
 };
 
 // Serialize an InferResult, emitting `tables`/`formulas` (+ degraded signals)
@@ -57,7 +62,7 @@ struct InferResult {
 [[nodiscard]] inline std::string
 emit_infer_result_json(InferResult &inf, bool want_blocks) {
   if (inf.tables.empty() && inf.formulas.empty() && !inf.formula_degraded &&
-      !inf.table_degraded) {
+      !inf.table_degraded && !inf.text_degraded) {
     return turbo_ocr::emit_results_json(inf.results, inf.layout,
                                         inf.reading_order, want_blocks);
   }
@@ -71,6 +76,8 @@ emit_infer_result_json(InferResult &inf, bool want_blocks) {
   out.formula_warning = std::move(inf.formula_warning);
   out.table_degraded = inf.table_degraded;
   out.table_warning = std::move(inf.table_warning);
+  out.text_degraded = inf.text_degraded;
+  out.text_warning = std::move(inf.text_warning);
   return turbo_ocr::emit_pipeline_result_json(out, want_blocks);
 }
 

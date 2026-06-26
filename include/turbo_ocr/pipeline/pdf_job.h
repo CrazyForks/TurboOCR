@@ -72,6 +72,16 @@ struct PdfPageResult {
   std::vector<OCRResultItem>     results;
   std::vector<layout::LayoutBox> layout;
   std::vector<int>               reading_order;
+  // Table/formula structure + the per-stage no-silent-failure signals. Previously dropped on
+  // /ocr/pdf, so a configured-but-failed table/formula stage was invisible on a PDF page.
+  std::vector<router::TableResult>   tables;
+  std::vector<router::FormulaResult> formulas;
+  bool        formula_degraded = false;
+  std::string formula_warning;
+  bool        table_degraded = false;
+  std::string table_warning;
+  bool        text_degraded = false;
+  std::string text_warning;
   int width = 0, height = 0, effective_dpi = 0;
   pdf::PdfMode resolved_mode = pdf::PdfMode::Ocr;
   std::string_view text_layer_quality = "absent";
@@ -259,6 +269,25 @@ inline void prepopulate_pages(pdf::PdfMode mode, bool layout_or_want_layout,
 // branch both sites used, so output is byte-identical.
 [[nodiscard]] inline std::string
 serialize_page_results(PdfPageResult &pg, bool want_blocks) {
+  // Structure or degradation present -> full pipeline emitter so tables/formulas + the
+  // *_degraded signals surface (they were dropped on /ocr/pdf). Otherwise the output is
+  // byte-identical to the prior text-only branches.
+  if (!pg.tables.empty() || !pg.formulas.empty() || pg.formula_degraded ||
+      pg.table_degraded || pg.text_degraded) {
+    OcrPipelineResult out;
+    out.results = std::move(pg.results);
+    out.layout = std::move(pg.layout);
+    out.reading_order = std::move(pg.reading_order);
+    out.tables = std::move(pg.tables);
+    out.formulas = std::move(pg.formulas);
+    out.formula_degraded = pg.formula_degraded;
+    out.formula_warning = std::move(pg.formula_warning);
+    out.table_degraded = pg.table_degraded;
+    out.table_warning = std::move(pg.table_warning);
+    out.text_degraded = pg.text_degraded;
+    out.text_warning = std::move(pg.text_warning);
+    return turbo_ocr::emit_pipeline_result_json(out, want_blocks);
+  }
   if (!pg.reading_order.empty())
     return emit_results_json(pg.results, pg.layout, pg.reading_order,
                              want_blocks);
@@ -329,6 +358,14 @@ inline void store_ocr_page(PdfPageSink &sink, int page_idx,
   slot.results       = std::move(out.results);
   slot.layout        = std::move(out.layout);
   slot.reading_order = std::move(out.reading_order);
+  slot.tables        = std::move(out.tables);
+  slot.formulas      = std::move(out.formulas);
+  slot.formula_degraded = out.formula_degraded;
+  slot.formula_warning  = std::move(out.formula_warning);
+  slot.table_degraded   = out.table_degraded;
+  slot.table_warning    = std::move(out.table_warning);
+  slot.text_degraded    = out.text_degraded;
+  slot.text_warning     = std::move(out.text_warning);
   slot.width         = width;
   slot.height        = height;
   slot.effective_dpi = sink.dpi;
@@ -623,6 +660,14 @@ inline int run_streamed_render_cpu(
           if (want_layout) {
             auto inf = infer(img, inf_opts);
             pg.layout = std::move(inf.layout);
+            // table/formula structure + degradation also apply to geometric pages (the router
+            // runs on the rendered image); text_degraded does NOT (text is the PDF layer).
+            pg.tables = std::move(inf.tables);
+            pg.formulas = std::move(inf.formulas);
+            pg.formula_degraded = inf.formula_degraded;
+            pg.formula_warning = std::move(inf.formula_warning);
+            pg.table_degraded = inf.table_degraded;
+            pg.table_warning = std::move(inf.table_warning);
           }
           pg.width = img.cols;
           pg.height = img.rows;
@@ -647,6 +692,14 @@ inline int run_streamed_render_cpu(
           pg.results = std::move(inf.results);
           pg.layout = std::move(inf.layout);
           pg.reading_order = std::move(inf.reading_order);
+          pg.tables = std::move(inf.tables);
+          pg.formulas = std::move(inf.formulas);
+          pg.formula_degraded = inf.formula_degraded;
+          pg.formula_warning = std::move(inf.formula_warning);
+          pg.table_degraded = inf.table_degraded;
+          pg.table_warning = std::move(inf.table_warning);
+          pg.text_degraded = inf.text_degraded;
+          pg.text_warning = std::move(inf.text_warning);
           pg.width = img.cols;
           pg.height = img.rows;
           pg.effective_dpi = dpi;

@@ -73,6 +73,14 @@ struct OcrPipelineResult {
   // page that simply had no table.
   bool                                   table_degraded = false;
   std::string                            table_warning;
+
+  // Text/recognition stage degradation: set when detection found text regions
+  // (boxes > 0) but recognition yielded no usable text (all crops decoded to
+  // empty/blank). Without this, a recognition-stage failure on a text page is
+  // byte-identical to a genuinely blank page — the no-silent-failure contract
+  // that the formula/table stages already honour, extended to base OCR.
+  bool                                   text_degraded = false;
+  std::string                            text_warning;
 };
 
 // Await + parse + assemble any deferred external (VLM) work into out.tables /

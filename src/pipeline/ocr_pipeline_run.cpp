@@ -17,7 +17,6 @@
 #include "turbo_ocr/table/cell_matcher.h"
 #include "turbo_ocr/table/html_reconstruct.h"
 #include "turbo_ocr/table/slanext_enc_split.h"
-#include "turbo_ocr/table/table_cls.h"
 #include "turbo_ocr/table/table_types.h"
 #include "turbo_ocr/engine/onnx_to_trt.h"
 
@@ -258,21 +257,31 @@ OcrPipelineResult OcrPipeline::run_with_layout(const cv::Mat &img,
     boxes = det_->run(gpu_img, img.rows, img.cols, stream);
     timer.gpu_stop();
   } catch (const turbo_ocr::CudaError &e) {
-    std::cerr << "[Pipeline] degenerate input "
-              << img.cols << "x" << img.rows
-              << " — returning empty result: " << e.what() << '\n';
+    // Surface any async fault, then: a STICKY fault poisons the context for every future
+    // request, so fail fast and let the orchestrator restart a healthy pod (std::_Exit, not
+    // std::abort — skip atexit/dtors that would issue poisoned CUDA calls and hang).
     cudaStreamSynchronize(stream);
-    cudaGetLastError(); // clears a non-sticky error so the next request works
-    if (cudaGetLastError() != cudaSuccess) {
-      // Still erroring after a clear → STICKY error (e.g. illegal address):
-      // the CUDA context is poisoned and every future request on every
-      // pipeline would fail. Fail fast so the orchestrator restarts a
-      // healthy process instead of leaving a zombie returning errors.
-      std::cerr << "[Pipeline] FATAL: sticky CUDA error, context is "
-                   "unrecoverable — aborting for supervisor restart\n";
-      std::abort();
+    turbo_ocr::abort_on_sticky_cuda_fault("run_with_layout/upload+det");
+    // Non-sticky: classify so a real fault never masquerades as a blank page. A degenerate
+    // INPUT (invalid dims/pitch for the GPU op, e.g. a 1x1 image) genuinely has no text →
+    // empty is the correct answer. Anything else — crucially cudaErrorMemoryAllocation (OOM
+    // on a legitimate image under VRAM pressure) — is a real failure and MUST be loud (5xx),
+    // not a silent empty 200 (no-silent-failure). The error is cleared either way so it does
+    // not poison subsequent requests.
+    const cudaError_t err = cudaGetLastError();
+    const bool degenerate_input = err == cudaErrorInvalidValue ||
+                                  err == cudaErrorInvalidPitchValue ||
+                                  err == cudaErrorInvalidConfiguration;
+    if (degenerate_input) {
+      std::cerr << "[Pipeline] degenerate input " << img.cols << "x" << img.rows
+                << " — empty result: " << e.what() << " (cuda=" << cudaGetErrorString(err)
+                << ")\n";
+      return OcrPipelineResult{};
     }
-    return OcrPipelineResult{};
+    std::cerr << "[Pipeline] detection GPU fault on " << img.cols << "x" << img.rows << ": "
+              << e.what() << " (cuda=" << cudaGetErrorString(err)
+              << ") — surfacing as an inference error, not a silent blank page\n";
+    throw turbo_ocr::InferenceError(std::string("detection GPU fault: ") + e.what());
   }
 
   // Sort boxes top-to-bottom, left-to-right (in-place)
@@ -358,6 +367,8 @@ OcrPipelineResult OcrPipeline::run_with_layout(const cv::Mat &img,
       });
     }
   }
+
+  detail::flag_text_degraded(out, boxes.size());
 
   // Layout collect waits on d2h_event_ recorded on layout_stream_. Because
   // layout and rec run on separate streams, total wall-clock is bounded by
@@ -516,6 +527,8 @@ OcrPipelineResult OcrPipeline::run_with_layout(GpuImage gpu_img,
       });
     }
   }
+
+  detail::flag_text_degraded(out, boxes.size());
 
   // Layout collect — see run(cv::Mat, stream) above.
   if (layout_enqueued) {
@@ -733,6 +746,9 @@ std::vector<OcrPipelineResult> OcrPipeline::run_batch_with_layout(
         });
       }
     }
+    // Same no-silent-failure signal the single-image path sets: boxes detected but
+    // recognition produced nothing usable -> text_degraded (was missing on /ocr/batch).
+    detail::flag_text_degraded(all_results[i], boxes.size());
   }
 
   // --- Phase 4 (opt-in): layout + CUA router (table/formula) per page ---

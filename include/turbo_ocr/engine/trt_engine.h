@@ -114,9 +114,10 @@ private:
   void destroy_graphs() noexcept;
 
   std::string model_path_;
-  // Shared, process-global engine (deserialized once per .trt path via the
-  // engine cache). The shared_ptr keeps the engine alive for as long as this
-  // instance — and its per-instance contexts/baked graphs — exist.
+  // Private engine, deserialized for this instance (see engine_cache.cpp — never
+  // shared across pool workers). The shared_ptr keeps the engine (and the TRT
+  // runtime captured in its deleter) alive for as long as this instance — and its
+  // per-instance contexts/baked graphs — exist.
   std::shared_ptr<nvinfer1::ICudaEngine> engine_;
 
   std::vector<BakedGraph> baked_;

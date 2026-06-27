@@ -3,7 +3,6 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
-#include <unordered_map>
 #include <vector>
 
 namespace turbo_ocr::engine {
@@ -17,17 +16,13 @@ class CacheLogger : public nvinfer1::ILogger {
   }
 };
 
-// Function-local statics: the runtime and the cache map are constructed on
-// first use and destroyed in reverse order at process teardown — the map
-// (engines) before the runtime. TensorRT requires the IRuntime to outlive every
-// engine deserialized from it; each cached engine's shared_ptr also captures the
-// shared runtime in its deleter (see below), so even an engine released after
-// the map is cleared keeps the runtime alive until that engine is gone.
+// The IRuntime is constructed on first use and shared via each engine's deleter,
+// so it is guaranteed to outlive every engine deserialized from it regardless of
+// static-destruction order (TensorRT requires the runtime to outlive its engines).
 struct CacheState {
   std::mutex mu;
   CacheLogger logger;
   std::shared_ptr<nvinfer1::IRuntime> runtime;
-  std::unordered_map<std::string, std::weak_ptr<nvinfer1::ICudaEngine>> engines;
 };
 
 CacheState &state() {
@@ -50,42 +45,20 @@ std::vector<char> read_file(const std::string &path) {
 
 } // namespace
 
-// Cross-pipeline engine sharing is OFF by default.
+// Engines are ALWAYS private: every caller deserializes its own ICudaEngine.
 //
-// Sharing ONE deserialized ICudaEngine across all pool workers and giving each
-// worker its own IExecutionContext is the textbook-"supported" TensorRT pattern
-// — but in practice, concurrent enqueueV3() on multiple contexts of the SAME
-// engine corrupts recognition output under load: detection still finds the text
-// boxes, yet rec decodes them to blank (empty/partial text on ~0.5-0.8% of
-// requests at concurrency ~150, the exact "silent text loss" failure). Private
-// per-worker engines eliminate the shared mutable engine state entirely AND run
-// ~2x faster (no contention on shared engine internals). Each pool stage loads a
-// distinct .trt path, so the cache deduped nothing WITHIN a pipeline anyway —
-// it only ever shared ACROSS pipelines, which is precisely the unsafe case.
-//
-// TURBO_OCR_SHARE_ENGINES=1 restores the old shared-engine behaviour; only safe
-// when pool concurrency is 1 (e.g. a single-worker, VRAM-constrained deploy).
-[[nodiscard]] static bool engine_sharing_enabled() {
-  static const bool v = std::getenv("TURBO_OCR_SHARE_ENGINES") != nullptr;
-  return v;
-}
-
+// Sharing one engine across the pool's execution contexts is the "supported"
+// TensorRT pattern, but in practice N contexts enqueuing concurrently on one
+// MULTI-PROFILE engine corrupt output under load — rec (small/large profiles)
+// decodes text boxes to blank while single-profile det is unaffected (the exact
+// "det finds the boxes, rec blank" failure). One execution context per engine is
+// the structurally-safe shape and matches the pre-cache design; the VRAM saved
+// by sharing is irrelevant on a GPU-compute-bound stack. There is no concurrency-
+// safe way to share that keeps the throughput, so sharing is not offered.
 std::shared_ptr<nvinfer1::ICudaEngine>
-get_or_load_engine(const std::string &trt_path) {
+load_engine(const std::string &trt_path) {
   CacheState &s = state();
   std::lock_guard<std::mutex> lock(s.mu);
-
-  const bool share = engine_sharing_enabled();
-
-  if (share) {
-  if (auto it = s.engines.find(trt_path); it != s.engines.end()) {
-    if (auto eng = it->second.lock())
-      return eng;
-    // weak_ptr expired (last sharing instance died): drop the dead entry so the
-    // map can't accumulate stale keys, then re-deserialize below.
-    s.engines.erase(it);
-  }
-  }
 
   if (!s.runtime) {
     s.runtime.reset(nvinfer1::createInferRuntime(s.logger));
@@ -108,14 +81,10 @@ get_or_load_engine(const std::string &trt_path) {
     return nullptr;
   }
 
-  // Capture the shared runtime in the deleter so the runtime is guaranteed to
-  // outlive this engine no matter the static-destruction order.
-  std::shared_ptr<nvinfer1::ICudaEngine> eng(
+  // Capture the shared runtime in the deleter so it outlives this engine no
+  // matter the static-destruction order.
+  return std::shared_ptr<nvinfer1::ICudaEngine>(
       raw, [rt = s.runtime](nvinfer1::ICudaEngine *p) { delete p; });
-
-  if (share)
-    s.engines[trt_path] = eng;
-  return eng;
 }
 
 } // namespace turbo_ocr::engine

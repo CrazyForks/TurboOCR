@@ -438,6 +438,22 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
         "disable layout, or remove this env var (layout is on by default).");
   }
 
+  // Table/formula recognition runs on the regions LAYOUT classifies, so a
+  // configured table/formula backend REQUIRES layout. Refuse to boot with one
+  // configured while layout is disabled — the stage would load and then
+  // silently produce nothing (no regions to fill). The enable set mirrors
+  // gpu_pipeline_pool.h::maybe_load_router_models.
+  if (c.layout_disabled &&
+      (env_present("FORMULA_BACKEND") || env_present("FORMULA_ONNX") ||
+       env_present("TABLE_BACKEND") || env_present("TABLE_CLS_TRT") ||
+       env_present("TABLE_SLANEXT_ENCODER_ONNX") ||
+       env_present("VLLM_TABLE_BASE_URL") || env_present("TURBO_ROUTING_CONFIG"))) {
+    c.errors.push_back(
+        "DISABLE_LAYOUT is set but a table/formula backend is configured; those "
+        "stages recognize layout regions and would produce nothing. Remove "
+        "DISABLE_LAYOUT, or unset the table/formula backend env.");
+  }
+
   if (env_present("ENABLE_PDF_MODE")) {
     auto m = env_choice_strict("ENABLE_PDF_MODE", "ocr",
         {"ocr", "geometric", "auto", "auto_verified"}, c.errors);

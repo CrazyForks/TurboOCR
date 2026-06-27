@@ -4,6 +4,7 @@
 #include <format>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -55,7 +56,21 @@ inline void maybe_load_router_models(OcrPipeline &pipeline) {
                            !env("TABLE_CLS_TRT").empty() ||
                            !env("TABLE_SLANEXT_ENCODER_ONNX").empty() ||
                            !env("VLLM_TABLE_BASE_URL").empty();
-  if (!want_router) return;
+  if (!want_router) {
+    // Text-only is a valid mode, but running it UNINTENTIONALLY is the classic
+    // footgun: tables come back empty and formulas are dropped with no error, so
+    // a full-document benchmark silently scores at the floor. Say so once, loudly.
+    static std::once_flag warned_text_only;
+    std::call_once(warned_text_only, [] {
+      std::cerr << "[Pipeline] NOTE: table + formula stages are DISABLED — running "
+                   "TEXT-ONLY. Tables/formulas will be empty. To enable full-document "
+                   "parsing set FORMULA_BACKEND=ppformulanet_s (+ FORMULA_ONNX / "
+                   "FORMULA_TOKENIZER) and TABLE_BACKEND=slanext (+ "
+                   "TABLE_SLANEXT_ENCODER_ONNX).\n"
+                << std::flush;
+    });
+    return;
+  }
   // Router (CuaRouter) + formula stage. A
   // CONFIGURED backend that fails to load (out-of-memory / bad model) ABORTS
   // boot — we never start a server that silently produces no formulas/tables.

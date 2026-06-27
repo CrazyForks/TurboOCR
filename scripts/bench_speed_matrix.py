@@ -392,7 +392,8 @@ def regression_check(results: dict, baseline_path: Path, tol: float) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--models-dir", default="models")
-    p.add_argument("--trt-lib", default="/home/user/TensorRT-10.15.1.29/lib")
+    p.add_argument("--trt-lib", default=os.environ.get(
+        "TENSORRT_LIB", os.path.expanduser("~/TensorRT-10.15.1.29/lib")))
     p.add_argument("--vllm-url", default="http://localhost:8077", help="default external endpoint for table+formula")
     p.add_argument("--pool-sizes", nargs="*", type=int,
                    help="explicit PIPELINE_POOL_SIZE values to sweep (default: server auto-sizes, one run/config)")

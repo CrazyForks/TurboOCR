@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import Counter
 from pathlib import Path
 
-GT_PATH = Path("/workspace/omnidocbench/data/OmniDocBench.json")
-IMAGES_DIR = Path("/workspace/omnidocbench/data/images")
+_OB = Path(os.environ.get("OMNIDOCBENCH",
+                          Path(__file__).resolve().parent.parent.parent / "omnidocbench"))
+GT_PATH = _OB / "data" / "OmniDocBench.json"
+IMAGES_DIR = _OB / "data" / "images"
 OUT_DIR = Path("/tmp/omnidoc_subset125")
 
 STRATA_KEYS = ("data_source", "language", "layout")

@@ -12,7 +12,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-TRT="${TENSORRT_ROOT:-/home/user/TensorRT-10.15.1.29}"
+TRT="${TENSORRT_ROOT:-$HOME/TensorRT-10.15.1.29}"
 MODEL_DIR="${REPO_ROOT}/models/formula/ppformulanet_plus_m"
 ONNX="${MODEL_DIR}/encoder.onnx"
 ENGINE="${MODEL_DIR}/encoder_fp16.engine"

@@ -21,14 +21,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-REPO = Path("/workspace/turboocr")
-BENCH = Path("/workspace/omnidocbench")
+REPO = Path(__file__).resolve().parent.parent
+BENCH = Path(os.environ.get("OMNIDOCBENCH", REPO.parent / "omnidocbench"))
 SUBSET_N = 125
 SUBSET_DIR = Path("/tmp/omnidoc_subset125")
 SUBSET_GT = SUBSET_DIR / "OmniDocBench_subset125.json"

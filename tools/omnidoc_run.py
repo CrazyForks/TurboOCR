@@ -45,7 +45,7 @@ def process_one(session: requests.Session, server: str, img: Path,
             data = f.read()
         ct = _CONTENT_TYPES.get(img.suffix.lower(), "application/octet-stream")
         r = session.post(
-            f"{server}/ocr/raw?layout=1&reading_order=1",
+            f"{server}/ocr/raw?layout=1&reading_order=1&tables=1&formulas=1",
             data=data,
             headers={"Content-Type": ct},
             timeout=120,

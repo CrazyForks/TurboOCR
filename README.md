@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>The fastest GPU document parser — OCR · layout · tables · formulas → Markdown. 15–90× faster than other OCR engines.</strong><br>
+  <strong>The fastest GPU document parser — OCR · layout · tables · formulas → Markdown, at 200–556 images/s on one GPU.</strong><br>
   C++ / CUDA / TensorRT / PP-OCRv6 &mdash; Linux + NVIDIA GPU
 </p>
 
@@ -44,8 +44,9 @@ An extremely fast GPU **document parser** — not just OCR. PP-OCRv6 detection +
 recognition, plus layout, tables (→ HTML), formulas (→ LaTeX) and reading-order
 **Markdown**, the whole pipeline on a single multi-stream CUDA/TensorRT engine,
 locally (no VLM), behind HTTP and gRPC. It turns documents into structured data
-at OCR speed: on forms and receipts it is both the most accurate open engine and
-15–90× faster than the alternatives.
+at OCR speed — **200–556 images/s on one GPU**, where VLM document parsers like
+PaddleOCR-VL run ~1–2 pages/s. On forms and receipts it is both the most accurate
+open engine and 15–90× faster than classic OCR engines.
 
 - 🚀 **Up to 556 img/s** (receipts) / **481 img/s** (forms) on one RTX 5090, fastest by default
 - 🎯 **Most accurate on forms & receipts** &mdash; beats PaddleOCR-VL, PaddleOCR-Python, RapidOCR, EasyOCR and Tesseract ([benchmarks](#benchmarks))

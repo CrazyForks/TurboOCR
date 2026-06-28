@@ -228,16 +228,15 @@ Latin-only workloads or direct A/B comparison.
 
 ## Upgrading to v3 (breaking changes)
 
-v3 moves the default engine from PP-OCRv5 to **PP-OCRv6**. The changes since v2.3
-sort into three buckets — only the first needs a config change.
+v3 moves the default engine from PP-OCRv5 to **PP-OCRv6** and turns the server into
+a full document parser — adding layout-aware **tables → HTML** and **formulas →
+LaTeX** (both new in v3). The changes since v2.3 sort into three buckets; only the
+first needs any action.
 
 **Breaking / config-incompatible** (action required):
 
-- **`OCR_SERVER` removed.** PP-OCRv6 covers Latin + Chinese + Japanese in one model, so the separate Chinese-server recognizer toggle is gone. Non-Latin scripts (Arabic, Cyrillic, Korean, Thai, Greek) are served by retained PP-OCRv5 recognizers, selected via `OCR_MODEL`.
-- **Clear the TensorRT engine cache on upgrade.** PP-OCRv6 ships new det/rec ONNX, so cached v5 engines must rebuild — wipe `~/.cache/turbo-ocr` (or the mounted `trt-cache` volume) once.
-- **Sidecar-specific formula env is gone.** Only relevant if you set `PPFNS_SIDECAR_SCRIPT` / `PPFNS_SOCK` or launched `scripts/ppformulanet_s_sidecar.py` directly — all no longer exist (the experimental `TURBO_OCR_TRTLLM_DEBUG` is gone too). Plain `FORMULA_BACKEND=ppformulanet_s` users are unaffected (see *Additive / transparent* below).
-- **Default `FORMULA_BACKEND` is now `ppformulanet_s`** (was `formulanet`), and the old `formulanet` backend was removed — `FORMULA_BACKEND=formulanet` now fails loudly at boot instead of running. Use `ppformulanet_s` (default, English/Latin), `ppformulanet_plus_m` (Chinese-capable), or `vlm`.
-- **Table backend overhauled — old per-table-model env removed.** The wired/wireless table router and the `table_cls` classifier are gone; tables now run through a single SLANet-Plus structure model. `TABLE_CLS_TRT`, `TABLE_SLANEXT_WIRED_TRT`, `TABLE_SLANEXT_WIRELESS_TRT` and `TABLE_CELL_*` no longer have any effect, and the model release dropped `SLANeXt_wireless_*` + `table_cls.onnx` (~24 MB → ~8 MB). Enable tables with `TABLE_BACKEND=slanext` (+ `TABLE_SLANEXT_ENCODER_ONNX`); output is essentially unchanged (the wireless model was a byte-identical duplicate). Only affects deployments that set the old table env.
+- **Server binary renamed.** The GPU server is now `turboocr-server` (was `paddle_highspeed_cpp`) and the CPU server `turboocr-cpu-server` (was `paddle_cpu_server`). Update any direct launch command, systemd unit, or wrapper script. Docker users are unaffected — the image entrypoint/`CMD` handle it.
+- **Clear the TensorRT engine cache and pull the new models on upgrade.** PP-OCRv6 ships new det/rec ONNX from the `models-v3.0.0-ppocrv6` release, so cached v5 engines must rebuild — wipe `~/.cache/turbo-ocr` (or the mounted `trt-cache` volume) once. The Docker image and the native build fetch the new release automatically; pull the new image (or rebuild) to get it.
 
 **Default-behaviour changes** (no config change, but output or runtime differ):
 
@@ -253,11 +252,13 @@ sort into three buckets — only the first needs a config change.
 **Additive / transparent** (nothing to do):
 
 - **`OCR_MODEL` is the new selector name; `OCR_LANG` still works** as a deprecated alias (warns on use), so this is backward-compatible. Select by tier/model name (`tiny`/`small`/`medium`, or `arabic`/`eslav`/`korean`/`thai`/`greek`).
-- **The Python formula sidecar is gone — transparently.** `FORMULA_BACKEND=ppformulanet_s` is now a fully **in-process pure-C++ PP-FormulaNet-S recognizer** on ORT-CUDA-13: same backend name, same output, no separate Python process to launch or manage. (The GPU path is FAST split-graph only; the CPU-only build decodes formulas on ORT CPU automatically.) Only callers of the deleted sidecar script / `PPFNS_SIDECAR_SCRIPT` env are affected (see *Breaking* above).
+- **New: formula recognition → LaTeX.** `FORMULA_BACKEND=ppformulanet_s` adds an **in-process pure-C++ PP-FormulaNet-S recognizer** (ORT-CUDA-13 on the GPU build, ORT-CPU on the CPU build — no Python, no sidecar). Use `ppformulanet_plus_m` for Chinese-capable formulas, or `vlm` to route to a VLM. Opt-in; off by default.
+- **New: table recognition → HTML.** `TABLE_BACKEND=slanext` adds the SLANet-Plus structure model (TRT FP16 encoder + hand-written C++ decoder); the encoder auto-resolves from the bundled model, so no extra path env is needed. Opt-in; off by default.
 - **New `POST /ocr/markdown` route** (GPU build) exports a parsed page as faithful Markdown. Purely additive — existing routes are unchanged.
 - **Oversized-image guard on `/infer`.** Like the other image routes, `/infer` now rejects inputs whose dimensions exceed `MAX_IMAGE_DIM` (default `16384`) with `400 DIMENSIONS_TOO_LARGE` (a decompression-bomb guard). Only affects callers that were sending images larger than 16384 px on a side.
 - **New `*_degraded` response signals.** When a configured stage produces nothing, the JSON now carries `text_degraded` / `table_degraded` / `formula_degraded` (+ a `*_warning` string) on `/ocr`, `/ocr/raw`, `/ocr/batch` and `/ocr/pdf`, and `/ocr/markdown` sets an `X-OCR-Degraded` header — so a partial result is never a silent clean `200` (a configured-but-failed stage also now fails at boot rather than serving empties). New fields only; ignore them and nothing changes.
-- **New `ppformulanet_plus_m` formula backend** (in-process, Chinese-capable) and **`GET /capabilities`** (runtime feature/route discovery) — both opt-in and additive.
+- **New: document auto-rotation.** `?autorotate=1` straightens rotated/skewed pages with a PP-LCNet orientation model before OCR (opt-in per request).
+- **New `GET /capabilities`** (runtime feature/route discovery) — opt-in and additive.
 
 ---
 

@@ -9,9 +9,8 @@
 # scripts/patch_ppformulanet_s_onnx.py rewrites those into
 # `inference_trt.onnx` (idempotent, re-runs only if src is newer).
 #
-# The C++ PPFormulaNetS backend spawns scripts/ppformulanet_s_sidecar.py
-# in the container (onnxruntime-gpu) and talks to it over a Unix socket
-# for each formula crop.
+# The C++ PP-FormulaNet-S backend runs fully in-process (ORT-CUDA-13 on the
+# GPU build, ORT-CPU on the CPU build) — no Python sidecar, no socket.
 #
 # Validation gate (5-doc OmniDocBench subset):
 #   display_formula_cdm ≥ 0.30  (vs FormulaNet baseline 0.040)

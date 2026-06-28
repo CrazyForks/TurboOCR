@@ -8,10 +8,11 @@ the inputs (inventory + checksum command) without performing any network action.
 ## 1. Why this is needed
 
 `models/` is gitignored (9.9 GB) and fetched at build time by
-`scripts/fetch_release_models.sh` from a GitHub Release. That release base —
+`scripts/fetch_release_models.sh` from a GitHub Release. The release base —
 `https://github.com/aiptimizer/TurboOCR/releases/download/models-v3.0.0-ppocrv6`
-— now returns **404** (e.g. `…/det.onnx` → 404), so a clean clone cannot build:
-`-DFETCH_MODELS=ON` hard-fails (correctly, loudly) on the missing assets.
+— is now **published** (OCR tiers + cls + layout + doc_ori + legacy scripts +
+SLANet-Plus table + both formula models, with `SHA256SUMS.txt`). This doc records
+how that bundle is assembled; a clean `-DFETCH_MODELS=ON` build fetches + verifies it.
 
 The fetch script already supports a **mirror fallback** and per-asset **SHA256
 verification**, so re-hosting only requires (a) somewhere to put the bytes and
@@ -32,15 +33,17 @@ else on disk is provenance/experimental and should be **excluded** from a releas
 | Layout | `layout/layout.onnx` (PP-DocLayoutV3) | ~124 MB |
 | Autorotate | `doc_ori.onnx` | ~6.5 MB |
 | Table (SLANet-Plus) | `table/slanext_encoder/{SLANeXt_wired_encoder.onnx, SLANeXt_wired_decoder.bin, SLANeXt_dict_infer.txt}` | ~8 MB |
-| Formula (PP-FormulaNet-S) | `formula/ppformulanet_s/{inference_trt.onnx, tokenizer.json}` | ~310 MB |
-| **Subtotal (local, no VL)** | | **~640 MB** |
-| External VL (hybrid only) | `vlm/paddleocr_vl_1_5/` (PaddleOCR-VL-1.5-0.9B) | ~1.8 GB |
+| Formula (PP-FormulaNet-S) | `formula/ppformulanet_s/{fast/{encoder,prep,step_batched}.onnx (GPU, required), inference_trt.onnx (CPU build), tokenizer.json}` | ~530 MB |
+| Formula (plus-M, Chinese) | `formula/ppformulanet_plus_m/{encoder,prep,decoder_step,decoder_step_384}.onnx` (tokenizer shared with -S) | ~850 MB |
+| **Subtotal (local, no VL)** | | **~1.7 GB** |
+| External VL (hybrid only) | `vlm/paddleocr_vl_1_6/` (PaddleOCR-VL-1.6-0.9B) | ~1.8 GB |
 
 **Deliberately excluded** (on disk but not loaded by the default pipeline; do not
 upload):
 - `formula/ppformulanet_s/*.original`, `*_patched*.onnx`, `inference.onnx`,
   `inference.pdiparams`, `inference.yml` — ~2.7 GB of pre-surgery / intermediate
-  export artifacts. Only `inference_trt.onnx` + `tokenizer.json` are loaded.
+  export artifacts. The GPU path loads the `fast/` split graphs; the CPU build
+  loads `inference_trt.onnx`; both use `tokenizer.json`.
 - `vlm/glm_ocr/` (2.5 GB) — unused alternative VLM.
 - `vlm/paddleocr_vl_1_5_nvfp4/` (790 MB) — W4A4 quant proven to destroy accuracy.
 - `table/slanet_plus.onnx`, `table/table_struct_{tatr,nemotron}*`,
@@ -75,18 +78,21 @@ upload):
    cp models/table/slanext_encoder/SLANeXt_wired_encoder.onnx /tmp/models_release/slanext_wired_encoder.onnx
    cp models/table/slanext_encoder/SLANeXt_wired_decoder.bin /tmp/models_release/slanext_wired_decoder.bin
    cp models/table/slanext_encoder/SLANeXt_dict_infer.txt /tmp/models_release/slanext_dict_infer.txt
+   cp models/formula/ppformulanet_s/fast/{encoder,prep,step_batched}.onnx /tmp/models_release/  # rename to ppformulanet_s_fast_*.onnx
    cp models/formula/ppformulanet_s/inference_trt.onnx /tmp/models_release/ppformulanet_s_trt.onnx
    cp models/formula/ppformulanet_s/tokenizer.json /tmp/models_release/ppformulanet_s_tokenizer.json
+   cp models/formula/ppformulanet_plus_m/{encoder,prep,decoder_step,decoder_step_384}.onnx /tmp/models_release/  # rename to ppformulanet_plus_m_*.onnx
    ```
+   (Authoritative list = the `fetch_verified` calls in `scripts/fetch_release_models.sh`.)
 2. **Generate the checksum manifest** the fetch script verifies against:
    ```bash
    ( cd /tmp/models_release && sha256sum * > SHA256SUMS.txt )
    ```
 3. **Create the release + upload** (requires per-turn approval; never run unprompted):
    ```bash
-   gh release create models-v3.1.0-local \
-     --repo <owner>/<repo> --title "Model bundle v3.1.0 (local pipeline)" \
-     --notes "OCR tiers + layout + SLANeXt table + PP-FormulaNet-S + PaddleOCR-VL-1.5" \
+   gh release create models-v3.0.0-ppocrv6 \
+     --repo <owner>/<repo> --title "Model weights (PP-OCRv6 pipeline, v3.0.0)" \
+     --notes "OCR tiers + layout + doc_ori + SLANet-Plus table + PP-FormulaNet-S (+ plus-M)" \
      /tmp/models_release/*
    ```
    (or `gh release upload models-v3.1.0-local /tmp/models_release/*` to add to an

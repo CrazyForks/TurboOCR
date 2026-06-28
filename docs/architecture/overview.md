@@ -29,7 +29,7 @@ Five named CUDA streams keep stages from serialising on each other:
 | caller `stream` | per call | n/a | upload + det + cls |
 | `rec_stream_` | `OcrPipeline` | `init()` (`ocr_pipeline.cpp:135`) | recognition |
 | `layout_stream_` | `OcrPipeline` | `load_layout_model()` (`ocr_pipeline.cpp:327`) | PP-DocLayoutV3 |
-| `table_stream_` | `OcrPipeline` | `load_router_models()` (`ocr_pipeline.cpp:168`/`181`) | table-cls + cell-det + SLANeXt / Nemotron |
+| `table_stream_` | `OcrPipeline` | `load_router_models()` (`ocr_pipeline.cpp:168`/`181`) | SLANet-Plus encoder + host GRU decoder |
 | `formula_stream_` | `OcrPipeline` | `load_router_models()` (`ocr_pipeline.cpp:203`) | FormulaNet enc + MTP decode |
 
 Streams are created `cudaStreamNonBlocking` and the dispatcher uses

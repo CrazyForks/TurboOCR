@@ -58,7 +58,8 @@ Sources:
 - `tests/table/test_html_reconstruct.cpp` (+ `_with_formulas`,
   `_aabb`, `_cell_matcher`)
 - `tests/table/test_slanext_dict.cpp`,
-  `test_slanext_postprocess.cpp`, `test_nemotron_postprocess.cpp`
+  `test_slanext_postprocess.cpp`, `test_slanext_postprocess_aabb.cpp`,
+  `test_cell_matcher.cpp`, `test_html_reconstruct.cpp`, `test_otsl_to_html.cpp`
 - `tests/formula/test_formula_tokenizer.cpp`,
   `test_formulanet_ar_loop.cpp`
 - `tests/lang_cls/test_script_id.cpp`

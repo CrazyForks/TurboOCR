@@ -120,8 +120,9 @@ When `class_id == 21` and tier is `Verify`,
 decision for the `turbostruct-table-cls` gate (PP-LCNet_x1_0,
 224×224, INT8). If neither class clears 0.6 and `max(scores) < 0.55`,
 `apply_verify_result` (`cua_router.cpp:357`) demotes to Text with
-reason `TableVerifyDemoted`; otherwise it forwards the wired/wireless
-verdict via `wired_hint` so the table pipeline doesn't re-classify.
+reason `TableVerifyDemoted`. (It may still emit a `wired_hint`, but that
+hint is now **inert**: the table stage is a single SLANet-Plus model with
+no wired/wireless classifier, so the downstream pipeline ignores it.)
 
 Budget per ambiguous box: ≤ 1 ms (224×224 PP-LCNet ~0.35 ms +
 ~0.05 ms fused preprocess). Text-only pages have zero verify-tier

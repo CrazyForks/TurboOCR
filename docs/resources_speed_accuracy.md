@@ -64,9 +64,9 @@ it is also the **best** tier (medium underperforms tiny on dense/handwritten pag
 per configuration:
 
 - **text** (every row): `det_tiny` + `rec_tiny` + `cls` (PP-LCNet angle) + layout (PP-DocLayoutV3)
-- **+ table (local)**: SLANeXt wired/wireless encoder+decoder + `table_cls`
+- **+ table (local)**: single SLANet-Plus encoder (GPU) + host GRU decoder
 - **+ formula (local)**: PP-FormulaNet-S via the **`ppformulanet_s`** in-process ORT-CUDA-13 backend
-- **+ VL (hybrid or VL-only)**: **PaddleOCR-VL-1.5-0.9B** on vLLM — table/formula region crops in the
+- **+ VL (hybrid or VL-only)**: **PaddleOCR-VL-1.6-0.9B** on vLLM — table/formula region crops in the
   hybrid, or the whole page in VL-only
 
 Always-on = text path (det+rec+cls). Everything else is optional. Per-model detail lives in
@@ -79,9 +79,9 @@ Always-on = text path (det+rec+cls). Everything else is optional. Per-model deta
 | angle classify | `models/cls.onnx` | PP-LCNet | 1.0 MB | `DISABLE_ANGLE_CLS` | yes |
 | doc orientation | `models/doc_ori.onnx` | PP-LCNet | 6.5 MB | file present | yes |
 | layout | `models/layout/layout.onnx` | PP-DocLayoutV3 (RT-DETR-L) | 124 MB | `DISABLE_LAYOUT` | yes |
-| table (local) | `slanext_encoder/SLANeXt_{wired,wireless}_encoder.onnx` + `_decoder.bin` + `table_cls.onnx` | SLANeXt enc(GPU)+dec(host) | 5.3 + 2.1 + 6.5 MB | `TABLE_BACKEND=slanext` | opt-in |
-| formula (local) | `formula/ppformulanet_s/inference_trt.onnx` + `tokenizer.json` | PP-FormulaNet-S (in-process ORT-CUDA-13, FAST split enc + host AR dec) | 295 MB | `FORMULA_BACKEND=ppformulanet_s` (NOT inert `formulanet`) | opt-in |
-| table / formula (external) | **PaddleOCR-VL-1.5-0.9B** (`models/vlm/paddleocr_vl_1_5`) on vLLM | VLM | 1.8 GB | `kind:openai` routing | opt-in |
+| table (local) | `slanext_encoder/SLANeXt_wired_encoder.onnx` + `_decoder.bin` + `_dict_infer.txt` | SLANet-Plus enc(GPU)+GRU dec(host) | 5.3 + 2.1 MB | `TABLE_BACKEND=slanext` | opt-in |
+| formula (local) | `formula/ppformulanet_s/fast/{encoder,prep,step_batched}.onnx` (GPU) · `inference_trt.onnx` (CPU build) + `tokenizer.json` | PP-FormulaNet-S (in-process ORT-CUDA-13, FAST split graphs) | 227 MB (fast) | `FORMULA_BACKEND=ppformulanet_s` (NOT inert `formulanet`) | opt-in |
+| table / formula (external) | **PaddleOCR-VL-1.6-0.9B** (`models/vlm/paddleocr_vl_1_6`) on vLLM | VLM | 1.8 GB | `kind:openai` routing | opt-in |
 
 OCR tiers (det+rec) trade accuracy for speed: **tiny** ~85% / ~481 img/s · **small** ~91% / ~234 ·
 **medium** ~92% / ~89 (these benchmarks use tiny). The external model is **any** OpenAI-compatible
@@ -159,7 +159,7 @@ page), all on the **same 125 docs**, scored identically (`↓` lower better, `�
 | **VL-only** (PaddleOCR-VL over the whole page) | 1.3 pg/s | **0.073** | **0.900** | **0.931** | **0.074** | **0.874** | **0.131** | **0.194** |
 
 The Local row is the shipped default **`LAYOUT_MERGE_MODE=all`** on the 125-doc subset with the **FAST**
-in-process PP-FormulaNet-S decoder (FAST == fused-graph parity: CDM 0.8052 vs 0.8053 with `PPFNS_EXACT=1`).
+in-process PP-FormulaNet-S decoder (the FAST split graphs match the fused reference: CDM ≈ 0.805).
 **`LAYOUT_MERGE_MODE=outer`** is the alternative if formula CDM is the priority — it scores CDM **0.8108**
 (formula edit 0.299, table TEDS 0.768, table struct 0.872, RO ~0.342) at a slight cost to the other
 metrics. All Local/Hybrid numbers are the 125-doc subset; the VL-only row is the PaddleOCR-VL full-page
@@ -234,11 +234,11 @@ Build recipe (clean): `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTENSORRT
 For the local pipeline, enable the formula backend + the reading-order param:
 ```bash
 FORMULA_BACKEND=ppformulanet_s \
-  FORMULA_ONNX=models/formula/ppformulanet_s/inference_trt.onnx \
+  FORMULA_ONNX=models/formula/ppformulanet_s/ \
   FORMULA_TOKENIZER=models/formula/ppformulanet_s/tokenizer.json \
   ./build/paddle_highspeed_cpp ...
-# Runs in-process on ORT-CUDA-13 (no Python, no sidecar). It fails loud if it
-# can't reach the GPU and surfaces per-region failures as formula_degraded.
-# Knobs: PPFNS_CHUNK (decode batch, default 8); PPFNS_EXACT=1 forces the fused
-# graph; FORMULA_DEVICE=cpu runs the fused graph on ORT CPU.
+# Runs in-process on ORT-CUDA-13 (no Python, no sidecar) from the fast/ split
+# graphs. It fails loud if it can't reach the GPU or the fast/ graphs are
+# missing, and surfaces per-region failures as formula_degraded.
+# Knob: PPFNS_CHUNK (decode batch, default 8).
 ```

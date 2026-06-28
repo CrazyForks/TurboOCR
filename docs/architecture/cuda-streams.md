@@ -9,7 +9,7 @@ paddle-highspeed-cpp uses **five named CUDA streams plus six CUDA events** to fa
 | caller `stream` | per request | upload + det + cls | yes |
 | `rec_stream_` | `init()` — `ocr_pipeline.cpp:135` | recognition | yes |
 | `layout_stream_` | `load_layout_model()` — `ocr_pipeline.cpp:327` | PP-DocLayoutV3 | when layout loaded |
-| `table_stream_` | `load_router_models()` — `ocr_pipeline.cpp:168` / `181` | table-cls + cell-det + SLANeXt | no |
+| `table_stream_` | `load_router_models()` — `ocr_pipeline.cpp:168` / `181` | SLANet-Plus encode + host GRU decode | no |
 | `formula_stream_` | `load_router_models()` — `ocr_pipeline.cpp:203` | FormulaNet enc + MTP | no |
 
 All four pipeline-owned streams are created with `cudaStreamNonBlocking`
@@ -44,7 +44,7 @@ flowchart TD
   end
 
   subgraph table_lane["table_stream_"]
-    TK[crop + table-cls + cell-det + SLANeXt + D2H]
+    TK[crop + SLANet-Plus encode + GRU decode + D2H]
   end
 
   subgraph formula_lane["formula_stream_"]
@@ -127,7 +127,7 @@ sequenceDiagram
   Note over worker: has_table=true; ocr_pipeline.cpp:497
   worker->>worker: table_stage_->run dispatch
   table->>table: waitEvent(det_only_event_) (inside TableStage)
-  table->>table: crop + table-cls + cell-det + SLANeXt + D2H
+  table->>table: crop + SLANet-Plus encode + GRU decode + D2H
   Note over table: cudaEventRecord(table_done_event_) — ocr_pipeline.cpp:502
   worker->>worker: TableStage internal collect joins table_stream_
 ```
@@ -139,7 +139,7 @@ caller_stream :  [upload][===det===][cls]↓det_only ↓det_event ↓crop_src
 layout_stream :                            ↓wait det_only [====layout TRT====]↓d2h
 rec_stream    :                                      ↓wait det_event [=======rec=======]↓rec_event
 worker thread :                                                          [collect][router][enqueue table][wait table_done]
-table_stream  :                                                                  ↓wait crop_src [crop][table_cls][cell_det][SLANeXt decode][D2H]↓table_done
+table_stream  :                                                                  ↓wait crop_src [crop][SLANet-Plus encode][GRU decode][D2H]↓table_done
 ```
 
 `crop_src_event_` from plan 04 was coalesced into `det_only_event_` per
@@ -206,7 +206,7 @@ sequenceDiagram
   Note over formula: cudaEventRecord(formula_done_event_)
   worker->>table: dispatch tables — ocr_pipeline.cpp:497
   table->>table: waitEvent(det_only_event_) (inside TableStage)
-  table->>table: crop + table-cls + cell-det + SLANeXt + D2H
+  table->>table: crop + SLANet-Plus encode + GRU decode + D2H
   Note over table: cudaEventRecord(table_done_event_)
   Note over worker: drop owned_by_cell formulas — ocr_pipeline.cpp:509-513
 ```
@@ -215,7 +215,7 @@ ASCII (plan 04 §4d):
 
 ```text
 worker thread :  ...[collect][router][enqueue table][enqueue formula][wait BOTH]...
-table_stream  :        ↓wait crop_src [crop][table_cls][cell_det][SLANeXt][D2H]↓table_done
+table_stream  :        ↓wait crop_src [crop][SLANet-Plus encode][GRU decode][D2H]↓table_done
 formula_stream:        ↓wait crop_src [batched crops 4×][encoder][MTP decode][D2H]↓formula_done
 ```
 
@@ -247,7 +247,7 @@ code. The only added cost is CPU-side: ≤ 50 µs.
 | Buffer | Owner | Lifetime | Plan 04 ref |
 |---|---|---|---|
 | `gpu_img` (`img_bufs_[2]`) | `OcrPipeline`, double-buffered | grow-only across calls; reused when `rec_event_` fires | §6a |
-| Crop staging (table-cls 224², SLANeXt input, formula encoder ~192×448) | per modality | pool, grow-only, lazy alloc | §6b |
+| Crop staging (SLANet-Plus input, formula encoder ~192×448) | per modality | pool, grow-only, lazy alloc | §6b |
 | Pinned host D2H (HTML / cell quads / LaTeX token IDs) | per modality | `cudaHostAlloc(cudaHostAllocDefault)` — readback, NOT write-combined | §6c |
 | Pinned upload (`h_pinned_buf_`) | `OcrPipeline` | `cudaHostAllocWriteCombined` — upload only — `ocr_pipeline.cpp:418` | n/a |
 | Per-page region caps | `kMaxTableRegionsPerPage=4`, `kMaxFormulaPerPage=32` | chunk on same stream if exceeded | §6d |

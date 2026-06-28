@@ -111,10 +111,19 @@ inline constexpr bool is_nestable_class(int class_id) noexcept {
   }
 }
 
-// If PaddleX ever reshuffles the label list, fail at build time rather
-// than silently misrouting classes through reading_priority_bucket,
-// is_nestable_class, or the oversized-image filter.
+// If PaddleX ever reshuffles the label list, fail at build time rather than
+// silently misrouting classes through reading_priority_bucket,
+// is_nestable_class, or the oversized-image filter. The full 25-label list is
+// pinned (not just the classes the post-processor references) so ANY relabel
+// or reorder is caught, not only the ones currently consumed.
+static_assert(kLayoutLabels.size() == 25, "PP-DocLayoutV3 has 25 layout classes");
+static_assert(kLayoutLabels[0]  == "abstract",          "class_id 0 must be 'abstract'");
+static_assert(kLayoutLabels[1]  == "algorithm",         "class_id 1 must be 'algorithm'");
+static_assert(kLayoutLabels[2]  == "aside_text",        "class_id 2 must be 'aside_text'");
+static_assert(kLayoutLabels[3]  == "chart",             "class_id 3 must be 'chart'");
+static_assert(kLayoutLabels[4]  == "content",           "class_id 4 must be 'content'");
 static_assert(kLayoutLabels[5]  == "display_formula",   "class_id 5 must be 'display_formula'");
+static_assert(kLayoutLabels[6]  == "doc_title",         "class_id 6 must be 'doc_title'");
 static_assert(kLayoutLabels[7]  == "figure_title",      "class_id 7 must be 'figure_title'");
 static_assert(kLayoutLabels[8]  == "footer",            "class_id 8 must be 'footer'");
 static_assert(kLayoutLabels[9]  == "footer_image",      "class_id 9 must be 'footer_image'");
@@ -124,9 +133,14 @@ static_assert(kLayoutLabels[12] == "header",            "class_id 12 must be 'he
 static_assert(kLayoutLabels[13] == "header_image",      "class_id 13 must be 'header_image'");
 static_assert(kLayoutLabels[14] == "image",             "class_id 14 must be 'image'");
 static_assert(kLayoutLabels[15] == "inline_formula",    "class_id 15 must be 'inline_formula'");
+static_assert(kLayoutLabels[16] == "number",            "class_id 16 must be 'number'");
 static_assert(kLayoutLabels[17] == "paragraph_title",   "class_id 17 must be 'paragraph_title'");
 static_assert(kLayoutLabels[18] == "reference",         "class_id 18 must be 'reference'");
 static_assert(kLayoutLabels[19] == "reference_content", "class_id 19 must be 'reference_content'");
+static_assert(kLayoutLabels[20] == "seal",              "class_id 20 must be 'seal'");
+static_assert(kLayoutLabels[21] == "table",             "class_id 21 must be 'table'");
+static_assert(kLayoutLabels[22] == "text",              "class_id 22 must be 'text'");
+static_assert(kLayoutLabels[23] == "vertical_text",     "class_id 23 must be 'vertical_text'");
 static_assert(kLayoutLabels[24] == "vision_footnote",   "class_id 24 must be 'vision_footnote'");
 
 // Reading direction for a layout cell or for the page as a whole.

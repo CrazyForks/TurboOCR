@@ -16,11 +16,11 @@ Two ways to run
   Attached (default): start the server yourself with the tier's env, then
       bench_ocr_tiers.py --tiers medium
   Spawned: let the bench restart the server per tier (needs the built binary)
-      bench_ocr_tiers.py --spawn build/paddle_highspeed_cpp --tiers medium,small,tiny
+      bench_ocr_tiers.py --spawn build/turboocr-server --tiers medium,small,tiny
 
 The v5 comparison resolves its paths from env overrides, e.g.
   V5_DET_ONNX=models/det.onnx V5_REC_ONNX=models/rec.onnx \
-      bench_ocr_tiers.py --spawn build/paddle_highspeed_cpp --tiers v5,medium
+      bench_ocr_tiers.py --spawn build/turboocr-server --tiers v5,medium
 """
 from __future__ import annotations
 

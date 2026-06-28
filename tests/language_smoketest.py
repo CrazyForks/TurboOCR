@@ -38,7 +38,7 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 
 REPO = Path(__file__).resolve().parent.parent
-SERVER_BIN = REPO / "build" / "paddle_highspeed_cpp"
+SERVER_BIN = REPO / "build" / "turboocr-server"
 DOWNLOAD_SCRIPT = REPO / "scripts" / "download_models.sh"
 PORT = int(os.environ.get("SMOKE_PORT", "8799"))
 

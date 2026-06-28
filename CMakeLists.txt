@@ -395,18 +395,18 @@ if(USE_CPU_ONLY)
     add_library(turbo_ocr::cpu ALIAS turbo_ocr_cpu)
 
     # CPU HTTP + gRPC server
-    add_executable(paddle_cpu_server
+    add_executable(turboocr-cpu-server
         src/server/cpu_main.cpp
         src/routes/common_routes.cpp
         src/routes/pdf_routes.cpp
         ${PROTO_GEN_CC}
         ${GRPC_GEN_CC}
     )
-    target_include_directories(paddle_cpu_server PRIVATE
+    target_include_directories(turboocr-cpu-server PRIVATE
         ${PROTO_GEN_DIR}
         ${CMAKE_SOURCE_DIR}/third_party/cli11
     )
-    target_link_libraries(paddle_cpu_server PRIVATE
+    target_link_libraries(turboocr-cpu-server PRIVATE
         turbo_ocr_cpu
         Drogon::Drogon
         ${GRPC_LIBRARIES}
@@ -498,7 +498,7 @@ else()
         src/pdf/pdf_text_layer.cpp
         src/pdf/page_image_encoder.cpp
         # CUA router + table + formula stages (referenced by ocr_pipeline's
-        # dispatch_router_). Pulled in here so paddle_highspeed_cpp links;
+        # dispatch_router_). Pulled in here so turboocr-server links;
         # the operator's prior in-progress integration left these source
         # files on disk but not on the build target.
         src/router/cua_router.cpp
@@ -591,7 +591,7 @@ else()
     )
 
     # GPU HTTP + gRPC server (shared pipeline pool)
-    add_executable(paddle_highspeed_cpp
+    add_executable(turboocr-server
         src/server/main.cpp
         src/routes/common_routes.cpp
         src/routes/image_routes.cpp
@@ -599,16 +599,31 @@ else()
         ${PROTO_GEN_CC}
         ${GRPC_GEN_CC}
     )
-    target_include_directories(paddle_highspeed_cpp PRIVATE
+    target_include_directories(turboocr-server PRIVATE
         ${PROTO_GEN_DIR}
         ${CMAKE_SOURCE_DIR}/third_party/cli11
     )
-    target_link_libraries(paddle_highspeed_cpp PRIVATE
+    target_link_libraries(turboocr-server PRIVATE
         turbo_ocr_gpu
         Drogon::Drogon
         ${GRPC_LIBRARIES}
         protobuf::libprotobuf
     )
+    # Bake the TensorRT lib dir into the binary's RPATH so a bare `cmake && make`
+    # (with -DTENSORRT_DIR) runs with no LD_LIBRARY_PATH. nvinfer dlopen()s
+    # libnvinfer_builder_resource_sm*.so by bare name at first engine build;
+    # without this it aborts cryptically. (onnxruntime's dir is auto-added to the
+    # rpath because it's linked by absolute path; TRT is linked via
+    # link_directories + bare names, which does NOT contribute to rpath.)
+    #
+    # --disable-new-dtags is LOAD-BEARING: it forces DT_RPATH instead of the
+    # linker-default DT_RUNPATH. DT_RUNPATH is NOT consulted when a dependency
+    # library (libnvinfer) dlopen()s another lib by bare name, so the resource
+    # lib would not be found; DT_RPATH IS searched transitively for such loads.
+    set_target_properties(turboocr-server PROPERTIES
+        BUILD_RPATH "${TENSORRT_DIR}/lib"
+        INSTALL_RPATH "${TENSORRT_DIR}/lib;${CMAKE_SOURCE_DIR}/third_party/onnxruntime/lib")
+    target_link_options(turboocr-server PRIVATE "-Wl,--disable-new-dtags")
 
     # Dev/CI-only drivers — EXCLUDE_FROM_ALL so the default `make` (and the Docker image build)
     # never compiles them into the production image; build explicitly when needed.
@@ -694,10 +709,10 @@ if(_ipo_ok AND CMAKE_BUILD_TYPE STREQUAL "Release")
     set_property(TARGET turbo_ocr_common PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
     if(USE_CPU_ONLY)
         set_property(TARGET turbo_ocr_cpu PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
-        set_property(TARGET paddle_cpu_server PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+        set_property(TARGET turboocr-cpu-server PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
     else()
         set_property(TARGET turbo_ocr_gpu PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
-        set_property(TARGET paddle_highspeed_cpp PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+        set_property(TARGET turboocr-server PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
     endif()
 elseif(NOT _ipo_ok)
     message(STATUS "IPO/LTO not supported by this toolchain: ${_ipo_err}")
@@ -706,9 +721,9 @@ endif()
 # --- Install rules --------------------------------------------------------
 # Minimal layout so `cmake --install build --prefix /usr/local` works.
 if(USE_CPU_ONLY)
-    install(TARGETS paddle_cpu_server RUNTIME DESTINATION bin)
+    install(TARGETS turboocr-cpu-server RUNTIME DESTINATION bin)
 else()
-    install(TARGETS paddle_highspeed_cpp RUNTIME DESTINATION bin)
+    install(TARGETS turboocr-server RUNTIME DESTINATION bin)
 endif()
 install(DIRECTORY models/ DESTINATION share/turbo-ocr/models OPTIONAL)
 install(DIRECTORY scripts/ DESTINATION share/turbo-ocr/scripts USE_SOURCE_PERMISSIONS)
@@ -734,8 +749,8 @@ if(FETCH_MODELS)
     )
     add_custom_target(fetch_models ALL DEPENDS ${MODELS_SENTINEL})
     if(USE_CPU_ONLY)
-        add_dependencies(paddle_cpu_server fetch_models)
+        add_dependencies(turboocr-cpu-server fetch_models)
     else()
-        add_dependencies(paddle_highspeed_cpp fetch_models)
+        add_dependencies(turboocr-server fetch_models)
     endif()
 endif()

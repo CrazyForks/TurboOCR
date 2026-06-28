@@ -139,7 +139,7 @@ def launch_server(a, cfg, routing_path: Path, log_path: Path, pool, ext) -> subp
         env["TURBO_ROUTING_CONFIG"] = str(routing_path)
     elif cfg["route_table"] == "slanext":
         env["TABLE_BACKEND"] = "slanext"  # local SLANeXt via env-synth (FORMULA_BACKEND already in env)
-    args = [str(REPO / "build" / "paddle_highspeed_cpp"),
+    args = [str(REPO / "build" / "turboocr-server"),
             "--http-port", str(a.port), "--grpc-port", str(a.grpc_port)] + cfg["flags"]
     log = open(log_path, "w")
     return subprocess.Popen(args, env=env, stdout=log, stderr=subprocess.STDOUT, cwd=str(REPO))

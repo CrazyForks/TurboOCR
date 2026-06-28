@@ -163,14 +163,14 @@ cmake -B build -DTENSORRT_DIR="$TENSORRT_LINK"
 cmake --build build -j"$(nproc)"
 
 info "Build complete:"
-ls -lh build/paddle_highspeed_cpp 2>/dev/null
+ls -lh build/turboocr-server 2>/dev/null
 
 # ─── Step 4: Verify ─────────────────────────────────────────────────────────
 
 info "Checking linked libraries..."
-if ldd build/paddle_highspeed_cpp | grep -q "not found"; then
+if ldd build/turboocr-server | grep -q "not found"; then
     warn "Some libraries not found:"
-    ldd build/paddle_highspeed_cpp | grep "not found"
+    ldd build/turboocr-server | grep "not found"
     warn "You may need to run: export LD_LIBRARY_PATH=/usr/local/tensorrt/lib:\$LD_LIBRARY_PATH"
 else
     info "All libraries found"
@@ -183,7 +183,7 @@ info "Installation complete!"
 echo ""
 echo "  Run the server:"
 echo "    cd $PROJECT_DIR"
-echo "    ./build/paddle_highspeed_cpp"
+echo "    ./build/turboocr-server"
 echo ""
 echo "  First startup will build TensorRT engines from ONNX models (~2-3 min)."
 echo "  Engines are cached in models/ for subsequent runs."

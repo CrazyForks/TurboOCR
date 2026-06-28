@@ -43,6 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     wget \
     curl \
+    libcurl4-openssl-dev \
     gettext-base \
     && rm -rf /var/lib/apt/lists/*
 
@@ -148,4 +149,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
     CMD curl -sf http://localhost:8000/health || exit 1
 
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
-CMD ["./build/paddle_highspeed_cpp"]
+CMD ["./build/turboocr-server"]

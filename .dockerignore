@@ -12,16 +12,12 @@ tests/test_data/
 benchmark/data/
 benchmark/results/
 .venv*/
-models/*.engine
-models/*.cache
-models/calibration_data/
-# .trt and .onnx files are included (models needed at runtime)
+# Models are fetched from the GitHub Release at build time (RUN
+# fetch_release_models.sh) — neither Dockerfile COPYs models/, so excluding the
+# whole tree just keeps the build context small (no GB of unused .onnx shipped).
+models/
 *.log
 *.trt
-
-# Language bundles are fetched at container start — never baked in.
-# Latin ships as flat-layout models/{det,rec,cls}.onnx + keys.txt.
-models/rec/
 LICENSE
 README.md
 .clang-format
@@ -29,3 +25,17 @@ tests/benchmark/
 tests/integration/
 tests/regression/
 tests/fixtures/
+
+# Local artifacts never COPYed by docker/Dockerfile.{gpu,cpu} (models are fetched
+# at build time, not copied). Excluding them keeps the build context lean.
+models.bak/
+.trt_cache/
+.trt_cache.bak/
+model.cache
+model.cache.bak
+build-cpu/
+result/
+predeploy/
+sdk/
+uploads/
+custom_models/

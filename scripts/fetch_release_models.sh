@@ -102,21 +102,52 @@ for lang in "${LANGS[@]}"; do
   fetch_verified "dict-${lang}.txt"  "$OUT/rec/${lang}/dict.txt"
 done
 
-# PP-LCNet_x1_0_doc_ori (~6.5 MB) — autorotate (?autorotate=1). Lives on the
-# pdf-page-images variant models release, not the base bundle; sha pinned here
-# so the asset can't change under us. Recipe: scripts/export_doc_ori.py.
+# Table structure — SLANet-Plus (enable with TABLE_BACKEND=slanext). ~8 MB.
+mkdir -p "$OUT/table/slanext_encoder"
+fetch_verified "slanext_wired_encoder.onnx" "$OUT/table/slanext_encoder/SLANeXt_wired_encoder.onnx"
+fetch_verified "slanext_wired_decoder.bin"  "$OUT/table/slanext_encoder/SLANeXt_wired_decoder.bin"
+fetch_verified "slanext_dict_infer.txt"     "$OUT/table/slanext_encoder/SLANeXt_dict_infer.txt"
+
+# Formula — PP-FormulaNet-S. GPU uses the fast/ split graphs (the only GPU path);
+# the CPU server (turboocr-cpu-server) uses the fused inference_trt.onnx. Ship both
+# + the shared tokenizer so either server variant can recognize formulas.
+mkdir -p "$OUT/formula/ppformulanet_s/fast"
+fetch_verified "ppformulanet_s_fast_encoder.onnx"      "$OUT/formula/ppformulanet_s/fast/encoder.onnx"
+fetch_verified "ppformulanet_s_fast_prep.onnx"         "$OUT/formula/ppformulanet_s/fast/prep.onnx"
+fetch_verified "ppformulanet_s_fast_step_batched.onnx" "$OUT/formula/ppformulanet_s/fast/step_batched.onnx"
+fetch_verified "ppformulanet_s_trt.onnx"               "$OUT/formula/ppformulanet_s/inference_trt.onnx"
+fetch_verified "ppformulanet_s_tokenizer.json"         "$OUT/formula/ppformulanet_s/tokenizer.json"
+
+# Formula (Chinese swap) — PP-FormulaNet_plus-M (FORMULA_BACKEND=ppformulanet_plus_m).
+# Split graphs live in the model dir (no fast/ subdir); decoder_step_384.onnx is the
+# length-bucket for faster Chinese. Tokenizer is byte-identical to -S, so reuse it.
+mkdir -p "$OUT/formula/ppformulanet_plus_m"
+fetch_verified "ppformulanet_plus_m_encoder.onnx"          "$OUT/formula/ppformulanet_plus_m/encoder.onnx"
+fetch_verified "ppformulanet_plus_m_prep.onnx"             "$OUT/formula/ppformulanet_plus_m/prep.onnx"
+fetch_verified "ppformulanet_plus_m_decoder_step.onnx"     "$OUT/formula/ppformulanet_plus_m/decoder_step.onnx"
+fetch_verified "ppformulanet_plus_m_decoder_step_384.onnx" "$OUT/formula/ppformulanet_plus_m/decoder_step_384.onnx"
+cp "$OUT/formula/ppformulanet_s/tokenizer.json" "$OUT/formula/ppformulanet_plus_m/tokenizer.json"
+
+# PP-LCNet_x1_0_doc_ori (~6.5 MB) — OPTIONAL autorotate (?autorotate=1). Lives on
+# the pdf-page-images variant release, not the base bundle; sha pinned here so the
+# asset can't change under us. Recipe: scripts/export_doc_ori.py. Because
+# autorotate is opt-in and this asset comes from a SEPARATE (older) release, a
+# failure here must NOT abort the whole fetch — every core model already succeeded
+# above. Warn and continue so a vanished/renamed doc_ori release can't break the
+# text/layout/table/formula cold start.
 DOC_ORI_RELEASE_URL="${DOC_ORI_RELEASE_URL:-https://github.com/aiptimizer/TurboOCR/releases/download/models-v2.4.0-pdf-page-images}"
 DOC_ORI_RELEASE_URL_FALLBACK="${DOC_ORI_RELEASE_URL_FALLBACK:-}"
 DOC_ORI_SHA256="96e898f047a0e460ba0652e9afb8c874e53872821cfd7a3fec53a5ab62df92f0"
-echo "  doc_ori.onnx -> $OUT/doc_ori.onnx"
-fetch_asset "doc_ori.onnx" "$OUT/doc_ori.onnx.part" \
-  "$DOC_ORI_RELEASE_URL" "$DOC_ORI_RELEASE_URL_FALLBACK"
-if [[ "$(sha256sum "$OUT/doc_ori.onnx.part" | awk '{print $1}')" != "$DOC_ORI_SHA256" ]]; then
-  echo "    ERROR: sha256 mismatch for doc_ori.onnx" >&2
+echo "  doc_ori.onnx -> $OUT/doc_ori.onnx (optional)"
+if fetch_asset "doc_ori.onnx" "$OUT/doc_ori.onnx.part" \
+       "$DOC_ORI_RELEASE_URL" "$DOC_ORI_RELEASE_URL_FALLBACK" \
+   && [[ "$(sha256sum "$OUT/doc_ori.onnx.part" | awk '{print $1}')" == "$DOC_ORI_SHA256" ]]; then
+  mv "$OUT/doc_ori.onnx.part" "$OUT/doc_ori.onnx"
+else
+  echo "    WARN: doc_ori.onnx unavailable or checksum mismatch — skipping." >&2
+  echo "          autorotate (?autorotate=1) will be disabled; core pipeline unaffected." >&2
   rm -f "$OUT/doc_ori.onnx.part"
-  exit 1
 fi
-mv "$OUT/doc_ori.onnx.part" "$OUT/doc_ori.onnx"
 
 rm -f "$SUMS_FILE"  # not shipped in image
 echo ""

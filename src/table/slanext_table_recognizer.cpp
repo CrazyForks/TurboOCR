@@ -4,6 +4,7 @@
 #include <array>
 #include <climits>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <string>
 
@@ -52,8 +53,21 @@ std::unique_ptr<SlanextEncSplit> build_enc(const std::string &enc_onnx,
 } // namespace
 
 bool SlanextTableRecognizer::load() {
-  const std::string enc = env_or("TABLE_SLANEXT_ENCODER_ONNX", "");
-  if (enc.empty()) return false;
+  // Auto-resolve the encoder shipped by the release bundle / Docker image so
+  // TABLE_BACKEND=slanext works out of the box; an explicit env still wins.
+  static constexpr const char *kDefaultEncoder =
+      "models/table/slanext_encoder/SLANeXt_wired_encoder.onnx";
+  std::string enc = env_or("TABLE_SLANEXT_ENCODER_ONNX", "");
+  if (enc.empty()) {
+    if (std::filesystem::exists(kDefaultEncoder)) {
+      enc = kDefaultEncoder;
+    } else {
+      std::cerr << "[slanext] table encoder not found: set "
+                   "TABLE_SLANEXT_ENCODER_ONNX (the release ships it at "
+                << kDefaultEncoder << ")\n";
+      return false;
+    }
+  }
   const std::string dec = env_or("TABLE_SLANEXT_DECODER_BIN", default_decoder_bin(enc));
   const std::string dict = env_or("TABLE_SLANEXT_DICT", default_dict(enc));
   wired_ = build_enc(enc, dec, dict);

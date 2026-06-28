@@ -4,7 +4,7 @@
 # Build:  docker build -f docker/Dockerfile.cpu -t turbo-ocr-cpu .
 # Run:    docker run -p 8000:8000 -v ./models:/app/models turbo-ocr-cpu
 #
-# Produces:  /app/build_cpu/paddle_cpu_server  (HTTP server)
+# Produces:  /app/build_cpu/turboocr-cpu-server  (HTTP server)
 #
 # Models (.onnx) must be in /app/models/:
 #   det.onnx, rec.onnx, cls.onnx, keys.txt
@@ -143,4 +143,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -sf http://localhost:8000/health || exit 1
 
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
-CMD ["./build_cpu/paddle_cpu_server"]
+CMD ["./build_cpu/turboocr-cpu-server"]

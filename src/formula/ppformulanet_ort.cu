@@ -90,8 +90,8 @@ __global__ void accum_kv_slot(float *dst, const float *src, const int64_t *pos,
 }
 }  // namespace
 
-PPFormulaNetOrt::PPFormulaNetOrt(std::string backend_label, bool force_fused)
-    : label_(std::move(backend_label)), force_fused_(force_fused) {}
+PPFormulaNetOrt::PPFormulaNetOrt(std::string backend_label)
+    : label_(std::move(backend_label)) {}
 PPFormulaNetOrt::~PPFormulaNetOrt() noexcept {
   free_buffers();
   if (stream_) cudaStreamDestroy(stream_);
@@ -99,7 +99,6 @@ PPFormulaNetOrt::~PPFormulaNetOrt() noexcept {
 
 bool PPFormulaNetOrt::alloc_buffers() {
   host_in_.assign((size_t)MAX_B * S * S, 0.0f);
-  if (cpu_) return true;  // CPU path: host tensors only, no device buffers/stream
   auto m = [](void **p, size_t n) { return cudaMalloc(p, n) == cudaSuccess; };
   if (!m((void **)&d_x_, (size_t)MAX_B * S * S * sizeof(float))) return false;
   if (fast_) {  // static-KV host-loop scratch
@@ -148,18 +147,13 @@ bool PPFormulaNetOrt::load_model_dir(const std::string &model_dir) {
   fs::path mp(model_dir);
   fs::path base = fs::is_directory(mp) ? mp : mp.parent_path();
   fs::path fast = base / "fast";
-  // Device select: FORMULA_DEVICE=cpu -> ORT CPUExecutionProvider (no CUDA, no Python).
-  // Otherwise GPU, where FAST (host-loop) is the default and matches the fused CDM
-  // exactly (0.811) at ~8x speed; PPFNS_EXACT=1 forces the fused graph on GPU.
-  const char *dev = std::getenv("FORMULA_DEVICE");
-  std::string devl = dev ? dev : "";
-  std::transform(devl.begin(), devl.end(), devl.begin(),
-                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  cpu_ = (devl == "cpu");
-  fast_ = !cpu_ && !force_fused_ && std::getenv("PPFNS_EXACT") == nullptr;
-  plusm_ = fast_ && (label_ == "ppformulanet_plus_m");  // 6-layer MBart fast host-loop
+  // GPU FAST is the only path: the host-loop matches the fused CDM exactly (0.811)
+  // at ~8x speed. There is no fused EXACT mode and no FORMULA_DEVICE=cpu here — CPU
+  // formula runs through CpuFormulaRecognizer instead.
+  fast_ = true;
+  plusm_ = (label_ == "ppformulanet_plus_m");  // 6-layer MBart fast host-loop
   fast_dir_ = fast.string();
-  if (!cpu_ && cudaStreamCreate(&stream_) != cudaSuccess) {
+  if (cudaStreamCreate(&stream_) != cudaSuccess) {
     std::cerr << "[PPFormulaNetOrt] FATAL: CUDA stream create failed\n";
     return false;
   }
@@ -167,73 +161,49 @@ bool PPFormulaNetOrt::load_model_dir(const std::string &model_dir) {
     std::cerr << "[PPFormulaNetOrt] FATAL: buffer alloc failed\n";
     return false;
   }
-  bool ok;
-  if (cpu_) {
-    // CPU: the fused graph on ORT-CPU with host tensors (the FAST host loop needs CUDA).
-    ok = fused_.load_cpu((base / "inference_trt.onnx").string());
-    std::cerr << "[PPFormulaNetOrt] CPU decode path (fused graph, ORT CPUExecutionProvider)\n";
-  } else if (fast_) {
-    // FAST: encoder + cross-KV prep + static-KV step, all ORT-CUDA-13 on our stream,
-    // driven by a host AR loop. The encoder is bit-exact to the fused in-graph encoder.
-    // These split graphs are locally generated (scratchpad/fastdec/batched_step.py) and
-    // are NOT in the committed bundle, so a fresh deploy may ship only the fused
-    // inference_trt.onnx. If any fast/ file is missing or fails to load, fall back to the
-    // fused graph (slower) with a LOUD warning rather than hard-failing boot.
-    // plus-M ships its split graphs in the model dir (encoder/prep/decoder_step.onnx);
-    // PP-FormulaNet-S keeps them in a fast/ subdir (encoder/prep/step_batched.onnx).
-    const fs::path enc_p  = plusm_ ? base / "encoder.onnx"      : fast / "encoder.onnx";
-    const fs::path prep_p = plusm_ ? base / "prep.onnx"         : fast / "prep.onnx";
-    const fs::path step_p = plusm_ ? base / "decoder_step.onnx" : fast / "step_batched.onnx";
-    const bool have_all =
-        fs::exists(enc_p) && fs::exists(prep_p) && fs::exists(step_p);
-    const bool fast_loaded =
-        have_all && enc_.load(enc_p.string(), 0, stream_, false)
-        && prep_.load(prep_p.string(), 0, stream_, false)
-        // NOTE: ORT CUDA-graph capture was tried for the plus-M step (enable_cuda_graph)
-        // and does NOT work — it freezes the step's pos-dependent KV scatter at the first
-        // step's position, so every replay writes to the wrong slot (0/30 correct), and it
-        // gave no speedup anyway (the step is compute/memory-bound, not launch-bound). We
-        // keep the persistent-binding run_graph() path (correct + slightly faster) but do
-        // NOT enable cuda-graph. The real per-step lever is length-bucketing the KV window.
-        && step_.load(step_p.string(), 0, stream_, false, /*enable_cuda_graph=*/false);
-    if (fast_loaded) {
-      ok = true;
-      // plus-M length-bucket: load the optional 384-KV-window step. Absent (e.g. fresh
-      // deploy) -> decode_continuous_plusm transparently uses the 1056 window for all crops.
-      if (plusm_) {
-        const fs::path short_p = base / "decoder_step_384.onnx";
-        if (fs::exists(short_p) && step_short_.load(short_p.string(), 0, stream_, false))
-          std::cerr << "[PPFormulaNetOrt] plus-M length-bucket: 384-KV step loaded\n";
-        else
-          std::cerr << "[PPFormulaNetOrt] plus-M length-bucket: decoder_step_384.onnx absent — "
-                       "1056 window for all crops\n";
-      }
-      std::cerr << "[PPFormulaNetOrt] FAST decode path ("
-                << (plusm_ ? "plus-M 6-layer MBart" : "PP-FormulaNet-S")
-                << " encoder+prep+step host-loop)\n";
-    } else if (plusm_) {
-      // plus-M's split graphs are REQUIRED. Their absence means FORMULA_ONNX points at the
-      // wrong model dir (most likely the -S dir) — the generic fused fallback below would
-      // then silently load whatever inference_trt.onnx lives there (the WRONG model) and
-      // emit perfectly valid wrong-language LaTeX, which formula_degraded cannot catch.
-      // Fail loudly instead of swapping in the wrong model (no-silent-failure).
-      std::cerr << "[PPFormulaNetOrt] FATAL: plus-M FAST graphs missing under " << base.string()
-                << " (need encoder.onnx + prep.onnx + decoder_step.onnx). FORMULA_ONNX likely "
-                   "points at the wrong model directory — refusing to start with the wrong "
-                   "formula model rather than silently serving it.\n";
-      return false;
-    } else {
-      std::cerr << "[PPFormulaNetOrt] WARNING: FAST artifacts missing in " << fast.string()
-                << " — falling back to fused graph (slower); regenerate with "
-                   "scratchpad/fastdec/batched_step.py\n";
-      fast_ = false;
-      ok = fused_.load((base / "inference_trt.onnx").string(), 0, stream_);
-    }
-  } else {
-    // EXACT (PPFNS_EXACT=1): the fused graph (encoder + AR Loop) batched on ORT-CUDA.
-    ok = fused_.load((base / "inference_trt.onnx").string(), 0, stream_);
+  // FAST: encoder + cross-KV prep + static-KV step, all ORT-CUDA-13 on our stream,
+  // driven by a host AR loop. The encoder is bit-exact to the fused in-graph encoder.
+  // plus-M ships its split graphs in the model dir (encoder/prep/decoder_step.onnx);
+  // PP-FormulaNet-S keeps them in a fast/ subdir (encoder/prep/step_batched.onnx).
+  const fs::path enc_p  = plusm_ ? base / "encoder.onnx"      : fast / "encoder.onnx";
+  const fs::path prep_p = plusm_ ? base / "prep.onnx"         : fast / "prep.onnx";
+  const fs::path step_p = plusm_ ? base / "decoder_step.onnx" : fast / "step_batched.onnx";
+  const bool have_all =
+      fs::exists(enc_p) && fs::exists(prep_p) && fs::exists(step_p);
+  const bool fast_loaded =
+      have_all && enc_.load(enc_p.string(), 0, stream_, false)
+      && prep_.load(prep_p.string(), 0, stream_, false)
+      // NOTE: ORT CUDA-graph capture was tried for the plus-M step (enable_cuda_graph)
+      // and does NOT work — it freezes the step's pos-dependent KV scatter at the first
+      // step's position, so every replay writes to the wrong slot (0/30 correct), and it
+      // gave no speedup anyway (the step is compute/memory-bound, not launch-bound). We
+      // keep the persistent-binding run_graph() path (correct + slightly faster) but do
+      // NOT enable cuda-graph. The real per-step lever is length-bucketing the KV window.
+      && step_.load(step_p.string(), 0, stream_, false, /*enable_cuda_graph=*/false);
+  if (!fast_loaded) {
+    // The FAST split graphs are REQUIRED — there is no fused fallback. Missing/unloadable
+    // graphs mean an incomplete deploy (or FORMULA_ONNX pointing at the wrong model dir);
+    // fail loudly rather than silently serving the wrong/slower model (no-silent-failure).
+    std::cerr << "[PPFormulaNetOrt] FATAL: FAST graphs missing/unloadable under "
+              << (plusm_ ? base.string() : fast.string())
+              << " (need encoder.onnx + prep.onnx + "
+              << (plusm_ ? "decoder_step.onnx" : "step_batched.onnx")
+              << "). The fast/ bundle must ship with the model.\n";
+    return false;
   }
-  if (!ok) { std::cerr << "[PPFormulaNetOrt] FATAL: formula model load failed under " << base << '\n'; return false; }
+  // plus-M length-bucket: load the optional 384-KV-window step. Absent (e.g. fresh
+  // deploy) -> decode_continuous_plusm transparently uses the 1056 window for all crops.
+  if (plusm_) {
+    const fs::path short_p = base / "decoder_step_384.onnx";
+    if (fs::exists(short_p) && step_short_.load(short_p.string(), 0, stream_, false))
+      std::cerr << "[PPFormulaNetOrt] plus-M length-bucket: 384-KV step loaded\n";
+    else
+      std::cerr << "[PPFormulaNetOrt] plus-M length-bucket: decoder_step_384.onnx absent — "
+                   "1056 window for all crops\n";
+  }
+  std::cerr << "[PPFormulaNetOrt] FAST decode path ("
+            << (plusm_ ? "plus-M 6-layer MBart" : "PP-FormulaNet-S")
+            << " encoder+prep+step host-loop)\n";
   ready_ = static_cast<bool>(tok_);  // ready once both model+tokenizer loaded
   return true;
 }
@@ -241,7 +211,7 @@ bool PPFormulaNetOrt::load_model_dir(const std::string &model_dir) {
 bool PPFormulaNetOrt::load_tokenizer(const std::string &path) {
   tok_ = FormulaTokenizer::load(path);
   if (!tok_) { std::cerr << "[PPFormulaNetOrt] tokenizer load failed: " << path << '\n'; return false; }
-  if (fast_ ? step_.ready() : fused_.ready()) ready_ = true;
+  if (step_.ready()) ready_ = true;
   return true;
 }
 
@@ -693,8 +663,7 @@ PPFormulaNetOrt::run(const GpuImage &page, const std::vector<Box> &boxes, cudaSt
         std::memcpy(tmp.data() + (size_t)r * w * 3, sp + (size_t)r * page.step, (size_t)w * 3);
       formula_preprocess_one(tmp.data(), w, h, host_in_.data() + (size_t)i * S * S);
     }
-    if (!cpu_)
-      cudaMemcpyAsync(d_x_, host_in_.data(), (size_t)B * S * S * sizeof(float), cudaMemcpyHostToDevice, stream_);
+    cudaMemcpyAsync(d_x_, host_in_.data(), (size_t)B * S * S * sizeof(float), cudaMemcpyHostToDevice, stream_);
     std::vector<std::vector<int64_t>> seqs(B);   // clean content tokens per crop
     bool chunk_ok = true;                        // false -> mark this chunk's crops failed
     if (fast_) {
@@ -717,28 +686,6 @@ PPFormulaNetOrt::run(const GpuImage &page, const std::vector<Box> &boxes, cudaSt
         for (int i = 0; i < B; ++i) out[s0 + i].ok = false; continue;
       }
       chunk_ok = decode_chunk(B, seqs);
-    } else {
-      // EXACT (GPU) or CPU: batched fused graph. CPU binds the HOST crops directly;
-      // GPU syncs the H2D first then binds d_x_.
-      const float *xin;
-      if (cpu_) {
-        xin = host_in_.data();
-      } else {
-        cudaStreamSynchronize(stream_);  // fused reads d_x_
-        xin = d_x_;
-      }
-      std::vector<int64_t> flat; int64_t L = 0;
-      if (!fused_.run_tokens("x", "fetch_name_0", xin, B, flat, L)) {
-        std::cerr << "[PPFormulaNetOrt] fused decode failed\n";
-        for (int i = 0; i < B; ++i) out[s0 + i].ok = false; continue;
-      }
-      const int64_t EOS = tok_->eos_id();
-      for (int i = 0; i < B; ++i)
-        for (int64_t j = 0; j < L; ++j) {
-          int64_t t = flat[(size_t)i * L + j];
-          if (t == EOS) break;
-          if (t != 0 && t != 1) seqs[i].push_back(t);  // drop BOS(0)/pad(1)
-        }
     }
     for (int i = 0; i < B; ++i) {
       std::string latex = tok_->decode(seqs[i], /*post_process=*/false);

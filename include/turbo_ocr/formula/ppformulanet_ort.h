@@ -18,36 +18,24 @@ namespace turbo_ocr::formula {
 // Pure in-process PP-FormulaNet-S recognizer running ONNX Runtime (no TensorRT
 // engines, no Python sidecar, no socket/GIL). It loads .onnx models only.
 //
-// Three modes, selected at load:
-//   * GPU FAST (default): ORT-CUDA-13 encoder.onnx -> cross-KV prep.onnx -> a
-//     static-KV single-step decoder (step_batched.onnx, 1056-token KV buffer)
-//     driven by a host AR loop with on-GPU argmax + KV ping-pong. Matches the
-//     fused reference EXACTLY (CDM 0.811) and is ~8x faster than the fused Loop.
-//   * GPU EXACT (PPFNS_EXACT=1): the fused graph inference_trt.onnx (encoder +
-//     growable-KV AR Loop) run batched on ORT-CUDA-13. The literal reference, kept
-//     as a fallback; slower (Loop-bound).
-//   * CPU (FORMULA_DEVICE=cpu): the fused graph on ORT's CPUExecutionProvider with
-//     host tensors only -- no CUDA decode buffers, no kernels, no Python. (The FAST
-//     host loop needs CUDA kernels, so CPU uses the fused graph.)
+// GPU FAST is the ONLY path: ORT-CUDA-13 encoder.onnx -> cross-KV prep.onnx -> a
+// static-KV single-step decoder (step_batched.onnx, 1056-token KV buffer) driven
+// by a host AR loop with on-GPU argmax + KV ping-pong. Matches the fused reference
+// EXACTLY (CDM 0.811) and is ~8x faster than the fused Loop. The slow fused graph
+// (inference_trt.onnx) is no longer used here — there is no EXACT mode and no fused
+// fallback; on CPU use CpuFormulaRecognizer instead.
 //
-// FAST/EXACT models live in <model_parent>/fast/ (encoder.onnx, prep.onnx,
-// step_batched.onnx) and <model_parent>/inference_trt.onnx (the fused graph).
-// The fast/ split graphs are locally generated (scratchpad/fastdec/batched_step.py)
-// and may be absent from a fresh deploy: if FAST is selected but any fast/ file is
-// missing/unloadable, the loader falls back to the fused graph (fast_=false) with a
-// LOUD warning rather than aborting boot. See docs/models/formula.md.
+// The FAST split graphs live in <model_parent>/fast/ (encoder.onnx, prep.onnx,
+// step_batched.onnx); plus-M ships them in the model dir itself. They are REQUIRED:
+// if any is missing/unloadable, load fails LOUDLY (no fused fallback) — the fast/
+// bundle must ship with the model. See docs/models/formula.md.
 class PPFormulaNetOrt final : public IFormulaRecognizer {
 public:
-  // backend_label names the engine in logs/routing; force_fused makes load_model_dir
-  // always take the fused EXACT path (no FAST host-loop). Defaults reproduce the
-  // original PP-FormulaNet-S behavior exactly. PP-FormulaNet_plus-M reuses this class
-  // via ("ppformulanet_plus_m", force_fused=FALSE): it ships its OWN split graphs
-  // (encoder.onnx + prep.onnx + decoder_step.onnx in the model dir) and runs the plus-M
-  // 6-layer MBart FAST host-loop (decode_chunk_plusm / decode_continuous_plusm). NOTE:
-  // force_fused=true would set fast_=false -> plusm_=false and disable the plus-M fast
-  // path entirely, so plus-M MUST be constructed with force_fused=false.
-  explicit PPFormulaNetOrt(std::string backend_label = "ppformulanet_s",
-                           bool force_fused = false);
+  // backend_label names the engine in logs/routing. PP-FormulaNet_plus-M reuses this
+  // class via ("ppformulanet_plus_m"): it ships its OWN split graphs (encoder.onnx +
+  // prep.onnx + decoder_step.onnx in the model dir) and runs the plus-M 6-layer MBart
+  // FAST host-loop (decode_chunk_plusm / decode_continuous_plusm).
+  explicit PPFormulaNetOrt(std::string backend_label = "ppformulanet_s");
   ~PPFormulaNetOrt() noexcept override;
 
   [[nodiscard]] bool load_model_dir(const std::string &model_dir) override;
@@ -106,18 +94,15 @@ private:
   void decode_plusm_page(int N, const std::vector<Box> &boxes, const GpuImage &page,
                          bool drop_collapse, std::vector<FormulaEngineResult> &out);
 
-  OrtSession fused_;                 // EXACT (GPU) + CPU path
   OrtSession enc_, prep_, step_;     // GPU FAST path
   OrtSession step_short_;            // plus-M length-bucket: 384-KV-window step (common case)
-  bool fast_ = false;                // GPU host-loop (default on GPU)
+  bool fast_ = false;                // GPU host-loop (always true once loaded)
   bool plusm_ = false;               // PP-FormulaNet_plus-M (6-layer MBart fast host-loop)
-  bool cpu_ = false;                 // ORT CPUExecutionProvider (FORMULA_DEVICE=cpu)
   std::string label_ = "ppformulanet_s";   // backend_name() (engine label)
-  bool force_fused_ = false;         // skip FAST host-loop, always fused EXACT
   std::optional<FormulaTokenizer> tok_;
   bool ready_ = false;
   std::string fast_dir_;
-  cudaStream_t stream_ = nullptr;    // nullptr on the CPU path
+  cudaStream_t stream_ = nullptr;    // GPU FAST decode stream
 
   float *d_x_ = nullptr;             // [MAX_B,1,384,384] device crops (GPU paths only)
   // FAST-path device buffers (allocated only when fast_).

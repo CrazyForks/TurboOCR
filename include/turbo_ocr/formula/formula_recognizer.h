@@ -93,8 +93,8 @@ public:
 // (typically read from FORMULA_BACKEND). Unknown keys return nullptr.
 //
 // Supported keys:
-//   "ppformulanet_s"  — PP-FormulaNet-S, in-process ONNX Runtime (CUDA/CPU);
-//                       FAST split-graph host loop, PPFNS_EXACT forces the fused graph
+//   "ppformulanet_s"  — PP-FormulaNet-S, in-process ONNX Runtime (CUDA);
+//                       FAST split-graph host loop only (no fused graph)
 //   "vlm"             — OpenAI-compatible vLLM endpoint (env-configured)
 std::unique_ptr<IFormulaRecognizer>
 make_formula_recognizer(std::string_view backend);

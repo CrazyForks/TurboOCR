@@ -14,16 +14,15 @@ namespace turbo_ocr::formula {
 std::unique_ptr<IFormulaRecognizer>
 make_formula_recognizer(std::string_view backend) {
   if (backend == "ppformulanet_s") {
-    // Pure in-process ORT decoder (no Python sidecar). GPU FAST host-loop by default,
-    // PPFNS_EXACT=1 for the fused graph, FORMULA_DEVICE=cpu for ORT-CPU.
+    // Pure in-process ORT decoder (no Python sidecar). GPU FAST host-loop only.
     return std::make_unique<PPFormulaNetOrt>();
   }
   if (backend == "ppformulanet_plus_m") {
     // PP-FormulaNet_plus-M (B6 encoder + 512-d x 6-layer MBart decoder): the
     // Chinese-formula model. In-process ORT FAST host-loop (encoder.onnx + prep.onnx +
-    // static-KV decoder_step.onnx, single greedy token/step), falling back to the fused
-    // inference_trt.onnx if the split graphs are missing. force_fused=false -> FAST.
-    return std::make_unique<PPFormulaNetOrt>("ppformulanet_plus_m", /*force_fused=*/false);
+    // static-KV decoder_step.onnx, single greedy token/step). The FAST split graphs are
+    // required (no fused fallback).
+    return std::make_unique<PPFormulaNetOrt>("ppformulanet_plus_m");
   }
   if (backend == "vlm") {
     return std::make_unique<VLMFormula>();

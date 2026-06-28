@@ -16,7 +16,7 @@ int main(int argc, char **argv) {
   std::string tok = argc > 3 ? argv[3] : (dir + "/tokenizer.json");
   std::string gate = argc > 4 ? argv[4] : "models/formula/ppformulanet_plus_m/eval";
 
-  turbo_ocr::formula::PPFormulaNetOrt rec(backend, /*force_fused=*/false);
+  turbo_ocr::formula::PPFormulaNetOrt rec(backend);
   std::cerr << "[selftest] backend=" << backend << " load_model_dir: " << dir << '\n';
   if (!rec.load_model_dir(dir)) { std::cerr << "[selftest] load_model_dir FAILED\n"; return 3; }
   std::cerr << "[selftest] load_tokenizer: " << tok << '\n';

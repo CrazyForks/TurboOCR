@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-OMNIDOC_IMAGES = Path("/workspace/omnidocbench/data/images")
+OMNIDOC_IMAGES = Path(__file__).resolve().parents[2] / "omnidocbench/data/images"
 DEFAULT_N = 200
 
 

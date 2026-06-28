@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile-driven CPU OCR benchmark. Starts paddle_cpu_server with a given env,
+"""Profile-driven CPU OCR benchmark. Starts turboocr-cpu-server with a given env,
 warms up, resets per-stage profiling, runs timed /ocr/batch rounds, reads the
 /profile breakdown, and emits img/s + per-stage ms/img + an accuracy signature
 (box count + text hash) for regression gating.
@@ -8,9 +8,9 @@ Usage: cpu_profile_bench.py [label] [KEY=VAL ...]   # extra env for the server
 """
 import base64, glob, hashlib, json, os, signal, subprocess, sys, time, urllib.request
 
-REPO = "/workspace/turboocr"
-BIN = f"{REPO}/build_cpu/paddle_cpu_server"
-FUNSD = "/workspace/compare-ocrs/funsd_cache"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BIN = f"{REPO}/build_cpu/turboocr-cpu-server"
+FUNSD = os.path.join(os.path.dirname(REPO), "compare-ocrs", "funsd_cache")
 PORT = int(os.environ.get("BENCH_PORT", "18080"))
 GRPC = PORT + 1
 N_IMAGES = int(os.environ.get("BENCH_N", "30"))

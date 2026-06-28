@@ -18,8 +18,6 @@
 //                    via PDFium and accept if sanity-check passes, else
 //                    rec that box. Detection is the ground truth.
 //
-// See /home/user/.claude/plans/sorted-strolling-aurora.md "Follow-up"
-// section for the full design.
 
 #include <string>
 #include <string_view>

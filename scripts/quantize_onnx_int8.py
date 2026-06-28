@@ -287,7 +287,7 @@ def run_quantize(onnx_path: Path, model_type: str, out_path: Path,
     except (ImportError, AttributeError) as exc:
         print("ERROR: nvidia-modelopt unavailable in this venv.", file=sys.stderr)
         print(f"  underlying: {exc}", file=sys.stderr)
-        print("  fix: run with /workspace/turboocr/"
+        print("  fix: run with <repo>/"
               ".venv-modelopt/bin/python (preferred — pinned to a working "
               "onnx≥1.21 + modelopt 0.44)", file=sys.stderr)
         return 2

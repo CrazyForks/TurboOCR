@@ -24,8 +24,8 @@ import sys
 import time
 from pathlib import Path
 
-REPO = Path("/workspace/turboocr")
-BENCH = Path("/workspace/omnidocbench")
+REPO = Path(__file__).resolve().parents[1]
+BENCH = REPO.parent / "omnidocbench"
 SUBSET_DIR = Path("/tmp/omnidoc_subset5")
 SUBSET_GT = SUBSET_DIR / "OmniDocBench_subset5.json"
 SUBSET_SCRIPT = REPO / "scripts" / "omnidoc_subset.py"

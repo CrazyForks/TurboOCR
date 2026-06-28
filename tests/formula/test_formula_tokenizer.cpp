@@ -89,7 +89,7 @@ TEST_CASE("FormulaTokenizer::load loads real tokenizer.json when present",
     // Skipped by default tag — the real tokenizer.json lives in the Rust
     // workspace, not in this repo. Run with `-Rinteg` to opt in.
     const std::string path =
-        "/workspace/turbostruct-rs/models/formulanet_s/tokenizer.json";
+        "models/formula/ppformulanet_s/tokenizer.json";
     auto tok = FormulaTokenizer::load(path);
     if (!tok) {
         WARN("tokenizer.json not found at " << path << " — skipping");

@@ -710,7 +710,6 @@ if _TRTLLM_AVAILABLE:
             _sibling_dirs = [
                 _os.path.join(_base_dir, "models", "vlm", "paddleocr_vl_1_5"),
                 _os.path.join(_os.path.dirname(_base_dir), "models", "vlm", "paddleocr_vl_1_5"),
-                "/workspace/turboocr/models/vlm/paddleocr_vl_1_5",
             ]
             _pack_emb_loaded = False
             for _bf16_dir in _sibling_dirs:

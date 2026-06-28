@@ -5,7 +5,7 @@ Uses the official `paddleocr.PaddleOCRVL` pipeline pointed at a vLLM
 OpenAI-compatible server. Saves per-image markdown to <out-dir>/md.
 
 Run with the compare-ocrs venv (Python 3.12 + paddle + paddleocr 3.4):
-  /workspace/compare-ocrs/.venv/bin/python tools/omnidoc_run_paddlevl.py ...
+  /path/to/compare-ocrs/.venv/bin/python tools/omnidoc_run_paddlevl.py ...
 
 Layout detection (PP-DocLayoutV3) runs locally on this host; only the
 VL element-level OCR is delegated to vLLM. `vl_rec_max_concurrency`
@@ -29,7 +29,7 @@ os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--images-dir", type=Path,
-                   default=Path("/workspace/omnidocbench/data/images"))
+                   default=Path(__file__).resolve().parents[2] / "omnidocbench/data/images")
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--server", default="http://127.0.0.1:8003/v1")
     p.add_argument("--limit", type=int, default=0)

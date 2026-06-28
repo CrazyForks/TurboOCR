@@ -16,7 +16,7 @@ from threading import Lock
 
 import requests
 
-IMAGES_DIR = Path("/workspace/omnidocbench/data/images")
+IMAGES_DIR = Path(__file__).resolve().parents[2] / "omnidocbench/data/images"
 
 
 def parse_args() -> argparse.Namespace:

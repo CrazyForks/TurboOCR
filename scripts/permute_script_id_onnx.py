@@ -26,7 +26,7 @@ import onnx
 import onnx.helper
 from onnx import numpy_helper
 
-ROOT = Path("/workspace/turboocr/models/script_id")
+ROOT = Path(__file__).resolve().parents[1] / "models" / "script_id"
 SRC = ROOT / "script_id.onnx"
 DST = ROOT / "script_id.onnx"  # overwrite — old data file will be orphaned + deleted at end
 

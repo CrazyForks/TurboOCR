@@ -5,8 +5,8 @@ import socket, struct, os, json, time, sys, threading, itertools
 import concurrent.futures as cf
 import cv2
 SOCK = "/tmp/vl_sidecar.sock"
-IMG = "/workspace/omnidocbench/data/images"
-d = json.load(open("/workspace/omnidocbench/data/OmniDocBench.json"))
+IMG = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "omnidocbench", "data", "images")
+d = json.load(open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "omnidocbench", "data", "OmniDocBench.json")))
 forms, tbls = [], []
 for page in d:
     p = os.path.join(IMG, page.get("page_info", {}).get("image_path", ""))

@@ -13,7 +13,7 @@ import json
 import sys
 from pathlib import Path
 
-GT_PATH = Path("/workspace/omnidocbench/data/OmniDocBench.json")
+GT_PATH = Path(__file__).resolve().parents[2] / "omnidocbench/data/OmniDocBench.json"
 OUT_DIR = Path("/tmp/omnidoc_subset5")
 OUT_JSON = OUT_DIR / "OmniDocBench_subset5.json"
 

@@ -8,7 +8,7 @@ become the gate). Any later config whose sig/boxes differ is flagged FAIL.
 """
 import json, subprocess, sys, os
 
-REPO = "/workspace/turboocr"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BENCH = f"{REPO}/tools/cpu_profile_bench.py"
 
 

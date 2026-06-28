@@ -25,7 +25,7 @@ import numpy as np
 from PIL import Image
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else \
-    "/home/user/.cache/huggingface/hub/models--PaddlePaddle--PaddleOCR-VL-1.6/snapshots/04f4914a147b84d7dabe3490dcf67152d2e097a9"
+    os.path.expanduser("~/.cache/huggingface/hub/models--PaddlePaddle--PaddleOCR-VL-1.6/snapshots/04f4914a147b84d7dabe3490dcf67152d2e097a9")
 SOCK = os.environ.get("VL_SOCK", "/tmp/vl_sidecar.sock")
 
 from vllm import AsyncEngineArgs, SamplingParams

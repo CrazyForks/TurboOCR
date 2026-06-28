@@ -27,7 +27,7 @@ import argparse, json, os, re, statistics, sys, tempfile
 from concurrent.futures import ProcessPoolExecutor
 
 OMNIDOCBENCH = os.environ.get(
-    "OMNIDOCBENCH", os.path.expanduser("~/code/workspace/omnidocbench"))
+    "OMNIDOCBENCH", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "omnidocbench"))
 
 
 def is_cjk(ch: str) -> bool:

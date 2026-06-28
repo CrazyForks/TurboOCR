@@ -21,7 +21,7 @@ URL = os.environ.get("TURBO_OCR_URL", "http://localhost:8080")
 N = 50
 CONCURRENCY = int(os.environ.get("BENCH_CONCURRENCY", "16"))
 THROUGHPUT_ITERS = int(os.environ.get("BENCH_ITERS", "600"))
-CACHE = Path("/workspace/compare-ocrs/funsd_cache")
+CACHE = Path(__file__).resolve().parents[3] / "compare-ocrs/funsd_cache"
 GT_PATH = Path(__file__).parent / "funsd_gt_words.json"
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")

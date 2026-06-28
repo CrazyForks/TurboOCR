@@ -95,7 +95,7 @@ def per_class_accuracy(model, loader, device):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="/tmp/script_id_data")
-    ap.add_argument("--out", default="/workspace/turboocr/models/script_id")
+    ap.add_argument("--out", default=str(Path(__file__).resolve().parents[1] / "models" / "script_id"))
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=4e-3)

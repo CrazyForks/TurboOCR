@@ -201,7 +201,7 @@ def export_onnx_permuted(model: nn.Module, out_path: Path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="/tmp/script_id_data_v2")
-    ap.add_argument("--out", default="/workspace/turboocr/models/script_id")
+    ap.add_argument("--out", default=str(Path(__file__).resolve().parents[1] / "models" / "script_id"))
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--batch", type=int, default=256)

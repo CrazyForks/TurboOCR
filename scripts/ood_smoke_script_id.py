@@ -24,10 +24,10 @@ import numpy as np
 from PIL import Image
 import onnxruntime as ort
 
-OMNI = Path("/workspace/omnidocbench/data")
+OMNI = Path(__file__).resolve().parents[2] / "omnidocbench" / "data"
 PREDS = Path("/tmp/omnidoc_predictions/json")
-ONNX = Path("/workspace/turboocr/models/script_id/script_id.onnx")
-OUT = Path("/workspace/turboocr/models/script_id/ood_smoke.json")
+ONNX = Path(__file__).resolve().parents[1] / "models/script_id/script_id.onnx"
+OUT = Path(__file__).resolve().parents[1] / "models/script_id/ood_smoke.json"
 
 CANON = ["latin", "chinese", "arabic", "eslav", "greek", "korean", "thai"]
 H, W = 32, 128

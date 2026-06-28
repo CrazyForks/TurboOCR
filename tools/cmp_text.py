@@ -5,9 +5,9 @@ Usage: cmp_text.py 'LABEL_A:ENV..' 'LABEL_B:ENV..'
 """
 import base64, glob, json, os, signal, subprocess, sys, time, urllib.request
 
-REPO = "/workspace/turboocr"
-BIN = f"{REPO}/build_cpu/paddle_cpu_server"
-FUNSD = "/workspace/compare-ocrs/funsd_cache"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BIN = f"{REPO}/build_cpu/turboocr-cpu-server"
+FUNSD = os.path.join(os.path.dirname(REPO), "compare-ocrs", "funsd_cache")
 PORT = 18090
 N = int(os.environ.get("BENCH_N", "30"))
 

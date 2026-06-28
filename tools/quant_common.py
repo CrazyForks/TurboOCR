@@ -15,8 +15,8 @@ import numpy as np
 import onnxruntime as ort
 import pyclipper
 
-REPO = "/workspace/turboocr"
-FUNSD = "/workspace/compare-ocrs/funsd_cache"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FUNSD = os.path.join(os.path.dirname(REPO), "compare-ocrs", "funsd_cache")
 
 # ---- det constants (cpu_paddle_det.h / det_config.h) ----
 DET_MAX_SIDE = 960

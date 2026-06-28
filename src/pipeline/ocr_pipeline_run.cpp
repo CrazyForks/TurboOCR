@@ -646,27 +646,13 @@ std::vector<OcrPipelineResult> OcrPipeline::run_batch_with_layout(
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
-  // Detection. In pdf_only mode, every page is the same rendered size so
-  // we go straight through det's batched static-shape path (one TRT call
-  // per batch chunk). In normal mode, det uses batch=1 per image for
-  // optimal single-image latency.
+  // Batched detection across the whole batch (one TRT call per <=8-image
+  // chunk via the batch-capable det profile) instead of batch-1 per image.
+  // det run_batch resizes all images to the batch-max shape and maps boxes
+  // back per image — ~40% cheaper det/image at batch 8 (measured). Only the
+  // batch path uses this; single /ocr/raw still takes the batch-1 fast path.
   std::vector<std::vector<Box>> all_det_boxes(batch_n);
-  if (pdf_only_) {
-    std::vector<GpuImage> gpu_imgs;
-    std::vector<std::pair<int,int>> dims;
-    gpu_imgs.reserve(batch_n); dims.reserve(batch_n);
-    for (int i = 0; i < batch_n; i++) {
-      gpu_imgs.push_back({per_img[i].d_buf, per_img[i].pitch,
-                          per_img[i].rows, per_img[i].cols});
-      dims.emplace_back(per_img[i].rows, per_img[i].cols);
-    }
-    all_det_boxes = det_->run_batch(gpu_imgs, dims, stream);
-  } else {
-    // Batched detection across the whole batch (one TRT call per <=8-image
-    // chunk via the batch-capable det profile) instead of batch-1 per image.
-    // det run_batch resizes all images to the batch-max shape and maps boxes
-    // back per image — ~40% cheaper det/image at batch 8 (measured). Only the
-    // batch path uses this; single /ocr/raw still takes the batch-1 fast path.
+  {
     std::vector<GpuImage> gpu_imgs;
     std::vector<std::pair<int, int>> dims;
     gpu_imgs.reserve(batch_n);
@@ -680,13 +666,11 @@ std::vector<OcrPipelineResult> OcrPipeline::run_batch_with_layout(
   }
 
   // Assign detection results and run angle classification per-image.
-  // pdf_only skips cls — PDF pages from a renderer are upright by
-  // construction, so an angle pass would be a redundant cost.
   for (int i = 0; i < batch_n; i++) {
     per_img[i].boxes = std::move(all_det_boxes[i]);
     sorted_boxes(per_img[i].boxes);
 
-    if (use_cls_ && !pdf_only_) {
+    if (use_cls_) {
       vertical_box_indices_.clear();
       for (int vi = 0; vi < static_cast<int>(per_img[i].boxes.size()); ++vi) {
         if (is_vertical_box(per_img[i].boxes[vi]))
@@ -774,39 +758,18 @@ void OcrPipeline::run_batch_layout_stage_(
   // record it on the caller's stream to give them a valid ordering point.
   CUDA_CHECK(cudaEventRecord(det_only_event_, stream));
 
-  if (pdf_only_) {
-    // Every page is the same rendered size, so layout runs as a single
-    // batched TRT execute (engine profile {1..kMaxBatch, 3, 800, 800})
-    // instead of batch_n sequential executes.
-    std::vector<GpuImage> gpu_imgs;
-    std::vector<std::pair<int,int>> dims;
-    gpu_imgs.reserve(batch_n); dims.reserve(batch_n);
-    for (int i = 0; i < batch_n; ++i) {
-      gpu_imgs.push_back(image_crops[i].img);
-      dims.emplace_back(image_crops[i].img.rows, image_crops[i].img.cols);
-    }
-    if (layout_->enqueue_batch(gpu_imgs, dims, layout_stream_)) {
-      auto all_layout = layout_->collect_batch();  // one entry per image
-      PipelineTimer t;
-      for (int i = 0; i < batch_n; ++i) {
-        outs[i].layout = std::move(all_layout[i]);
-        dispatch_router_(outs[i], gpu_imgs[i], image_crops[i].boxes, t);
-      }
-    }
-  } else {
-    for (int i = 0; i < batch_n; i++) {
-      const GpuImage &gpu_img = image_crops[i].img;
-      // collect() only after a successful enqueue — on failure it would
-      // sync the stale d2h_event_ of the last successful execute and hand
-      // this page the PREVIOUS page's boxes (which the router would then
-      // crop at wrong coordinates on the wrong image).
-      if (!layout_->enqueue(gpu_img, gpu_img.rows, gpu_img.cols,
-                            layout_stream_))
-        continue;
-      outs[i].layout = layout_->collect();
-      PipelineTimer t;
-      dispatch_router_(outs[i], gpu_img, image_crops[i].boxes, t);
-    }
+  for (int i = 0; i < batch_n; i++) {
+    const GpuImage &gpu_img = image_crops[i].img;
+    // collect() only after a successful enqueue — on failure it would
+    // sync the stale d2h_event_ of the last successful execute and hand
+    // this page the PREVIOUS page's boxes (which the router would then
+    // crop at wrong coordinates on the wrong image).
+    if (!layout_->enqueue(gpu_img, gpu_img.rows, gpu_img.cols,
+                          layout_stream_))
+      continue;
+    outs[i].layout = layout_->collect();
+    PipelineTimer t;
+    dispatch_router_(outs[i], gpu_img, image_crops[i].boxes, t);
   }
 
   // Reading order — same contract as run_with_layout: helper handles

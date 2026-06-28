@@ -219,9 +219,8 @@ public:
         grpc_batch_workers_(cfg.grpc_batch_workers),
         max_pdf_pages_(cfg.max_pdf_pages),
         max_batch_images_(cfg.max_batch_images),
-        default_pdf_dpi_(cfg.pdf_only ? cfg.pdf_dpi : 100),
-        request_timeout_ms_(cfg.request_timeout_ms),
-        pdf_chunk_batch_(cfg.pdf_only ? cfg.pdf_batch : 0) {}
+        default_pdf_dpi_(100),
+        request_timeout_ms_(cfg.request_timeout_ms) {}
 #endif
 
   /// CPU-friendly constructor: takes an InferFunc instead of a dispatcher.
@@ -237,7 +236,7 @@ public:
         grpc_batch_workers_(cfg.grpc_batch_workers),
         max_pdf_pages_(cfg.max_pdf_pages),
         max_batch_images_(cfg.max_batch_images),
-        default_pdf_dpi_(cfg.pdf_only ? cfg.pdf_dpi : 100),
+        default_pdf_dpi_(100),
         request_timeout_ms_(cfg.request_timeout_ms) {}
 
   /// Set the readiness probe used by Health(). Called once per Health RPC on
@@ -691,9 +690,6 @@ public:
     if (want_blocks) want_layout = true;
 
     int dpi = request->dpi();
-    // In pdf_only mode the default is cfg.pdf_dpi — the DPI the static det
-    // profile (pdf_page_h/w) was sized for; 100 otherwise. Explicit request
-    // dpi always wins.
     if (dpi == 0) dpi = default_pdf_dpi_;
     if (dpi < pipeline::kMinPdfDpi || dpi > pipeline::kMaxPdfDpi)
       return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT, "INVALID_DPI",
@@ -729,7 +725,6 @@ public:
     job_opts.want_layout = want_layout;
     job_opts.want_reading_order = want_reading_order;
     job_opts.want_blocks = want_blocks;
-    job_opts.pdf_only_batch = pdf_chunk_batch_;
     // Bound the GPU per-page future join with the configured request deadline so
     // a wedged page can't hang the RPC (no-op on the sequential CPU overload).
     job_opts.request_timeout_ms = request_timeout_ms_;
@@ -929,18 +924,13 @@ private:
   int grpc_batch_workers_ = 8;
   int max_pdf_pages_ = 2000;
   int max_batch_images_ = 1024;
-  // Default render DPI when the request doesn't specify one: cfg.pdf_dpi
-  // in pdf_only mode (matching the static det profile), 100 otherwise.
+  // Default render DPI when the request doesn't specify one.
   int default_pdf_dpi_ = 100;
   // Per-request inference deadline (C4) from cfg.request_timeout_ms; 0 = wait
   // unbounded (legacy). Applied to every GPU future .get() so a wedged worker
   // surfaces as DEADLINE_EXCEEDED instead of hanging an RPC. CPU path leaves
   // it unused (InferFunc is synchronous, no dispatcher/wedge risk).
   long request_timeout_ms_ = 30000;
-  // pdf_only mode: chunk size for batched PDF page OCR (cfg.pdf_batch,
-  // the static det engine's batch dim); 0 = per-page path. Only ever
-  // non-zero on the GPU dispatcher constructor.
-  int pdf_chunk_batch_ = 0;
 };
 
 /// Start gRPC server on a background thread. Returns the server and thread.

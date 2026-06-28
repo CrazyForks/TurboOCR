@@ -57,11 +57,6 @@ const char* const kAllEnvVars[] = {
     "MAX_IMAGE_DIM",
     "LOG_LEVEL",
     "LOG_FORMAT",
-    "TURBO_OCR_PDF_ONLY",
-    "TURBO_OCR_PDF_DPI",
-    "TURBO_OCR_PDF_PAGE_H",
-    "TURBO_OCR_PDF_PAGE_W",
-    "TURBO_OCR_PDF_BATCH",
     "MAX_BATCH_IMAGES",
     "MAX_PDF_PAGE_PIXELS_MP",
     "DOC_ORI_ONNX",
@@ -376,63 +371,6 @@ TEST_CASE("to_json produces non-empty JSON object", "[server_config]") {
   CHECK(j.back() == '}');
   CHECK(j.find("\"host\":\"0.0.0.0\"") != std::string::npos);
   CHECK(j.find("\"http_port\":8080") != std::string::npos);
-}
-
-TEST_CASE("pdf_only hybrid mode defaults and parsing", "[server_config]") {
-  reset_env();
-  auto c = ServerConfig::from_env(Profile::Gpu);
-  CHECK(c.errors.empty());
-  CHECK_FALSE(c.pdf_only);
-  CHECK(c.pdf_dpi == 150);
-  CHECK(c.pdf_page_h == 1280);
-  CHECK(c.pdf_page_w == 960);
-  CHECK(c.pdf_batch == 8);
-
-  ::setenv("TURBO_OCR_PDF_ONLY", "true", 1);  // strict bool: any spelling
-  ::setenv("TURBO_OCR_PDF_PAGE_H", "1664", 1);
-  ::setenv("TURBO_OCR_PDF_PAGE_W", "1280", 1);
-  ::setenv("TURBO_OCR_PDF_BATCH", "4", 1);
-  auto on = ServerConfig::from_env(Profile::Gpu);
-  CHECK(on.errors.empty());
-  CHECK(on.pdf_only);
-  CHECK(on.pdf_page_h == 1664);
-  CHECK(on.pdf_page_w == 1280);
-  CHECK(on.pdf_batch == 4);
-}
-
-TEST_CASE("pdf_only page dims must be multiples of 32", "[server_config]") {
-  reset_env();
-  ::setenv("TURBO_OCR_PDF_ONLY", "1", 1);
-  ::setenv("TURBO_OCR_PDF_PAGE_H", "1250", 1);  // not /32
-  auto c = ServerConfig::from_env(Profile::Gpu);
-  REQUIRE_FALSE(c.errors.empty());
-  CHECK(c.errors[0].find("multiple") != std::string::npos);
-
-  // Same dims without pdf_only: no error (knob is inert).
-  reset_env();
-  ::setenv("TURBO_OCR_PDF_PAGE_H", "1250", 1);
-  auto off = ServerConfig::from_env(Profile::Gpu);
-  CHECK(off.errors.empty());
-}
-
-TEST_CASE("pdf_batch is capped at the pipeline batch chunk size", "[server_config]") {
-  // A static det batch dim above 8 could never be filled (the pipeline
-  // chunks at 8 images) — reject instead of silently padding forever.
-  reset_env();
-  ::setenv("TURBO_OCR_PDF_BATCH", "64", 1);
-  auto c = ServerConfig::from_env(Profile::Gpu);
-  REQUIRE_FALSE(c.errors.empty());
-  CHECK(c.errors[0].find("TURBO_OCR_PDF_BATCH") != std::string::npos);
-}
-
-TEST_CASE("to_json reports pdf_only knobs", "[server_config]") {
-  reset_env();
-  ::setenv("TURBO_OCR_PDF_ONLY", "1", 1);
-  auto c = ServerConfig::from_env(Profile::Gpu);
-  auto j = c.to_json();
-  CHECK(j.find("\"pdf_only\":true") != std::string::npos);
-  CHECK(j.find("\"pdf_page_h\":1280") != std::string::npos);
-  CHECK(j.find("\"pdf_batch\":8") != std::string::npos);
 }
 
 TEST_CASE("exposure-hardening caps: defaults, env override, bounds", "[server_config]") {

@@ -30,9 +30,6 @@ struct PipelineBuildSpec {
   std::string rec_dict;
   std::string cls_model;
   std::string layout_model;
-  int pdf_only_batch = 0;
-  int pdf_only_page_h = 0;
-  int pdf_only_page_w = 0;
   std::string doc_ori_model;
   DetInferConfig det_cfg{turbo_ocr::detection::kDetResizeDefault,
                          turbo_ocr::detection::kDbDefaults};
@@ -136,9 +133,6 @@ struct GpuPipelineEntry {
     if (!fresh->init(spec.det_model, spec.rec_model, spec.rec_dict,
                      spec.cls_model, spec.det_cfg))
       throw turbo_ocr::ModelLoadError("[Recycle] Failed to re-init GPU pipeline");
-    if (spec.pdf_only_batch > 0)
-      fresh->enable_pdf_only_mode(spec.pdf_only_batch, spec.pdf_only_page_h,
-                                  spec.pdf_only_page_w);
     if (!spec.layout_model.empty() && !fresh->load_layout_model(spec.layout_model))
       throw turbo_ocr::ModelLoadError("[Recycle] Failed to reload layout model");
     if (!spec.doc_ori_model.empty())

@@ -675,17 +675,6 @@ else()
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
     )
 
-    # PDF-only static-engine throughput benchmark.
-    add_executable(pdf_static_bench tools/pdf_static_bench.cpp)
-    target_include_directories(pdf_static_bench PRIVATE include)
-    target_link_libraries(pdf_static_bench PRIVATE
-        turbo_ocr_gpu
-        ${OpenCV_LIBS}
-    )
-    set_target_properties(pdf_static_bench PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    )
 
     # Regression: nvJPEG handler-thread -> dispatcher-worker race
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_nvjpeg_race.cpp)

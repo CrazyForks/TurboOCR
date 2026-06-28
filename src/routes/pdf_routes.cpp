@@ -361,7 +361,6 @@ void register_pdf_route(server::WorkPool &pool,
                         render::PdfRenderer &pdf_renderer,
                         pdf::PdfMode default_pdf_mode,
                         bool layout_available,
-                        int pdf_only_batch,
                         int default_dpi,
                         int max_pdf_pages,
                         bool doc_ori_available) {
@@ -369,7 +368,7 @@ void register_pdf_route(server::WorkPool &pool,
   drogon::app().registerHandler(
       "/ocr/pdf",
       [&pool, &dispatcher, &pdf_renderer, default_pdf_mode, layout_available,
-       pdf_only_batch, default_dpi, max_pdf_pages, doc_ori_available](
+       default_dpi, max_pdf_pages, doc_ori_available](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
@@ -446,7 +445,7 @@ void register_pdf_route(server::WorkPool &pool,
     server::submit_work(pool, std::move(callback),
         [pdf_buf, req, &dispatcher, &pdf_renderer,
          layout_enabled, want_reading_order, want_blocks,
-         dpi, req_mode, pdf_only_batch, image_mode,
+         dpi, req_mode, image_mode,
          encode_opts, max_pdf_pages, autorotate](server::DrogonCallback &cb) {
      // Wrap the whole body: post-render work (emit_pdf_response's multi-GB
      // reserve under images=inline) can throw bad_alloc, which the WorkPool
@@ -467,7 +466,6 @@ void register_pdf_route(server::WorkPool &pool,
       job_opts.autorotate = autorotate;
       job_opts.image_mode = image_mode;
       job_opts.encode_opts = encode_opts;
-      job_opts.pdf_only_batch = pdf_only_batch;
       // Bound the per-page future join with the configured request deadline so a
       // wedged page can't hang the whole PDF request (same value the dispatcher
       // applies to single-image submits).

@@ -426,8 +426,7 @@ void batch_check_dims_post(std::vector<cv::Mat> &imgs,
 
 // Stage 5: run the pipeline on every slot that survived decode. Chunks
 // into kMaxBatch-sized batches through run_batch_with_layout — both with
-// and without layout the batched path applies (batched det/rec; in
-// pdf_only mode layout is one batched TRT execute per chunk too), so
+// and without layout the batched path applies (batched det/rec), so
 // ?layout=1 no longer falls back to serial single-image inference.
 //
 // C4: the submitted lambda is SELF-CONTAINED. It owns the decoded images

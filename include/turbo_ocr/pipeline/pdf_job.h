@@ -101,8 +101,6 @@ struct PdfJobOptions {
   bool autorotate = false;
   PdfImageMode image_mode = PdfImageMode::None;
   pdf::EncodeOptions encode_opts{};
-  // pdf_only batched-chunk size (GPU only; 0 = per-page path).
-  int pdf_only_batch = 0;
   // Per-request deadline (ms; 0 = unbounded). The GPU job bounds its page-future
   // join against this so a worker wedged mid-page can't hang the whole request.
   long request_timeout_ms = 0;
@@ -452,55 +450,7 @@ inline void ocr_single_page(GpuPipelineEntry &e, PdfPageSink &sink,
   }
 }
 
-// pdf_only chunk task: decode a chunk of rendered pages and run the batched
-// path — one static-shape det execute + batched rec + one batched layout
-// execute per chunk. Runs on a dispatcher worker.
-inline void ocr_page_chunk(GpuPipelineEntry &e, PdfPageSink &sink,
-                           bool layout_enabled, bool want_reading_order,
-                           const std::vector<int> &idxs,
-                           const std::vector<std::string> &paths) {
-  std::vector<cv::Mat> imgs;
-  std::vector<int> live;     // page index per successfully decoded image
-  std::vector<int> orients;  // detected rotation per live image (0 unless autorotate)
-  imgs.reserve(paths.size());
-  live.reserve(paths.size());
-  orients.reserve(paths.size());
-  for (size_t j = 0; j < paths.size(); ++j) {
-    cv::Mat img = render::PdfRenderer::decode_ppm(paths[j]);
-    if (img.empty()) {
-      TOCR_LOG_ERROR("Failed to decode PPM for page",
-                     "route", "/ocr/pdf", "page", idxs[j]);
-      sink.decode_failures.fetch_add(1, std::memory_order_relaxed);
-      continue;
-    }
-    int orient = sink.autorotate
-        ? e.pipeline->detect_orientation(img, e.stream) : 0;
-    if (orient) classification::rotate_upright(img, orient);
-    imgs.push_back(std::move(img));
-    live.push_back(idxs[j]);
-    orients.push_back(orient);
-  }
-  if (imgs.empty()) return;
-
-  try {
-    auto outs = e.pipeline->run_batch_with_layout(imgs, e.stream, layout_enabled,
-                                                  want_reading_order);
-    for (size_t j = 0; j < outs.size(); ++j)
-      store_ocr_page(sink, live[j], std::move(outs[j]),
-                     imgs[j].cols, imgs[j].rows,
-                     maybe_encode_page(sink, imgs[j]), orients[j]);
-  } catch (const std::exception &ex) {
-    // The whole batch shares one execute — a throw blanks every live page in
-    // the chunk, so count them all (not 1) for an accurate PAGE_FAILED.
-    sink.page_failures.fetch_add(static_cast<int>(live.size()),
-                                 std::memory_order_relaxed);
-    TOCR_LOG_ERROR("PDF page chunk inference error", "route", "/ocr/pdf",
-                   "first_page", live.front(), "pages", live.size(),
-                   "error", std::string_view(ex.what()));
-  }
-}
-
-// GPU streamed render: per rendered page, accumulate into a pdf_only batch
+// GPU streamed render: per rendered page, submit a single-page OCR task
 // chunk or submit a single-page task directly onto the dispatcher (H3 — no
 // per-page OS thread). `sink` and `stream_handle` are shared_ptrs captured BY
 // VALUE into every task so an abandoned (timed-out) task safely outlives this
@@ -514,33 +464,7 @@ inline void ocr_page_chunk(GpuPipelineEntry &e, PdfPageSink &sink,
     const std::shared_ptr<render::PdfRenderer::StreamHandle> &stream_handle,
     std::vector<uint8_t> &need_render,
     std::vector<std::future<void>> &page_futures, std::mutex &futures_mutex,
-    int pdf_only_batch, std::vector<int> &dropped_pages) {
-  std::vector<int> acc_idxs;
-  std::vector<std::string> acc_paths;
-
-  auto submit_ocr_chunk = [&](std::vector<int> idxs,
-                              std::vector<std::string> paths) {
-    std::future<void> fut;
-    try {
-      // idxs is copied (<= pdf_only_batch ints) rather than moved: submit()
-      // consumes the move BEFORE it can throw PoolExhausted, and the catch
-      // below still needs the indices.
-      fut = dispatcher.submit(
-          [sink, stream_handle, layout_enabled, want_reading_order,
-           idxs, paths = std::move(paths)](auto &e) {
-            ocr_page_chunk(e, *sink, layout_enabled, want_reading_order,
-                           idxs, paths);
-          });
-    } catch (const turbo_ocr::PoolExhaustedError &) {
-      TOCR_LOG_WARN("GPU queue full, dropping page chunk", "route", "/ocr/pdf",
-                    "first_page", idxs.front(), "pages", idxs.size());
-      dropped_pages.insert(dropped_pages.end(), idxs.begin(), idxs.end());
-      return;
-    }
-    std::lock_guard lock(futures_mutex);
-    page_futures.push_back(std::move(fut));
-  };
-
+    std::vector<int> &dropped_pages) {
   auto handle = pdf_renderer.render_streamed(pdf_data, pdf_len, sink->dpi,
       [&](int page_idx, std::string ppm_path) {
         bool is_geometric = false;
@@ -561,17 +485,7 @@ inline void ocr_page_chunk(GpuPipelineEntry &e, PdfPageSink &sink,
               page_results[page_idx].resolved_mode == pdf::PdfMode::Geometric;
         }
 
-        if (pdf_only_batch > 0 && !is_geometric) {
-          acc_idxs.push_back(page_idx);
-          acc_paths.push_back(std::move(ppm_path));
-          if (static_cast<int>(acc_idxs.size()) >= pdf_only_batch) {
-            submit_ocr_chunk(std::move(acc_idxs), std::move(acc_paths));
-            acc_idxs.clear();
-            acc_paths.clear();
-          }
-          return;
-        }
-
+        (void)is_geometric;
         std::future<void> fut;
         try {
           fut = dispatcher.submit(
@@ -589,11 +503,6 @@ inline void ocr_page_chunk(GpuPipelineEntry &e, PdfPageSink &sink,
         std::lock_guard lock(futures_mutex);
         page_futures.push_back(std::move(fut));
       });
-
-  // render_streamed is synchronous (all callbacks have fired) — flush the
-  // partial last chunk so trailing pages aren't dropped.
-  if (!acc_idxs.empty())
-    submit_ocr_chunk(std::move(acc_idxs), std::move(acc_paths));
 
   // Hand the tmpdir-owning handle to the shared object the tasks co-own; the
   // tmpdir now lives until the last task (including any abandoned one) drops it.
@@ -767,7 +676,7 @@ inline int run_streamed_render_cpu(
       num_pages = detail::run_streamed_render_gpu(
           dispatcher, pdf_renderer, pdf_data, pdf_len, opts.want_layout,
           opts.want_reading_order, mode, sink, stream_handle, need_render,
-          page_futures, futures_mutex, opts.pdf_only_batch, dropped);
+          page_futures, futures_mutex, dropped);
     } catch (const std::exception &e) {
       // No drain needed: every in-flight page task co-owns the sink/handle via
       // shared_ptr, so abandoning the futures here is memory-safe (a still-running

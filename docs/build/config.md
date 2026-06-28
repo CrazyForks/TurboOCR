@@ -98,22 +98,6 @@ build the variables are `*_ONNX`; on the CPU build they are `*_MODEL`.
 | `TURBO_PDF_IMAGE_ENCODER` | `gpu` | Inline-JPEG page-image encoder: `gpu` (nvJPEG) or `cpu` (libjpeg-turbo). GPU-only path; reported but inert on the CPU build. |
 | `TURBO_PPM_SWAP` | `simd` | PPM channel-swap path: `simd` or `scalar`. |
 
-### PDF-only hybrid mode
-
-Env-only (operators flip this at boot, not per-request). When enabled, the
-detection engine is built with a **static** input shape for zero
-dynamic-shape overhead; CLS is skipped (rendered pages are upright by
-construction) and REC stays the dynamic engine. Page dimensions must be
-multiples of 32 (fatal otherwise).
-
-| Variable | Default | Description |
-|---|---|---|
-| `TURBO_OCR_PDF_ONLY` | `0` | `1` enables static-shape PDF-only mode. |
-| `TURBO_OCR_PDF_DPI` | `150` | Default render DPI for `/ocr/pdf` (an explicit `?dpi=` still wins). Bounds `[50, 600]`. |
-| `TURBO_OCR_PDF_PAGE_H` | `1280` | Static det height (multiple of 32). Bounds `[32, 4096]`. |
-| `TURBO_OCR_PDF_PAGE_W` | `960` | Static det width (multiple of 32). Bounds `[32, 4096]`. |
-| `TURBO_OCR_PDF_BATCH` | `8` | Static det batch dim. Bounds `[1, 8]` (8 = the pipeline batch-chunk size; larger could never be filled). |
-
 ## TensorRT / engine
 
 | Variable | Default | Description |

@@ -350,26 +350,18 @@ private:
 };
 
 /// Factory: create, init, warmup GPU pipelines and wrap in a dispatcher.
-/// `pdf_only_batch > 0` enables the PDF-only hybrid mode on every pipeline
-/// (static batched det at {batch, 3, page_h, page_w}; values from the
-/// validated ServerConfig) before warmup, so the static-engine warmup path
-/// is taken instead of the dynamic-shape one.
-// Build + warm exactly one pipeline (det/rec/cls + optional layout/doc_ori +
-// pdf_only). Returns nullptr on a non-fatal init failure (logged).
+// Build + warm exactly one pipeline (det/rec/cls + optional layout/doc_ori).
+// Returns nullptr on a non-fatal init failure (logged).
 [[nodiscard]] inline std::unique_ptr<GpuPipelineEntry> build_one_pipeline(
     int idx, const std::string &det_model, const std::string &rec_model,
     const std::string &rec_dict, const std::string &cls_model,
-    const std::string &layout_model, int pdf_only_batch, int pdf_only_page_h,
-    int pdf_only_page_w, const std::string &doc_ori_model,
+    const std::string &layout_model, const std::string &doc_ori_model,
     const DetInferConfig &det_cfg) {
   auto pipeline = std::make_unique<OcrPipeline>();
   if (!pipeline->init(det_model, rec_model, rec_dict, cls_model, det_cfg)) {
     std::cerr << std::format("[Dispatcher] Failed to init GPU pipeline {}\n", idx);
     return nullptr;
   }
-  if (pdf_only_batch > 0)
-    pipeline->enable_pdf_only_mode(pdf_only_batch, pdf_only_page_h,
-                                   pdf_only_page_w);
   if (!layout_model.empty() && !pipeline->load_layout_model(layout_model))
     throw turbo_ocr::ModelLoadError(std::format(
         "[Dispatcher] Failed to load layout model for pipeline {}", idx));
@@ -387,7 +379,6 @@ private:
     int pool_size, const std::string &det_model, const std::string &rec_model,
     const std::string &rec_dict, const std::string &cls_model = "",
     const std::string &layout_model = "",
-    int pdf_only_batch = 0, int pdf_only_page_h = 0, int pdf_only_page_w = 0,
     const std::string &doc_ori_model = "",
     const DetInferConfig &det_cfg = {turbo_ocr::detection::kDetResizeDefault,
                                      turbo_ocr::detection::kDbDefaults}) {
@@ -399,8 +390,7 @@ private:
   std::vector<std::unique_ptr<GpuPipelineEntry>> entries;
   for (int i = 0; i < pool_size; ++i) {
     if (auto e = build_one_pipeline(i, det_model, rec_model, rec_dict,
-                                    cls_model, layout_model, pdf_only_batch,
-                                    pdf_only_page_h, pdf_only_page_w,
+                                    cls_model, layout_model,
                                     doc_ori_model, det_cfg))
       entries.push_back(std::move(e));
   }
@@ -412,10 +402,8 @@ private:
   std::cout << std::format("Pipeline warmup complete ({} pipelines).\n",
                            entries.size());
   // Carry the build recipe so a watchdog can rebuild a wedged entry in place.
-  PipelineBuildSpec spec{det_model,        rec_model,      rec_dict,
-                         cls_model,         layout_model,   pdf_only_batch,
-                         pdf_only_page_h,   pdf_only_page_w, doc_ori_model,
-                         det_cfg};
+  PipelineBuildSpec spec{det_model,  rec_model,    rec_dict,      cls_model,
+                         layout_model, doc_ori_model, det_cfg};
   return std::make_unique<PipelineDispatcher>(std::move(entries),
                                               std::move(spec));
 }

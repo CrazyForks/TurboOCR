@@ -234,60 +234,10 @@ int OcrPipeline::detect_orientation(const cv::Mat &bgr, cudaStream_t stream) {
   return doc_ori_->detect(bgr, stream);
 }
 
-void OcrPipeline::enable_pdf_only_mode(int batch, int page_h, int page_w) {
-  pdf_only_   = true;
-  pdf_batch_  = batch;
-  pdf_page_h_ = page_h;
-  pdf_page_w_ = page_w;
-  // Det owns the static profile: locks run_batch to {batch,3,H,W} and
-  // grows its batch/CCL buffers when the fixed page exceeds DET_MAX_SIDE².
-  det_->set_pdf_static_profile(batch, page_h, page_w);
-}
-
 void OcrPipeline::warmup_gpu(cudaStream_t stream) {
-  if (pdf_only_) {
-    // HYBRID pdf_only warmup: static det (fixed page size) + batched layout
-    // (fixed 800x800) are warmed at their exact profile shapes here. The
-    // recognition engine is the DYNAMIC 5-bucket rec (see main.cpp) because
-    // a single static rec width squishes wide text lines and tanks accuracy
-    // on multi-column/dense pages — so rec is warmed by the shared 5-bucket
-    // loop below, exactly like the non-pdf path. We deliberately skip the
-    // run(dummy) full-pipeline warmup since it issues a dynamic det shape
-    // the static det engine rejects.
-    const int B = pdf_batch_;
-    const int H = pdf_page_h_;
-    const int W = pdf_page_w_;
-    if (!det_->warmup_pdf_static(stream))
-      throw turbo_ocr::InferenceError("[pdf_only] det static warmup failed");
-
-    // Batched layout warmup at {B,3,800,800}: build B dummy page GpuImages
-    // pointing at one white page-sized buffer so enqueue_batch JITs the
-    // batched profile + reallocs its buffers before the first real request.
-    if (use_layout_ && layout_) {
-      auto &lbuf = img_bufs_[0];
-      if (H > lbuf.cap_rows || W > lbuf.cap_cols) {
-        cudaFree(lbuf.d_buf); lbuf.d_buf = nullptr;
-        CUDA_CHECK(cudaMallocPitch(&lbuf.d_buf, &lbuf.pitch, W * 3, H));
-        lbuf.cap_rows = H; lbuf.cap_cols = W;
-      }
-      CUDA_CHECK(cudaMemset2DAsync(lbuf.d_buf, lbuf.pitch, 255, W * 3, H, stream));
-      std::vector<GpuImage> dummy_pages;
-      std::vector<std::pair<int,int>> dims;
-      for (int i = 0; i < B; ++i) {
-        dummy_pages.push_back({lbuf.d_buf, lbuf.pitch, H, W});
-        dims.emplace_back(H, W);
-      }
-      if (layout_->enqueue_batch(dummy_pages, dims, layout_stream_))
-        (void)layout_->collect_batch();
-    }
-    std::cout << "[Pipeline] PDF-only hybrid warmup: static det B=" << B
-              << " H=" << H << " W=" << W
-              << ", batched layout=" << (use_layout_ ? "on" : "off")
-              << ", dynamic 5-bucket rec\n";
-    // Fall through to the shared 5-bucket rec warmup below.
-  } else {
-    // Run full pipeline with a dummy image to trigger TRT JIT and lazy GPU
-    // allocations. If layout is enabled, the run(...) body hits layout too.
+  // Run full pipeline with a dummy image to trigger TRT JIT and lazy GPU
+  // allocations. If layout is enabled, the run(...) body hits layout too.
+  {
     cv::Mat dummy(100, 100, CV_8UC3, cv::Scalar(255, 255, 255));
     cv::rectangle(dummy, cv::Point(10, 30), cv::Point(90, 70), cv::Scalar(0, 0, 0), 2);
     (void)run(dummy, stream);

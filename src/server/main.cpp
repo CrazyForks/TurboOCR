@@ -111,8 +111,7 @@ int main(int argc, char **argv) try {
   };
   require_model(cfg.det_onnx, "DET");
   require_model(rec_paths.rec, "REC");
-  if (!cfg.pdf_only)
-    require_model(cfg.cls_onnx, "CLS");
+  require_model(cfg.cls_onnx, "CLS");
 
   // Build the PdfRenderer here — AFTER the fail-fast model validation above
   // (so a missing model std::exit(1)s without orphaning forked daemons) but
@@ -133,28 +132,9 @@ int main(int argc, char **argv) try {
   // because in-progress builds by sibling replicas are protected by the
   // 60-second min-age window inside the sweeper.
   turbo_ocr::engine::sweep_orphan_engine_temps();
-  // PDF-only hybrid mode: build DET with a STATIC shape (min==opt==max at
-  // {pdf_batch, 3, pdf_page_h, pdf_page_w}) so TRT specializes tactics for
-  // the one shape every rendered page has. The "det_pdf_static" type makes
-  // onnx_to_trt emit that profile and bake the dims into the cache key.
-  // REC stays the DYNAMIC 5-bucket engine: benchmarks showed a single-width
-  // static rec squishes wide text lines and drops recall to 70-80% on
-  // multi-column/dense pages (vs 98% dynamic) for only ~10-20% speed.
-  // CLS is skipped entirely (rendered PDF pages are upright by
-  // construction), saving its build + per-request pass.
-  const char *det_type = cfg.pdf_only ? "det_pdf_static" : "det";
-  auto det_model = turbo_ocr::engine::ensure_trt_engine(cfg.det_onnx, det_type);
+  auto det_model = turbo_ocr::engine::ensure_trt_engine(cfg.det_onnx, "det");
   auto rec_model = turbo_ocr::engine::ensure_trt_engine(rec_paths.rec, "rec");
-  std::string cls_model;
-  if (!cfg.pdf_only) {
-    cls_model = turbo_ocr::engine::ensure_trt_engine(cfg.cls_onnx, "cls");
-  } else {
-    TOCR_LOG_INFO("PDF-only hybrid: static batched det + dynamic 5-bucket rec, cls skipped",
-                  "dpi",       cfg.pdf_dpi,
-                  "page_h",    cfg.pdf_page_h,
-                  "page_w",    cfg.pdf_page_w,
-                  "batch",     cfg.pdf_batch);
-  }
+  std::string cls_model = turbo_ocr::engine::ensure_trt_engine(cfg.cls_onnx, "cls");
   if (cfg.disable_angle_cls) {
     cls_model.clear();
     TOCR_LOG_INFO("Angle classification disabled via DISABLE_ANGLE_CLS=1");
@@ -247,9 +227,6 @@ int main(int argc, char **argv) try {
 
   auto dispatcher = turbo_ocr::pipeline::make_pipeline_dispatcher(
       pool_size, det_model, rec_model, rec_dict, cls_model, layout_model,
-      cfg.pdf_only ? cfg.pdf_batch  : 0,
-      cfg.pdf_only ? cfg.pdf_page_h : 0,
-      cfg.pdf_only ? cfg.pdf_page_w : 0,
       doc_ori_model, cfg.det_cfg);
   // Some pipelines may have failed to init (logged); key downstream sizing
   // off the count actually built.
@@ -403,8 +380,7 @@ int main(int argc, char **argv) try {
   turbo_ocr::routes::register_image_routes(work_pool, *dispatcher, decode, nvjpeg_available, layout_available,
                                            cfg.max_batch_images);
   turbo_ocr::routes::register_pdf_route(work_pool, *dispatcher, pdf_renderer, default_pdf_mode, layout_available,
-                                        cfg.pdf_only ? cfg.pdf_batch : 0,
-                                        cfg.pdf_only ? cfg.pdf_dpi : 100,
+                                        /*default_dpi=*/100,
                                         cfg.max_pdf_pages,
                                         /*doc_ori_available=*/!doc_ori_model.empty());
 
@@ -420,7 +396,7 @@ int main(int argc, char **argv) try {
     caps.grpc_response_mode  =
         std::string(turbo_ocr::server::detail::grpc_mode_str(cfg.grpc_response_mode));
     caps.honored_auto_verified = true;
-    caps.pdf_default_dpi     = cfg.pdf_only ? cfg.pdf_dpi : 100;
+    caps.pdf_default_dpi     = 100;
     caps.max_pdf_pages       = cfg.max_pdf_pages;
     caps.max_body_mb         = cfg.max_body_mb;
     caps.max_image_dim       = cfg.max_image_dim;

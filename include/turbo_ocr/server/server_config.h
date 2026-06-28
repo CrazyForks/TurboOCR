@@ -132,27 +132,6 @@ struct ServerConfig {
   pdf::PdfMode default_pdf_mode = pdf::PdfMode::Ocr;
   bool        default_pdf_mode_was_set = false;
 
-  // ---- PDF-only hybrid mode -----------------------------------------------
-  // When `pdf_only` is true, the DET engine is built with a STATIC input
-  // shape (min==opt==max) at {pdf_batch, 3, pdf_page_h, pdf_page_w} — TRT
-  // specializes tactics for one shape with zero dynamic-shape overhead at
-  // execute time. Pages render at `pdf_dpi` (the /ocr/pdf default; an
-  // explicit ?dpi= still wins) and det resize-fits each page into the
-  // static shape, so pick page_h/w to match pdf_dpi renders of the
-  // dominant page size. REC stays the dynamic 5-bucket engine (a static
-  // single-width rec squishes wide lines and tanks recall) and CLS is
-  // skipped entirely (rendered pages are upright by construction).
-  //   TURBO_OCR_PDF_ONLY=1                  enable
-  //   TURBO_OCR_PDF_DPI=150                 default render DPI for /ocr/pdf
-  //   TURBO_OCR_PDF_PAGE_H=1280  PAGE_W=960 static det dims (multiple of 32)
-  //   TURBO_OCR_PDF_BATCH=8                 static det batch dim (≤ the
-  //                                          pipeline's 8-image batch chunk)
-  bool pdf_only       = false;
-  int  pdf_dpi        = 150;
-  int  pdf_page_h     = 1280;
-  int  pdf_page_w     = 960;
-  int  pdf_batch      = 8;
-
   /// Effective profile this config was loaded for. Set by from_env.
   Profile profile = build_profile();
 
@@ -280,11 +259,6 @@ inline std::string ServerConfig::to_json() const {
   j += ",\"ocr_lang\":"          + esc(ocr_lang_value);
   j += ",\"disable_angle_cls\":" + std::string(disable_angle_cls ? "true" : "false");
   j += ",\"layout_disabled\":"   + std::string(layout_disabled ? "true" : "false");
-  j += ",\"pdf_only\":"          + std::string(pdf_only ? "true" : "false");
-  j += ",\"pdf_dpi\":"           + std::to_string(pdf_dpi);
-  j += ",\"pdf_page_h\":"        + std::to_string(pdf_page_h);
-  j += ",\"pdf_page_w\":"        + std::to_string(pdf_page_w);
-  j += ",\"pdf_batch\":"         + std::to_string(pdf_batch);
   j += ",\"default_pdf_mode\":"  + esc(pdf::mode_name(default_pdf_mode));
   // Report the EFFECTIVE det config (per-model base + DET_* env overrides) so
   // the post-mortem matches what the detector actually runs. det_max_side was
@@ -415,22 +389,6 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
   c.disable_angle_cls = env_bool_strict("DISABLE_ANGLE_CLS", false, c.errors);
   c.layout_disabled   = env_bool_strict("DISABLE_LAYOUT",    false, c.errors);
 
-  // PDF-only hybrid mode (env-only by design — operators flip this at
-  // boot, not per-request). Defaults match A4 portrait at 150 DPI rounded
-  // to multiples of 32: 1280 × 960. Sizes outside [32, 4096] are rejected.
-  // pdf_batch is capped at 8 = the pipeline's batch chunk size — a larger
-  // static det batch dim could never be filled and would only pad.
-  c.pdf_only       = env_bool_strict("TURBO_OCR_PDF_ONLY", false, c.errors);
-  c.pdf_dpi        = env_int_strict("TURBO_OCR_PDF_DPI",        150,  50,  600,  c.errors);
-  c.pdf_page_h     = env_int_strict("TURBO_OCR_PDF_PAGE_H",     1280, 32,  4096, c.errors);
-  c.pdf_page_w     = env_int_strict("TURBO_OCR_PDF_PAGE_W",     960,  32,  4096, c.errors);
-  c.pdf_batch      = env_int_strict("TURBO_OCR_PDF_BATCH",      8,    1,   8,    c.errors);
-  if (c.pdf_only && (c.pdf_page_h % 32 != 0 || c.pdf_page_w % 32 != 0)) {
-    c.errors.push_back("TURBO_OCR_PDF_PAGE_H/_PAGE_W must each be a multiple "
-                       "of 32 (det engine requires it); got H=" +
-                       std::to_string(c.pdf_page_h) + " W=" +
-                       std::to_string(c.pdf_page_w));
-  }
   // ENABLE_LAYOUT removed — operators must migrate.
   if (env_present("ENABLE_LAYOUT")) {
     c.errors.push_back(

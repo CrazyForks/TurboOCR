@@ -68,14 +68,6 @@ public:
                      const std::string &formula_onnx,
                      const std::string &formula_tokenizer_json);
 
-  // PDF-only hybrid mode: static batched det at the fixed render size +
-  // batched layout; rec stays the dynamic 5-bucket engine and cls is
-  // skipped entirely (rendered PDF pages are upright by construction).
-  // Call once after init() with the validated ServerConfig values —
-  // the pipeline and its stages never read TURBO_OCR_PDF_* env directly,
-  // so the engine profile and the runtime path can't disagree.
-  void enable_pdf_only_mode(int batch, int page_h, int page_w);
-
   // Load the document-orientation model (PP-LCNet_x1_0_doc_ori). Optional;
   // when loaded, detect_orientation() powers /ocr/pdf?autorotate=1. Must be
   // called after init(). Returns false on load failure (caller logs + treats
@@ -205,9 +197,8 @@ public:
   [[nodiscard]] std::vector<std::vector<OCRResultItem>>
   run_batch(const std::vector<cv::Mat> &imgs, cudaStream_t stream = 0);
 
-  // Batch counterpart of run_with_layout: batched det (static-shape in
-  // pdf_only mode), cross-image batched rec, and — when want_layout —
-  // layout (one batched TRT execute in pdf_only mode) + CUA router per
+  // Batch counterpart of run_with_layout: batched det, cross-image batched
+  // rec, and — when want_layout — per-page layout + CUA router per
   // page. Returns full per-page results: text, layout, tables, formulas,
   // and reading order when requested. Callers should chunk at most
   // kMaxBatchImages images per call (extra images are dropped with a
@@ -228,13 +219,6 @@ private:
   bool use_cls_ = false;
   bool use_layout_ = false;
   bool use_doc_ori_ = false;
-
-  // PDF-only hybrid mode (see enable_pdf_only_mode). batch/page dims are
-  // the static det engine's only accepted profile shape.
-  bool pdf_only_ = false;
-  int pdf_batch_ = 0;
-  int pdf_page_h_ = 0;
-  int pdf_page_w_ = 0;
 
   // Shared GPU upload: wait for previous rec, toggle double-buffer, grow-only
   // realloc, pinned staging memcpy, async H2D. Used by run_with_layout and
@@ -360,9 +344,8 @@ private:
   void prewarm_openai_registry_(const std::string &modality,
                                 const routing::RoutingTable &tbl);
 
-  // Phase 4 of run_batch_with_layout: layout (one batched TRT execute in
-  // pdf_only mode, per-image otherwise), CUA router dispatch, and reading-
-  // order assignment. `image_crops[i].img` is page i on GPU; `.boxes` are
+  // Phase 4 of run_batch_with_layout: per-image layout, CUA router dispatch,
+  // and reading-order assignment. `image_crops[i].img` is page i on GPU; `.boxes` are
   // the det boxes recognition ran on. Caller guarantees layout_ is loaded.
   void run_batch_layout_stage_(
       const std::vector<recognition::PaddleRec::ImageCrops> &image_crops,

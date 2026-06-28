@@ -68,20 +68,6 @@ using turbo_ocr::detection::kDetMaxSideMin;
   return v;
 }
 
-// ---------- PDF-only fixed-resolution mode ----------------------------------
-// When the operator boots with TURBO_OCR_PDF_ONLY=1, the DET TRT engine is
-// built with a STATIC (min==opt==max) input profile at {pdf_batch, 3,
-// pdf_page_h, pdf_page_w} — TRT picks tactics optimal for that exact size
-// and elides every dynamic-shape branch at execute time. Pages render at
-// the pdf_dpi default and det resize-fits them into the static shape. Rec
-// stays dynamic 5-bucket and cls is skipped (hybrid mode — see ServerConfig).
-//
-// Same env vars + bounds as ServerConfig (which validates them and aborts
-// boot on errors before any engine builds, so these reads see sane values).
-[[nodiscard]] static int read_pdf_page_h() { return server::env_int("TURBO_OCR_PDF_PAGE_H", 1280, 32, 4096); }
-[[nodiscard]] static int read_pdf_page_w() { return server::env_int("TURBO_OCR_PDF_PAGE_W", 960,  32, 4096); }
-[[nodiscard]] static int read_pdf_batch()  { return server::env_int("TURBO_OCR_PDF_BATCH",  8,    1,  8); }
-
 static class BuildLogger : public nvinfer1::ILogger {
 public:
   void log(Severity severity, const char *msg) noexcept override {
@@ -174,14 +160,6 @@ std::string get_cached_engine_path(const std::string &onnx_path,
   // no rebuild is triggered on upgrade.
   if (type == "rec" && TrtEngine::graphs_enabled())
     key += ":gp12aux0";
-  // PDF-only static det engine: the cache must distinguish between
-  // different fixed shapes / batches, so bake the page dims + batch into
-  // the cache key — a DPI change rebuilds rather than reusing stale.
-  if (type == "det_pdf_static") {
-    key += ":pdfh" + std::to_string(read_pdf_page_h()) +
-           ":pdfw" + std::to_string(read_pdf_page_w()) +
-           ":pdfb" + std::to_string(read_pdf_batch());
-  }
   // TRT_OPT_LEVEL changes which kernels TensorRT picks, so the produced
   // engine differs. Operators that toggle the level get separate cached
   // engines instead of silently reusing a stale one.
@@ -282,14 +260,6 @@ static bool build_engine(const std::string &onnx_path,
   } else if (type == "slanext_wired" || type == "slanext_wireless" ||
              type == "formula") {
     workspace_bytes = 2ULL << 30;          // 2 GiB (plan 07 §5)
-  } else if (type == "det_pdf_static") {
-    // Static-shape PDF det engine: same workspace policy as dynamic det,
-    // scaled by the larger of the two PDF page dims (since both are fixed).
-    double side = std::max(read_pdf_page_h(), read_pdf_page_w());
-    double scale = (side / 960.0) * (side / 960.0);
-    size_t scaled = static_cast<size_t>((1ULL << 30) * scale);
-    workspace_bytes = std::min(scaled, size_t(4ULL << 30));
-    if (workspace_bytes < (1ULL << 30)) workspace_bytes = 1ULL << 30;
   } else if (type == "rec") {
     // v6 rec (EncoderWithLightSVTR) fuses the whole graph into one large
     // attention ForeignNode; 1 GiB starves the tactic search on the medium
@@ -331,20 +301,6 @@ static bool build_engine(const std::string &onnx_path,
         nvinfer1::Dims4{det_opt_batch, 3, det_opt, det_opt});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
         nvinfer1::Dims4{8, 3, det_max, det_max});
-  } else if (type == "det_pdf_static") {
-    // PDF-only mode: every page is rendered to the SAME (H, W) at a fixed
-    // DPI, so we pin the profile to a single shape (min==opt==max) at the
-    // configured batch. TRT can fully specialize: no dynamic-shape branches
-    // at execute time, tactic search runs once for this exact shape.
-    const int B = read_pdf_batch();
-    const int H = read_pdf_page_h();
-    const int W = read_pdf_page_w();
-    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
-        nvinfer1::Dims4{B, 3, H, W});
-    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
-        nvinfer1::Dims4{B, 3, H, W});
-    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
-        nvinfer1::Dims4{B, 3, H, W});
   } else if (type == "rec") {
     // Profile 0: dynamic profile, covers all shapes (the default serving path).
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,

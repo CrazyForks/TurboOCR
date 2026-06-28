@@ -125,7 +125,7 @@ mobile det+rec on GPU.
 .venv/bin/python bench_turbo_tiers.py --datasets funsd cord --n 50
 
 # Complex-document pipelines (OmniDocBench-125, official scorer):
-DET_MAX_SIDE=2048 OCR_MODEL=<tier> ./build/paddle_highspeed_cpp        # TurboOCR server
+DET_MAX_SIDE=2048 OCR_MODEL=<tier> ./build/turboocr-server        # TurboOCR server
 python tools/omnidoc_run.py          --images-dir <125> --out-dir <d> --server :8080
 python tools/omnidoc_run_paddlevl.py --images-dir <125> --out-dir <d> --server :8003/v1
 python omnidocbench/pdf_validation.py --config <end2end.yaml>          # text_block edit

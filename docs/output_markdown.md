@@ -103,8 +103,8 @@ STATIC` source list in `CMakeLists.txt`:
     src/output/markdown_export.cpp
 ```
 
-That makes it available to both servers (`paddle_highspeed_cpp` and
-`paddle_cpu_server` link `turbo_ocr_common` transitively) and to the test exe.
+That makes it available to both servers (`turboocr-server` and
+`turboocr-cpu-server` link `turbo_ocr_common` transitively) and to the test exe.
 
 ### 2. Route — `POST /ocr/markdown` (GPU build)
 

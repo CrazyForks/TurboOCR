@@ -1,4 +1,4 @@
-site_name: paddle-highspeed-cpp
+site_name: TurboOCR
 site_description: "Multi-stream OCR pipeline — det, cls, layout, router, rec, table, formula"
 site_author: ""
 site_url: "https://aiptimizer.github.io/TurboOCR/"

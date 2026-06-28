@@ -1,6 +1,6 @@
 # CUDA streams
 
-paddle-highspeed-cpp uses **five named CUDA streams plus six CUDA events** to fan computation out and back in. The text-only path uses three of the streams and pays zero cost for the unused two — the constraint that the entire stream graph is engineered around.
+TurboOCR uses **five named CUDA streams plus six CUDA events** to fan computation out and back in. The text-only path uses three of the streams and pays zero cost for the unused two — the constraint that the entire stream graph is engineered around.
 
 ## The five streams
 

@@ -63,7 +63,7 @@ Full documentation: **<https://aiptimizer.github.io/TurboOCR/>**
 
 ## Quick Start
 
-**Requirements:** Linux, NVIDIA driver 595+, Turing or newer GPU (RTX 20-series / GTX 16-series+).
+**Requirements:** Linux, NVIDIA driver 595+, Turing or newer GPU (RTX 20-series / GTX 16-series+). Plan for ~4 GB VRAM text-only and ~8 GB for the full pipeline (layout + tables + formulas); each extra `PIPELINE_POOL_SIZE` replica adds roughly another full set, so lower it on smaller cards.
 
 ```bash
 docker run --gpus all -p 8000:8000 -p 50051:50051 \
@@ -152,7 +152,7 @@ opt-in and only load when configured. Each stage links to its own model page.
 | **Text recognition** | PP-OCRv6 rec (CRNN + CTC, Latin + Chinese + Japanese) | 4.3 / 20 / 73 MB | `OCR_MODEL` tier — default `tiny` | [recognition](docs/models/recognition.md) · [selection](docs/models/selection.md) |
 | **Orientation** | PP-LCNet textline angle classifier | ~1 MB | always on (runs only on vertical lines) | [classification](docs/models/classification.md) |
 | **Layout** | PP-DocLayoutV3 (RT-DETR-L, 25 classes) | ~124 MB | per request via `?layout=1`; disable with `DISABLE_LAYOUT=1` | [layout](docs/models/layout.md) |
-| **Table → HTML** | SLANet-Plus (TRT FP16 CNN encoder + hand-written C++ GRU decoder) | ~5 MB | `TABLE_BACKEND=slanext` *(default backend)* + encoder paths | [table](docs/models/table.md) |
+| **Table → HTML** | SLANet-Plus (TRT FP16 CNN encoder + hand-written C++ GRU decoder) | ~5 MB | `TABLE_BACKEND=slanext` *(encoder auto-resolved from the bundle)* | [table](docs/models/table.md) |
 | **Formula → LaTeX** | PP-FormulaNet-S, in-process pure-C++ (ORT-CUDA-13, no Python) | ~294 MB | `FORMULA_BACKEND=ppformulanet_s` | [formula](docs/models/formula.md) |
 
 The three OCR tiers (`tiny`/`small`/`medium`) all cover the same Latin + Chinese +
@@ -179,7 +179,7 @@ backend is set, run any request with `layout` enabled and the response gains
 | Capability | Enable at startup | Recognizer |
 |---|---|---|
 | Formula → LaTeX | `FORMULA_BACKEND=ppformulanet_s` | PP-FormulaNet-S |
-| Table → HTML | `TABLE_BACKEND=slanext` (+ SLANet-Plus model paths) | SLANet-Plus |
+| Table → HTML | `TABLE_BACKEND=slanext` (encoder auto-resolved from the bundle) | SLANet-Plus |
 
 ```bash
 docker run --gpus all -p 8000:8000 \
@@ -196,17 +196,20 @@ curl -X POST "http://localhost:8000/ocr/raw?layout=1" \
 
 ## Running the legacy PP-OCRv5 models
 
-The previous-generation **PP-OCRv5** detection + recognition models are retained
-alongside the v6 default (`models/det_v5.onnx`, `models/rec_v5.onnx`,
-`models/keys_v5.txt`). Select them by pointing the three per-stage path overrides
-at the v5 files — everything else (layout, table, formula, orientation) is
-unchanged, so it is a drop-in swap of just the text detector + recognizer:
+The previous-generation **PP-OCRv5** detection + recognition models
+(`models/det_v5.onnx`, `models/rec_v5.onnx`, `models/keys_v5.txt`) are **not**
+part of the default v3 release bundle — `scripts/fetch_release_models.sh` ships
+only the v6 tiers and the retained per-script v5 recognizers. To use the v5
+Latin detector/recognizer, supply those three files yourself, then point the
+per-stage path overrides at them — everything else (layout, table, formula,
+orientation) is unchanged, so it is a drop-in swap of just the text detector +
+recognizer:
 
 ```bash
 DET_ONNX=models/det_v5.onnx \
 REC_ONNX=models/rec_v5.onnx \
 REC_DICT=models/keys_v5.txt \
-LD_LIBRARY_PATH=/usr/local/tensorrt/lib ./build/paddle_highspeed_cpp
+LD_LIBRARY_PATH=/usr/local/tensorrt/lib ./build/turboocr-server
 ```
 
 `DET_ONNX` / `REC_ONNX` / `REC_DICT` override `OCR_MODEL` per stage; the TensorRT
@@ -315,7 +318,7 @@ docker run --gpus all -p 8000:8000 -p 50051:50051 \
 # Native (PP-OCRv6 models auto-fetched into ./models/ on first build)
 cmake -B build -DTENSORRT_DIR=/usr/local/tensorrt
 cmake --build build -j$(nproc)
-LD_LIBRARY_PATH=/usr/local/tensorrt/lib ./build/paddle_highspeed_cpp
+LD_LIBRARY_PATH=/usr/local/tensorrt/lib ./build/turboocr-server
 ```
 
 Needs GCC 13.3+/C++20, CUDA + TensorRT 10.2+, OpenCV 4.x, Drogon 1.9+, gRPC.

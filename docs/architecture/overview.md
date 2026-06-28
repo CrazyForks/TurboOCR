@@ -1,6 +1,6 @@
 # Architecture overview
 
-paddle-highspeed-cpp is a multi-stream OCR pipeline tuned for one number: **~270 ms p50 per page** on the text-only hot path, on an RTX 5090 (sm_120 / Blackwell). Every other design choice — TensorRT over ONNX Runtime, five named CUDA streams, lazy-loaded layout / table / formula stages, a CPU-side router — is downstream of that constraint.
+TurboOCR is a multi-stream OCR pipeline tuned for one number: **~270 ms p50 per page** on the text-only hot path, on an RTX 5090 (sm_120 / Blackwell). Every other design choice — TensorRT over ONNX Runtime, five named CUDA streams, lazy-loaded layout / table / formula stages, a CPU-side router — is downstream of that constraint.
 
 ## The 270 ms invariant
 

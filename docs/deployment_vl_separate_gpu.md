@@ -21,7 +21,7 @@ then falls back to native support). Plain `vllm serve` is the correct path.
 CUDA_VISIBLE_DEVICES=1 \
 PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-PATH="/workspace/.venv-vllm/bin:$PATH" \
+PATH="/path/to/vllm-venv/bin:$PATH" \
 vllm serve /path/to/models--PaddlePaddle--PaddleOCR-VL-1.6/snapshots/<snap> \
   --port 8077 \
   --trust-remote-code \
@@ -72,8 +72,8 @@ the same `base_url`. Save as `routing.json`:
 Launch the C++ server with the config:
 ```bash
 TURBO_ROUTING_CONFIG=/path/to/routing.json \
-LD_LIBRARY_PATH=/home/user/TensorRT-10.15.1.29/lib \
-./build/paddle_highspeed_cpp   # + your usual server flags
+LD_LIBRARY_PATH=/path/to/TensorRT/lib \
+./build/turboocr-server   # + your usual server flags
 ```
 
 Verify the wiring (no secrets are emitted — names + kinds only):

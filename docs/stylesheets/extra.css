@@ -1,5 +1,5 @@
 /* ============================================================
- * paddle-highspeed-cpp — custom typographic + visual layer
+ * TurboOCR — custom typographic + visual layer
  * Sits on top of mkdocs-material's defaults. All custom tokens
  * live under --phc-*; do not override Material variables that
  * the toggle palette switches at runtime.

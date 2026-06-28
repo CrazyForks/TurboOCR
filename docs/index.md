@@ -1,4 +1,4 @@
-# paddle-highspeed-cpp
+# TurboOCR
 
 !!! abstract "TL;DR"
     Multi-stream OCR pipeline that holds **6 ms p50** on RTX 5090 for the text-only short-circuit path, with opt-in layout / table / formula stages that fan out on dedicated CUDA streams.

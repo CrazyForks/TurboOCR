@@ -138,7 +138,7 @@ distance (0.326 vs 0.243). All "ours" cells below are the **full 1651-page** run
 | GPT-5.2 | General VLM | 86.59 | 0.114 | 88.21 | 82.95 | 0.193 |
 | Mistral OCR | Specialised VLM | 85.66 | 0.097 | 89.91 | 76.78 | 0.171 |
 | Marker | Pipeline tool | 78.44 | 0.157 | 85.24 | 65.77 | 0.243 |
-| **paddle-highspeed-cpp (ours, May 17, full 1651)** | **Pipeline tool** | **≈ 49.0** ‡ | **0.160** | re-measure pending § | **0.568** | **0.326** |
+| **TurboOCR (ours, May 17, full 1651)** | **Pipeline tool** | **≈ 49.0** ‡ | **0.160** | re-measure pending § | **0.568** | **0.326** |
 | ours, English-only subset (full 1651) | Pipeline tool | n/a | **0.079** | — | — | — |
 
 ‡ Pre formula-fix floor — embeds the since-fixed formula 0.063; pending re-measure with the fixed stage.
@@ -179,7 +179,7 @@ LD_LIBRARY_PATH="$HOME/TensorRT-10.15.1.29/lib:$LD_LIBRARY_PATH" \
 
 # 2. Render predictions for all 1651 pages (~18 s wall on RTX 5090)
 timeout 600 python tools/omnidoc_run.py \
-  --in /workspace/omnidocbench/data/v1.7 \
+  --in /path/to/omnidocbench/data/v1.7 \
   --out /tmp/omnidoc_predictions/json \
   --url 'http://127.0.0.1:8000/ocr/raw?layout=1&reading_order=1&tables=1&formulas=1'
 
@@ -189,7 +189,7 @@ timeout 600 python tools/omnidoc_to_md.py \
   --out /tmp/omnidoc_predictions/md
 
 # 4. Run the OmniDocBench scorer
-cd /workspace/omnidocbench && \
+cd /path/to/omnidocbench && \
   timeout 1800 python -m src.runtime.evaluator \
     --config configs/end2end_paddle_optim.yaml \
     --predictions /tmp/omnidoc_predictions/md \

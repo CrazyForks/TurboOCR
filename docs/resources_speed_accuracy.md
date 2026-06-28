@@ -236,7 +236,7 @@ For the local pipeline, enable the formula backend + the reading-order param:
 FORMULA_BACKEND=ppformulanet_s \
   FORMULA_ONNX=models/formula/ppformulanet_s/ \
   FORMULA_TOKENIZER=models/formula/ppformulanet_s/tokenizer.json \
-  ./build/paddle_highspeed_cpp ...
+  ./build/turboocr-server ...
 # Runs in-process on ORT-CUDA-13 (no Python, no sidecar) from the fast/ split
 # graphs. It fails loud if it can't reach the GPU or the fast/ graphs are
 # missing, and surfaces per-region failures as formula_degraded.

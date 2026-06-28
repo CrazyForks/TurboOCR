@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="tests/benchmark/comparison/images/banner.png" alt="TurboOCR — Fast GPU OCR server." width="100%">
+  <img src="tests/benchmark/comparison/images/banner.png" alt="TurboOCR — the fastest GPU document parser." width="100%">
 </p>
 
 <p align="center">
-  <strong>GPU-accelerated OCR server. 15–90× faster than other OCR engines.</strong><br>
+  <strong>The fastest GPU document parser — OCR · layout · tables · formulas → Markdown. 15–90× faster than other OCR engines.</strong><br>
   C++ / CUDA / TensorRT / PP-OCRv6 &mdash; Linux + NVIDIA GPU
 </p>
 
@@ -40,9 +40,11 @@
 
 ---
 
-A production OCR server that runs PP-OCRv6 detection + recognition (+ optional
-layout and PDF parsing) on a single multi-stream CUDA/TensorRT pipeline, behind
-HTTP and gRPC. On forms and receipts it is both the most accurate open engine and
+An extremely fast GPU **document parser** — not just OCR. PP-OCRv6 detection +
+recognition, plus layout, tables (→ HTML), formulas (→ LaTeX) and reading-order
+**Markdown**, the whole pipeline on a single multi-stream CUDA/TensorRT engine,
+locally (no VLM), behind HTTP and gRPC. It turns documents into structured data
+at OCR speed: on forms and receipts it is both the most accurate open engine and
 15–90× faster than the alternatives.
 
 - 🚀 **Up to 556 img/s** (receipts) / **481 img/s** (forms) on one RTX 5090, fastest by default
@@ -242,11 +244,12 @@ sort into three buckets — only the first needs a config change.
 - **Detection resize defaults changed** (max-side `960` → `limit_type=min`, `limit_side_len=64`, `max_side_limit=1280`), so detection boxes — and therefore OCR output — differ slightly. Tune via `DET_MAX_SIDE_LIMIT` / `DET_LIMIT_TYPE` / `DET_LIMIT_SIDE_LEN` (`DET_MAX_SIDE` still honored).
 - **GPU out-of-memory now returns `500 INFERENCE_ERROR`** instead of a blank `200`, and a sticky CUDA fault `_Exit`s the process for a clean restart. Under sustained overload, queued work whose client deadline already elapsed is dropped (the caller gets its `504`) rather than processed late. Clients should handle 5xx/504 and retry.
 - **A bare launch announces text-only mode.** With neither `FORMULA_BACKEND` nor `TABLE_BACKEND` set, the server runs text-only (tables/formulas empty) and now logs a one-time `[Pipeline] NOTE: table + formula stages are DISABLED — running TEXT-ONLY …`, so a text-only run can't be silently mistaken for a full-document one.
+- **New input-size caps** (previously-accepted requests are now rejected): `/ocr/batch` and gRPC `RecognizeBatch` cap at **1024 images** → `400 BATCH_TOO_LARGE` (split the batch or raise `MAX_BATCH_IMAGES`); `/ocr/pdf` rendered pages cap at **~40 MP/page** → very large pages at high DPI fail to render (lower `?dpi=` or raise `MAX_PDF_PAGE_PIXELS_MP`); and `/ocr`, `/ocr/raw`, `/ocr/batch`, `/infer` now also reject images over **128 MP total area** → `400 PIXELS_TOO_LARGE`, in addition to the existing per-side `MAX_IMAGE_DIM` guard (downscale, or raise `MAX_IMAGE_PIXELS_MP`).
 
 **Additive / transparent** (nothing to do):
 
 - **`OCR_MODEL` is the new selector name; `OCR_LANG` still works** as a deprecated alias (warns on use), so this is backward-compatible. Select by tier/model name (`tiny`/`small`/`medium`, or `arabic`/`eslav`/`korean`/`thai`/`greek`).
-- **The Python formula sidecar is gone — transparently.** `FORMULA_BACKEND=ppformulanet_s` is now a fully **in-process pure-C++ PP-FormulaNet-S recognizer** on ORT-CUDA-13: same backend name, same output, no separate Python process to launch or manage. Set `FORMULA_DEVICE=cpu` for an ORT `CPUExecutionProvider` decode (no CUDA, no Python). Only callers of the deleted sidecar script / `PPFNS_SIDECAR_SCRIPT` env are affected (see *Breaking* above).
+- **The Python formula sidecar is gone — transparently.** `FORMULA_BACKEND=ppformulanet_s` is now a fully **in-process pure-C++ PP-FormulaNet-S recognizer** on ORT-CUDA-13: same backend name, same output, no separate Python process to launch or manage. (The GPU path is FAST split-graph only; the CPU-only build decodes formulas on ORT CPU automatically.) Only callers of the deleted sidecar script / `PPFNS_SIDECAR_SCRIPT` env are affected (see *Breaking* above).
 - **New `POST /ocr/markdown` route** (GPU build) exports a parsed page as faithful Markdown. Purely additive — existing routes are unchanged.
 - **Oversized-image guard on `/infer`.** Like the other image routes, `/infer` now rejects inputs whose dimensions exceed `MAX_IMAGE_DIM` (default `16384`) with `400 DIMENSIONS_TOO_LARGE` (a decompression-bomb guard). Only affects callers that were sending images larger than 16384 px on a side.
 - **New `*_degraded` response signals.** When a configured stage produces nothing, the JSON now carries `text_degraded` / `table_degraded` / `formula_degraded` (+ a `*_warning` string) on `/ocr`, `/ocr/raw`, `/ocr/batch` and `/ocr/pdf`, and `/ocr/markdown` sets an `X-OCR-Degraded` header — so a partial result is never a silent clean `200` (a configured-but-failed stage also now fails at boot rather than serving empties). New fields only; ignore them and nothing changes.
@@ -266,7 +269,10 @@ One binary serves HTTP and gRPC from a shared GPU pipeline pool.
 | `POST /ocr/batch` | Batch of images |
 | `POST /ocr/pdf` | PDF → text (optional page images & auto-rotate) |
 | `POST /ocr/markdown` | Page → faithful Markdown (GPU build; requires layout) |
+| `POST /infer` | OCR + layout / reading-order / blocks in one structured response |
+| `GET /capabilities` | Runtime feature & route discovery |
 | `GET /metrics` | Prometheus metrics |
+| `GET /health` · `/health/live` · `/health/ready` | Liveness / readiness probes |
 
 All endpoints accept `?layout=1` (region detection + reading order). Example:
 
@@ -289,6 +295,7 @@ Common ones:
 | `OCR_MODEL` | `tiny` | `tiny` / `small` / `medium`, or a PP-OCRv5 script model |
 | `DISABLE_LAYOUT` | `0` | `1` skips the layout model (~300–500 MB VRAM) |
 | `LAYOUT_MERGE_MODE` | `all` | Nested-box policy: `all` (keep every box) / `outer` (outer regions only) / `inner` (innermost only). Old `large`/`small`/`union` accepted as aliases. |
+| `LAYOUT_KEEP_NESTED_CHILDREN` | `0` | Only affects `outer`/`inner` modes: `1` still keeps the model's nested child regions (`figure_title`, `footnote`, `formula_number`, `paragraph_title`) instead of dropping them inside a parent. Formulas are always kept; no effect under default `all`. |
 | `REQUEST_TIMEOUT_MS` | `60000` | Per-request inference deadline; on overrun returns `504` and frees the slot. `0` = unbounded (pre-v3 behaviour). |
 | `PIPELINE_POOL_SIZE` | auto | Concurrent GPU pipelines |
 

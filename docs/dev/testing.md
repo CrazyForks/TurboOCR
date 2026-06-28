@@ -139,7 +139,7 @@ Standalone shell + Python harnesses for performance work:
 | `tests/benchmark/bench_matrix.py` | Cross-product of fixtures × concurrency — primary regression input. |
 
 !!! tip "bench_cua_loop exit codes"
-    Per `.claude/plans/06_benchmark_harness.md §6`:
+    Per internal engineering notes:
     `0 = PASS`, `1 = INFRA`, `2 = server-down`,
     `3 = ALERT`, `4 = HALT`. Anything non-zero blocks the merge.
 

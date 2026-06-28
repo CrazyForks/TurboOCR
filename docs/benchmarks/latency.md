@@ -15,7 +15,7 @@ Per-fixture text_only p50 (ms) from the first sweep:
 business_letter 12.3, dense_text 13.6, multi_language 5.0, small_text 8.3,
 03_book_page 5.6, 08_document_scan 5.7.
 
-Source: `.claude/plans/99_bench_diary.md` (8 sweeps over a 3-hour autonomous
+Source: internal engineering notes (8 sweeps over a 3-hour autonomous
 window, 0 HALT, 0 text-only ALERTs).
 
 ## Why 270 ms was conservative
@@ -38,7 +38,7 @@ bench activity (loadavg 1m: 2.32 at the noise-floor sample).
 
 ## Stage budget (text-only target)
 
-From `.claude/plans/06_benchmark_harness.md` §3. Stages overlap on multiple
+From internal engineering notes §3. Stages overlap on multiple
 CUDA streams (see [cuda-streams](../architecture/cuda-streams.md)) — these
 are individual budgets, not a sum.
 
@@ -99,14 +99,14 @@ Aggregate over the 3-hour window:
   > 1.20× prior 0.7 ms — well below the absolute 300 ms ceiling)
 - Final text-only baseline: **6.0 ms p50 → 45× under the 270 ms target**
 
-Full per-sweep notes in `.claude/plans/99_bench_diary.md`.
+Full per-sweep notes in internal engineering notes.
 
 ## Regression detector
 
 The harness writes one JSON per sweep under `/tmp/cua_bench/<timestamp>.json`
 and maintains `latest.json` + `baseline.json` (rolling median of last 3
 PASS p50s per scenario). Decision table (from
-`.claude/plans/06_benchmark_harness.md` §4):
+internal engineering notes §4):
 
 | Scenario | Condition | Verdict |
 |---|---|---|

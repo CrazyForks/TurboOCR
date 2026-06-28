@@ -1,7 +1,7 @@
 # Plan history
 
 !!! abstract "TL;DR"
-    `.claude/plans/` is the running engineering log: every architectural
+    internal engineering notes is the running engineering log: every architectural
     decision, recon, and post-mortem lives there as a self-contained
     markdown file. Grouped roughly by phase below; one-liners describe
     what each document captures.
@@ -125,7 +125,7 @@
   that produced this entire docs tree).
 
 !!! tip "Every plan is self-contained"
-    Each file in `.claude/plans/` states the question being answered,
+    Each file in internal engineering notes states the question being answered,
     the experiment run, and the verdict. Pull the matching plan when
     you need to know **why** something is the way it is.
 

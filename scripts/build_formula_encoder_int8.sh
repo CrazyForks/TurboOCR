@@ -4,7 +4,7 @@
 # formula_resizer.
 #
 # The released encoder.onnx already carries some Q/DQ ops baked in per
-# models/MANIFEST.txt + .claude/plans/07_build_integration.md §6 — modelopt
+# models/MANIFEST.txt + internal engineering notes §6 — modelopt
 # will add per-tensor activation scales on top. If the resulting engine is
 # the same size or slower than FP16, the upstream Q/DQ scales may already
 # saturate the achievable INT8 gain on this architecture — drop the flag and

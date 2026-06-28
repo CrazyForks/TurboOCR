@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Convert per-image OCR JSON into OmniDocBench-style markdown.
 
-Mapping per `.claude/plans/omnidoc_class_mapping.md`. Tables and formulas
+Mapping per internal engineering notes. Tables and formulas
 are emitted as v1 placeholders since the pipeline's `tables[]` /
 `formulas[]` outputs are empty.
 """

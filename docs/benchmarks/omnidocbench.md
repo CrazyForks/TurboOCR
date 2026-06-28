@@ -48,14 +48,14 @@ the same eval config.
 | **SOTA integration** | **2026-05-17** | **0.160** | **0.568** | 0.063 *(bug, since fixed)* | **0.326** | **≈ 49.0** |
 
 (All rows are the **full 1651-page** set.) Net delta vs baseline: **+16.7 composite points**
-(32.27 → 49.0). The forensic prediction in `.claude/plans/forensic_findings.md` was +25 from
+(32.27 → 49.0). The forensic prediction in internal engineering notes was +25 from
 tables and +10 from CJK rec; realized gain matches the table line (TEDS
 0.03 → 0.57) and the CJK line (text 0.51 → 0.16). The third line (formulas
 +10) was offset at the time by an integration bug in the formula stage; that bug is **now fixed** (the
 in-process PP-FormulaNet-S decoder scores CDM 0.805 on the 125-doc subset — see §4), so the full-1651
 composite above understates the current pipeline and is pending a re-measure.
 
-Baseline (May 14) numbers are sourced from `.claude/plans/omnidoc_result.md`
+Baseline (May 14) numbers are sourced from internal engineering notes
 §1 because the on-disk `md_quick_match_metric_result.json` was overwritten
 by today's SOTA regen. The May 15 optim numbers come from
 `omnidocbench/result/md_optim_quick_match_metric_result.json` (still on
@@ -168,7 +168,7 @@ upstream model availability; once the tables and CJK gates opened, the
 composite jumped accordingly. The `md_sota_v*` series in
 `omnidocbench/result/` (v2…v30) records the intermediate model-swap and
 re-export iterations that funnelled into today's SOTA tag — see
-`.claude/plans/{cjk_push,formula_*,sota_*}.md` for the per-attempt diary.
+internal engineering notes for the per-attempt diary.
 
 ## 6. Reproduce
 

@@ -150,7 +150,7 @@ bool OcrPipeline::load_router_models(
   // Formula half — backend selected via FORMULA_BACKEND
   // (formulanet | ppformulanet_s | vlm). The file-based backends are guarded
   // against missing files so the server starts cleanly while upstream
-  // re-exports the split-ONNX bundle (see .claude/plans/10_trt_gate_results.md);
+  // re-exports the split-ONNX bundle (see internal engineering notes);
   // the "vlm" backend talks to a remote endpoint and needs no local files.
   // Formula backend from the routing table (TURBO_ROUTING_CONFIG, or
   // env-synthesized from FORMULA_BACKEND/VLLM_* = today's behavior). kind:openai

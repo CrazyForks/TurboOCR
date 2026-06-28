@@ -133,7 +133,7 @@ CUDA resources. Verifiable at
 | table TEDS (.all) | full 1651 | **0.568** | same file |
 | formula CDM | 125-doc table/formula subset | **0.805** | in-process PP-FormulaNet-S, FAST decoder — see [resources](resources_speed_accuracy.md) |
 | table TEDS | 125-doc table/formula subset | **0.773** | same subset run |
-| text-only p50 latency | — | **6.0 ms** | `.claude/plans/99_bench_diary.md` (8 sweeps, RTX 5090, TRT 10.15.1.29) |
+| text-only p50 latency | — | **6.0 ms** | internal engineering notes (8 sweeps, RTX 5090, TRT 10.15.1.29) |
 
 !!! note "Formula CDM is fixed; full-1651 re-measure pending"
     The earlier formula CDM 0.063 "regression" was an integration bug, **now resolved**: the in-process

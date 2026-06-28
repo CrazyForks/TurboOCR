@@ -5,7 +5,7 @@ _How seven C++ classes coordinate one upload into one JSON response across four 
 !!! abstract "TL;DR"
 
     - **Happy path with layout** — det → cls → layout fan-out, rec on `rec_stream_`, then router + formula + table reconverge into one `OcrPipelineResult`.
-    - **Text-only short-circuit** — three guards in `dispatch_router_` bail before any new CUDA call when the router or layout output is missing. This is the 6–7 ms p50 invariant (`.claude/plans/99_bench_diary.md` sweeps 1–8).
+    - **Text-only short-circuit** — three guards in `dispatch_router_` bail before any new CUDA call when the router or layout output is missing. This is the 6–7 ms p50 invariant (internal engineering notes sweeps 1–8).
     - Formulas run **before** tables so `<td>`-absorbed formulas can be flagged `owned_by_cell` and dropped from the top-level array.
 
 Seven C++ classes turn a `/ocr/raw` upload into a JSON response: `PaddleDet`,

@@ -48,7 +48,7 @@ single TRT execute even when sources differ in size: every image rounds up to
 ## Latency budget
 
 On RTX 5090 / TRT 10.15.1 / CUDA 13 the **whole pipeline** text-only aggregate
-p50 is **5.9–7.0 ms** across sweeps 1–8 of `.claude/plans/99_bench_diary.md`.
+p50 is **5.9–7.0 ms** across sweeps 1–8 of internal engineering notes.
 Detection dominates that figure on dense pages; cls / rec / layout overlap
 onto secondary streams. The 270 ms text-only target named in the brief is
 **~38× looser** than measured, so `PaddleDet` retains headroom even when

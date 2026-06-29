@@ -78,6 +78,11 @@ message OCRResponse {
   // contents as response.json_response.reading_order — duplicated here
   // for clients that don't parse the JSON fast-path.
   repeated int32 reading_order = 4;
+  // Per-slot failure reason for RecognizeBatch: the error code of a slot that
+  // failed to decode or infer (e.g. "IMAGE_DECODE_FAILED", "IMAGE_TOO_LARGE",
+  // "INFERENCE_TIMEOUT", "INFERENCE_ERROR"); empty on a successful slot.
+  // Mirrors the per-image error the HTTP /ocr/batch route returns.
+  string error = 5;
 }
 
 message OCRBatchResponse {

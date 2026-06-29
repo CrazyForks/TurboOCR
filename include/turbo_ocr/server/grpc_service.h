@@ -556,7 +556,8 @@ public:
     entries.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
       auto *e = response->add_batch_results();
-      if (!is_jpeg[i] && imgs[i].empty()) mark_empty_slot(e);
+      if (!is_jpeg[i] && imgs[i].empty())
+        mark_empty_slot(e, too_large[i] ? "IMAGE_TOO_LARGE" : "IMAGE_DECODE_FAILED");
       entries.push_back(e);
     }
 
@@ -611,7 +612,7 @@ public:
               // window): abandon this slot empty. Must NOT call
               // get_with_timeout(fut, 0) — 0 means "disabled" there and would
               // block on future.get() forever, hanging the whole RPC.
-              mark_empty_slot(entries[i]);
+              mark_empty_slot(entries[i], "INFERENCE_TIMEOUT");
               continue;
             }
             out = pipeline::get_with_timeout(futs[i], remaining_ms);
@@ -623,9 +624,9 @@ public:
         } catch (const std::exception &e) {
           std::cerr << std::format("[gRPC Batch] Image {} error: {}\n",
                                    i, e.what());
-          mark_empty_slot(entries[i]);
+          mark_empty_slot(entries[i], "INFERENCE_ERROR");
         } catch (...) {
-          mark_empty_slot(entries[i]);
+          mark_empty_slot(entries[i], "INFERENCE_ERROR");
         }
       }
       return grpc::Status::OK;
@@ -652,9 +653,9 @@ public:
             } catch (const std::exception &e) {
               std::cerr << std::format("[gRPC Batch] Image {} error: {}\n",
                                        i, e.what());
-              mark_empty_slot(entries[i]);
+              mark_empty_slot(entries[i], "INFERENCE_ERROR");
             } catch (...) {
-              mark_empty_slot(entries[i]);
+              mark_empty_slot(entries[i], "INFERENCE_ERROR");
             }
           }
         });
@@ -815,8 +816,9 @@ private:
   // client uniformly parsing json_response per slot doesn't choke on an
   // empty bytes field for a failed/undecodable image (a successful blank
   // page already produces valid empty JSON via fill_response).
-  void mark_empty_slot(ocr::OCRResponse *entry) {
+  void mark_empty_slot(ocr::OCRResponse *entry, const char *err = nullptr) {
     entry->set_num_detections(0);
+    if (err) entry->set_error(err);
     if (mode_ == GrpcResponseMode::json_bytes) {
       std::vector<OCRResultItem> empty;
       entry->set_json_response(results_to_json(empty));

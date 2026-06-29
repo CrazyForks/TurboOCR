@@ -101,10 +101,13 @@ if [[ "${SKIP_TRT:-}" != "1" ]]; then
 
     info "TensorRT $TRT_VERSION for CUDA $TRT_CUDA"
 
-    # Check if already downloaded
-    if [[ -f "/tmp/$TRT_TAR" ]]; then
-        info "Found /tmp/$TRT_TAR (already downloaded)"
+    # Reuse a cached tarball ONLY if it's a complete, valid archive — a partial
+    # download from an earlier interrupted run must not be reused (it would fail
+    # extraction forever until manually deleted).
+    if [[ -f "/tmp/$TRT_TAR" ]] && tar -tzf "/tmp/$TRT_TAR" >/dev/null 2>&1; then
+        info "Found valid /tmp/$TRT_TAR (already downloaded)"
     else
+        [[ -f "/tmp/$TRT_TAR" ]] && { warn "Cached /tmp/$TRT_TAR is incomplete — re-downloading"; rm -f "/tmp/$TRT_TAR"; }
         info "Downloading TensorRT (~7.5 GB)..."
         info "URL: $TRT_URL"
 
@@ -129,7 +132,14 @@ if [[ "${SKIP_TRT:-}" != "1" ]]; then
             TRT_DIR=$(echo "$TRT_TAR" | sed 's/\.Linux\.x86_64-gnu\.cuda-.*\.tar\.gz//')
         fi
 
-        wget -O "/tmp/$TRT_TAR" "$TRT_URL"
+        # Download to a .part file and rename only on a verified-complete
+        # transfer, so an interrupted download never looks "done" next run.
+        wget -c -O "/tmp/$TRT_TAR.part" "$TRT_URL"
+        if ! tar -tzf "/tmp/$TRT_TAR.part" >/dev/null 2>&1; then
+            rm -f "/tmp/$TRT_TAR.part"
+            error "Downloaded TensorRT archive is corrupt/incomplete — re-run to retry"
+        fi
+        mv "/tmp/$TRT_TAR.part" "/tmp/$TRT_TAR"
     fi
 
     info "Extracting to $TENSORRT_INSTALL_DIR..."

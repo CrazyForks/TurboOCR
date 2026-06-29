@@ -101,10 +101,13 @@ if [[ "${SKIP_TRT:-}" != "1" ]]; then
 
     info "TensorRT $TRT_VERSION for CUDA $TRT_CUDA"
 
-    # Check if already downloaded
-    if [[ -f "/tmp/$TRT_TAR" ]]; then
-        info "Found /tmp/$TRT_TAR (already downloaded)"
+    # Reuse a cached tarball ONLY if it's a complete, valid archive — a partial
+    # download from an earlier interrupted run must not be reused (it would fail
+    # extraction forever until manually deleted).
+    if [[ -f "/tmp/$TRT_TAR" ]] && tar -tzf "/tmp/$TRT_TAR" >/dev/null 2>&1; then
+        info "Found valid /tmp/$TRT_TAR (already downloaded)"
     else
+        [[ -f "/tmp/$TRT_TAR" ]] && { warn "Cached /tmp/$TRT_TAR is incomplete — re-downloading"; rm -f "/tmp/$TRT_TAR"; }
         info "Downloading TensorRT (~7.5 GB)..."
         info "URL: $TRT_URL"
 
@@ -129,7 +132,14 @@ if [[ "${SKIP_TRT:-}" != "1" ]]; then
             TRT_DIR=$(echo "$TRT_TAR" | sed 's/\.Linux\.x86_64-gnu\.cuda-.*\.tar\.gz//')
         fi
 
-        wget -O "/tmp/$TRT_TAR" "$TRT_URL"
+        # Download to a .part file and rename only on a verified-complete
+        # transfer, so an interrupted download never looks "done" next run.
+        wget -c -O "/tmp/$TRT_TAR.part" "$TRT_URL"
+        if ! tar -tzf "/tmp/$TRT_TAR.part" >/dev/null 2>&1; then
+            rm -f "/tmp/$TRT_TAR.part"
+            error "Downloaded TensorRT archive is corrupt/incomplete — re-run to retry"
+        fi
+        mv "/tmp/$TRT_TAR.part" "/tmp/$TRT_TAR"
     fi
 
     info "Extracting to $TENSORRT_INSTALL_DIR..."
@@ -163,14 +173,14 @@ cmake -B build -DTENSORRT_DIR="$TENSORRT_LINK"
 cmake --build build -j"$(nproc)"
 
 info "Build complete:"
-ls -lh build/paddle_highspeed_cpp 2>/dev/null
+ls -lh build/turboocr-server 2>/dev/null
 
 # ─── Step 4: Verify ─────────────────────────────────────────────────────────
 
 info "Checking linked libraries..."
-if ldd build/paddle_highspeed_cpp | grep -q "not found"; then
+if ldd build/turboocr-server | grep -q "not found"; then
     warn "Some libraries not found:"
-    ldd build/paddle_highspeed_cpp | grep "not found"
+    ldd build/turboocr-server | grep "not found"
     warn "You may need to run: export LD_LIBRARY_PATH=/usr/local/tensorrt/lib:\$LD_LIBRARY_PATH"
 else
     info "All libraries found"
@@ -183,7 +193,7 @@ info "Installation complete!"
 echo ""
 echo "  Run the server:"
 echo "    cd $PROJECT_DIR"
-echo "    ./build/paddle_highspeed_cpp"
+echo "    ./build/turboocr-server"
 echo ""
 echo "  First startup will build TensorRT engines from ONNX models (~2-3 min)."
 echo "  Engines are cached in models/ for subsequent runs."

@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    # Nightly sanitizer run (ASAN/TSAN are too slow for every push).
+    - cron: "0 3 * * *"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # CPU build + the C++ unit suite. GitHub runners have no GPU, so the GPU build
+  # (TRT/CUDA) cannot run here — this gate covers the portable CPU path and every
+  # CPU-testable unit. Deps (Drogon from source, ONNX Runtime, PDFium) are
+  # installed by the composite action that mirrors docker/Dockerfile.cpu.
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-cpp-deps
+      - name: Configure (CPU, portable baseline)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNATIVE_ARCH=OFF -DUSE_CPU_ONLY=ON
+      - name: Build unit tests
+        run: cmake --build build --target turbo_ocr_tests -j"$(nproc)"
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+  # CPU server smoke: boot turboocr-cpu-server and curl the endpoint matrix.
+  # Requires the model bundle, so it is gated on MODELS_RELEASE_URL being set.
+  cpu-smoke:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: ${{ vars.MODELS_RELEASE_URL != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-cpp-deps
+      - name: Fetch models
+        env:
+          MODELS_RELEASE_URL: ${{ vars.MODELS_RELEASE_URL }}
+        run: bash scripts/fetch_release_models.sh
+      - name: Build CPU server
+        run: |
+          cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DNATIVE_ARCH=OFF -DUSE_CPU_ONLY=ON
+          cmake --build build-cpu --target turboocr-cpu-server -j"$(nproc)"
+      - name: Endpoint matrix smoke test
+        run: |
+          HTTP_PORT=18080 GRPC_PORT=18051 HOST=127.0.0.1 OCR_MODEL=tiny \
+            ./build-cpu/turboocr-cpu-server &
+          SERVER_PID=$!
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:18080/health && break || sleep 1
+          done
+          python3 tests/docker_endpoint_matrix.py --base-url http://127.0.0.1:18080
+          kill "$SERVER_PID" 2>/dev/null || true
+
+  # Static analysis: cppcheck (dead code + quality). Report-only.
+  static-analysis:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-cpp-deps
+      - name: Install analysis tooling
+        run: sudo apt-get install -y --no-install-recommends clang-tidy cppcheck
+      - name: Configure (for compile_commands.json)
+        run: cmake -S . -B build -G Ninja -DNATIVE_ARCH=OFF -DUSE_CPU_ONLY=ON
+      - name: cppcheck (dead code + quality, excluding third_party)
+        # --max-configs=1: don't re-analyze each file under every preprocessor
+        # macro combination (the stb/wuffs bundles in fast_png_decoder.cpp blow
+        # this up to tens of minutes). Single-threaded on purpose — `-j` would
+        # disable the unusedFunction (dead-code) check this job exists for.
+        run: |
+          cppcheck --enable=all --std=c++20 --max-configs=1 \
+            --suppress=missingIncludeSystem --suppress=missingInclude \
+            -i third_party -i src/decode/fast_png_decoder.cpp \
+            -I include src include 2>cppcheck.txt || true
+          echo "::group::cppcheck summary"; grep -E "\(error\)|unusedFunction" cppcheck.txt || echo "no error-severity / dead-code findings"; echo "::endgroup::"
+
+  # Docker image: build via docker/Dockerfile.cpu using buildx (the single source
+  # of truth for the toolchain). Builds linux/amd64 to gate every push/PR; on a
+  # version tag it builds the full multi-arch (amd64 + arm64) image and pushes it
+  # to GHCR. The GPU image (TRT/CUDA, docker/Dockerfile.gpu) is published from a
+  # maintainer machine — it is too large/slow for the standard runner.
+  docker-cpu-image:
+    # Heavy (Drogon/ORT/PDFium + compile in-image). Run on PRs to validate the
+    # image, and on version tags to build+push the multi-arch release image —
+    # not on every branch push (those still get build-and-test + cpu-smoke).
+    if: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (and push on tag) the CPU image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.cpu
+          platforms: ${{ startsWith(github.ref, 'refs/tags/v') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          # PR refs (e.g. "20/merge") aren't valid Docker tags; only tag builds
+          # push, so a fixed "ci" tag is fine for the PR build-validation case.
+          tags: ghcr.io/aiptimizer/turboocr:${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'ci' }}-cpu
+
+  # Nightly sanitizer run (L2). ASAN catches leaks/UAF, TSAN catches data races.
+  # Too slow per-push, so scheduled-only.
+  sanitizers:
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        san: [asan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-cpp-deps
+      - name: Configure (${{ matrix.san }})
+        run: |
+          FLAG=$([ "${{ matrix.san }}" = asan ] && echo -DENABLE_ASAN=ON || echo -DENABLE_TSAN=ON)
+          cmake -S . -B build-san -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DNATIVE_ARCH=OFF -DUSE_CPU_ONLY=ON $FLAG
+      - name: Build unit tests
+        run: cmake --build build-san --target turbo_ocr_tests -j"$(nproc)"
+      - name: Run unit tests under ${{ matrix.san }}
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=0
+          TSAN_OPTIONS: halt_on_error=0
+        run: ctest --test-dir build-san --output-on-failure --no-tests=error

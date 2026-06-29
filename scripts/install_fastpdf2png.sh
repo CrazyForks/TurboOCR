@@ -6,9 +6,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
 BIN_DIR="$ROOT/bin"
-REPO="https://github.com/nataell95/fastpdf2png.git"
+REPO="https://github.com/aiptimizer/fastpdf2png.git"
 # Pinned commit on main. To refresh, run:
-#   git ls-remote https://github.com/nataell95/fastpdf2png.git refs/heads/main
+#   git ls-remote https://github.com/aiptimizer/fastpdf2png.git refs/heads/main
 # and update FASTPDF2PNG_COMMIT below to the resulting 40-char SHA.
 FASTPDF2PNG_COMMIT="9f82350f7d6e1d0f6320abfb298865e7d544a286"
 TMP_DIR="/tmp/fastpdf2png_build_$$"
@@ -34,7 +34,11 @@ if [ "$ACTUAL_SHA" != "$FASTPDF2PNG_COMMIT" ]; then
   exit 1
 fi
 
-# Pre-seed PDFium from the vendored copy if we have one, so the build doesn't
+# Make sure third_party/pdfium matches the build arch (no-op on x86_64; fetches
+# the arm64 PDFium on aarch64) before we seed it into the fastpdf2png build.
+bash "$SCRIPT_DIR/install_pdfium.sh"
+
+# Pre-seed PDFium from the (now arch-correct) vendored copy so the build doesn't
 # need network access to github.com/bblanchon/pdfium-binaries (which has been
 # rate-limit-flaky from inside Docker builds).
 VENDORED_PDFIUM="$ROOT/third_party/pdfium"

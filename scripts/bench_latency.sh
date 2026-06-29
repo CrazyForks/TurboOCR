@@ -2,7 +2,7 @@
 # Latency benchmark — sequential requests for accurate p50/p95/p99
 HEY=~/go/bin/hey
 SERVER=${OCR_URL:-http://localhost:8000}
-IMAGE=${1:-tests/test_data/png/receipt.png}
+IMAGE=${1:-tests/fixtures/images/png/receipt.png}
 CONTENT_TYPE="image/png"
 
 if [[ "$IMAGE" == *.jpg ]] || [[ "$IMAGE" == *.jpeg ]]; then

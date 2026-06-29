@@ -1,13 +1,16 @@
 #include "turbo_ocr/layout/paddle_layout.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <string>
 
 #include <cuda_runtime.h>
 
 #include "turbo_ocr/common/cuda_check.h"
 #include "turbo_ocr/kernels/kernels.h"
+#include "turbo_ocr/layout/layout_postfilter.h"
 
 namespace turbo_ocr::layout {
 
@@ -113,6 +116,10 @@ bool PaddleLayout::load_model(const std::string &trt_path) {
 
 bool PaddleLayout::enqueue(const GpuImage &gpu_img, int orig_h, int orig_w,
                            cudaStream_t stream) {
+  // Cleared up front; only re-armed on full success (step 5 below). collect()
+  // treats a null pending_stream_ as "the last enqueue failed" and bails,
+  // rather than syncing a stale event and decoding a stale buffer.
+  pending_stream_ = nullptr;
   pending_orig_h_ = orig_h;
   pending_orig_w_ = orig_w;
   if (!engine_) return false;
@@ -162,16 +169,39 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
   std::vector<LayoutBox> out;
   if (!engine_ || !d2h_event_) return out;
 
+  // A null pending_stream_ means the matching enqueue() bailed before
+  // recording d2h_event_ (e.g. execute() returned false). Syncing the event
+  // here would wait on a stale recording from an earlier successful request
+  // and then decode whatever is left in h_out0_ — silently serving the
+  // previous request's layout. Bail instead.
+  if (!pending_stream_) return out;
+
   // Wait for the TRT execute to finish on layout_stream_.
   CUDA_CHECK(cudaEventSynchronize(d2h_event_));
 
-  // Query the output shape now that execution is complete. For DETR models
-  // this is data-dependent — calling it inside enqueue() would have
-  // implicitly synced the GPU, stalling the worker thread.
-  auto out_dims = engine_->tensor_shape(name_out0_);
-  int n_rows = (out_dims.nbDims >= 2 ? out_dims.d[0] : 0);
+  // The detection count comes from the model's own count tensor (out1), NOT
+  // from getTensorShape(out0). out0's (N,7) shape has a data-dependent first
+  // dim; querying it via getTensorShape() without an IOutputAllocator is
+  // unreliable across repeated executions — it returns the correct N on the
+  // first request and a stale/zero N on later ones, which silently dropped
+  // layout out of every consecutive response. out1[0] is written by the
+  // model's NMS on every run and is authoritative.
+  CUDA_CHECK(cudaMemcpyAsync(h_out1_.get(), d_out1_.get(), sizeof(int32_t),
+                             cudaMemcpyDeviceToHost, pending_stream_));
+  CUDA_CHECK(cudaStreamSynchronize(pending_stream_));
+  int n_rows = h_out1_.get()[0];
   if (n_rows <= 0) return out;
   n_rows = std::min(n_rows, kMaxDetections);
+
+  // Opt-in diagnostic: surfaces the divergence between the authoritative
+  // count and the previously-trusted getTensorShape() value.
+  static const bool kLayoutDebug = std::getenv("TURBO_LAYOUT_DEBUG") != nullptr;
+  if (kLayoutDebug) {
+    auto sd = engine_->tensor_shape(name_out0_);
+    std::cerr << "[layout-dbg] out1_count=" << h_out1_.get()[0]
+              << " getTensorShape(out0).d[0]="
+              << (sd.nbDims >= 2 ? sd.d[0] : -1) << '\n';
+  }
 
   // D2H the detection tensor (8 KB for 300 rows × 7 × 4 B). The GPU is
   // idle on this stream so the copy completes immediately.
@@ -183,8 +213,6 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
 
   const int orig_h  = pending_orig_h_;
   const int orig_w  = pending_orig_w_;
-
-  if (n_rows <= 0) return out;
 
   // Decode rows: [class_id, score, xmin, ymin, xmax, ymax, read_order].
   // With correct im_shape/scale_factor (PaddleX convention), the model's
@@ -208,6 +236,7 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
     LayoutBox lb;
     lb.class_id = cls;
     lb.score = score;
+    lb.read_order = static_cast<int>(row[6]);
     lb.box[0] = {x0, y0};
     lb.box[1] = {x1, y0};
     lb.box[2] = {x1, y1};
@@ -215,98 +244,7 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
     out.push_back(lb);
   }
 
-  // Layout NMS (matches PaddleX layout_nms=True):
-  //   same-class IoU > 0.6  → suppress the lower-scoring box
-  //   cross-class IoU > 0.98 → suppress the lower-scoring box
-  // Boxes are already sorted by descending score (model output order).
-  std::sort(out.begin(), out.end(),
-            [](const LayoutBox &a, const LayoutBox &b) {
-              return a.score > b.score;
-            });
-
-  auto box_coords = [](const LayoutBox &lb) {
-    return std::tuple{lb.box[0][0], lb.box[0][1], lb.box[2][0], lb.box[2][1]};
-  };
-
-  auto compute_iou = [&](const LayoutBox &a, const LayoutBox &b) -> float {
-    auto [ax0, ay0, ax1, ay1] = box_coords(a);
-    auto [bx0, by0, bx1, by1] = box_coords(b);
-    int ix0 = std::max(ax0, bx0), iy0 = std::max(ay0, by0);
-    int ix1 = std::min(ax1, bx1), iy1 = std::min(ay1, by1);
-    float inter = std::max(0, ix1 - ix0) * std::max(0, iy1 - iy0);
-    float area_a = (ax1 - ax0) * (ay1 - ay0);
-    float area_b = (bx1 - bx0) * (by1 - by0);
-    float union_area = area_a + area_b - inter;
-    return union_area > 0 ? inter / union_area : 0.0f;
-  };
-
-  // Containment: if >90% of box b's area is inside box a, b is contained.
-  auto is_contained = [&](const LayoutBox &a, const LayoutBox &b) -> bool {
-    auto [ax0, ay0, ax1, ay1] = box_coords(a);
-    auto [bx0, by0, bx1, by1] = box_coords(b);
-    int ix0 = std::max(ax0, bx0), iy0 = std::max(ay0, by0);
-    int ix1 = std::min(ax1, bx1), iy1 = std::min(ay1, by1);
-    float inter = std::max(0, ix1 - ix0) * std::max(0, iy1 - iy0);
-    float area_b = (bx1 - bx0) * (by1 - by0);
-    return area_b > 0 && (inter / area_b) >= 0.8f;
-  };
-
-  constexpr float kIoUSame = 0.6f;
-  constexpr float kIoUDiff = 0.98f;
-
-  std::vector<LayoutBox> nms_out;
-  nms_out.reserve(out.size());
-  std::vector<bool> suppressed(out.size(), false);
-  for (size_t i = 0; i < out.size(); ++i) {
-    if (suppressed[i]) continue;
-    nms_out.push_back(out[i]);
-    for (size_t j = i + 1; j < out.size(); ++j) {
-      if (suppressed[j]) continue;
-      float iou = compute_iou(out[i], out[j]);
-      float thresh = (out[i].class_id == out[j].class_id) ? kIoUSame : kIoUDiff;
-      if (iou >= thresh) { suppressed[j] = true; continue; }
-      // Same-class containment: if j is ≥90% inside i, suppress j.
-      if (out[i].class_id == out[j].class_id && is_contained(out[i], out[j]))
-        suppressed[j] = true;
-    }
-  }
-
-  // Post-NMS containment cleanup: if box A is ≥90% inside box B (any class),
-  // drop A — it's a duplicate subset. Handles both same-class (e.g. nested
-  // tables) and cross-class (e.g. text lines inside a table region).
-  {
-    std::vector<bool> drop(nms_out.size(), false);
-    for (size_t i = 0; i < nms_out.size(); ++i) {
-      if (drop[i]) continue;
-      for (size_t j = i + 1; j < nms_out.size(); ++j) {
-        if (drop[j]) continue;
-        if (is_contained(nms_out[j], nms_out[i])) {
-          drop[i] = true; break;
-        }
-        if (is_contained(nms_out[i], nms_out[j])) {
-          drop[j] = true;
-        }
-      }
-    }
-    std::vector<LayoutBox> cleaned;
-    cleaned.reserve(nms_out.size());
-    for (size_t i = 0; i < nms_out.size(); ++i)
-      if (!drop[i]) cleaned.push_back(std::move(nms_out[i]));
-    nms_out = std::move(cleaned);
-  }
-
-  // Filter "image" detections that cover >82% (portrait) or >93% (landscape) of the page.
-  const float img_area = static_cast<float>(orig_w) * orig_h;
-  const float area_thresh = (orig_h > orig_w) ? 0.82f : 0.93f;
-  constexpr int kImageClassId = 14; // "image" in kLayoutLabels
-  std::erase_if(nms_out, [&](const LayoutBox &lb) {
-    if (lb.class_id != kImageClassId) return false;
-    float box_area = static_cast<float>(lb.box[2][0] - lb.box[0][0]) *
-                     (lb.box[2][1] - lb.box[0][1]);
-    return box_area > area_thresh * img_area;
-  });
-
-  return nms_out;
+  return postfilter_layout_boxes(std::move(out), orig_h, orig_w);
 }
 
 } // namespace turbo_ocr::layout

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "turbo_ocr/decode/gpu_image.h"
+#include "turbo_ocr/engine/rec_graph_profiles.h"
 #include "turbo_ocr/engine/trt_engine.h"
 #include "turbo_ocr/common/box.h"
 #include "turbo_ocr/common/cuda_check.h"
@@ -45,6 +46,11 @@ public:
   // Eagerly allocate all GPU/pinned buffers (called during warmup)
   void allocate_buffers();
 
+  // Record one CUDA graph per static (batch, width) engine profile. Call
+  // once from pipeline warmup, after allocate_buffers(). No-op when the
+  // cached engine predates the static profiles or graphs are disabled.
+  void bake_graphs(cudaStream_t stream);
+
 private:
   std::vector<std::string> label_list_;
   int rec_batch_num_ = 32;
@@ -56,7 +62,18 @@ private:
   static constexpr int kMaxRecWidth = 4000;
   static constexpr std::array kWidthBuckets = {320, 480, 800, 1200, 1600, 2000, 2500, 3200, 4000};
 
-  // Actual model dims (probed after load)
+  struct BakedSlot {
+    int slot = -1;
+    int seq_len = 0;
+  };
+  // Indexed by position in engine::kRecGraphProfiles.
+  std::vector<BakedSlot> baked_slots_;
+  bool graphs_baked_ = false;
+
+  // Actual model dims (probed after load via probe_output_dims). The
+  // initializers are placeholders only: actual_num_classes_ must stay >= the
+  // widest tier (medium/small CTC width 18,710) so the over-dim skip guard in
+  // run() never fires before the probe overwrites it with the true width.
   int actual_seq_len_ = 600;
   int actual_num_classes_ = 20000;
 
@@ -94,6 +111,11 @@ private:
 
   // Common init after engine load (called by both load_model overloads)
   [[nodiscard]] bool probe_and_init();
+
+  // Run one (cur_batch, imgW) bucket: baked graph when available, dynamic
+  // fallback otherwise. Fills seq_len/num_classes for decoding.
+  void infer_bucket(int cur_batch, int imgW, cudaStream_t stream,
+                    int &seq_len, int &num_classes);
 };
 
 } // namespace turbo_ocr::recognition

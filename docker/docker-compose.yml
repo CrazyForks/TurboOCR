@@ -41,7 +41,8 @@ services:
       retries: 3
       start_period: 180s
 
-  # gRPC mode (alternative)
+  # gRPC mode (alternative). gRPC is served in-process by the same
+  # turboocr-server binary on 50051 — no separate server binary.
   ocr-grpc:
     build:
       context: ..
@@ -59,7 +60,6 @@ services:
       - "50051:50051"
     volumes:
       - trt-cache:/home/ocr/.cache/turbo-ocr
-    command: ["./build/paddle_grpc_server"]
     restart: unless-stopped
     profiles:
       - grpc

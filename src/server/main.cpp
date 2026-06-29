@@ -9,6 +9,11 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include "turbo_ocr/common/logger.h"
 
@@ -27,6 +32,7 @@
 #include "turbo_ocr/server/grpc_service.h"
 #include "turbo_ocr/server/language_paths.h"
 #include "turbo_ocr/server/metrics.h"
+#include "turbo_ocr/server/server_bootstrap.h"
 #include "turbo_ocr/server/server_config.h"
 #include "turbo_ocr/server/server_types.h"
 #include "turbo_ocr/server/work_pool.h"
@@ -38,49 +44,61 @@ using turbo_ocr::decode::FastPngDecoder;
 using turbo_ocr::decode::NvJpegDecoder;
 using turbo_ocr::render::PdfRenderer;
 
-namespace {
-std::atomic<bool> g_shutdown_requested{false};
-turbo_ocr::server::WorkPool *g_work_pool_for_drain = nullptr;
-// Atomic because the signal handler may fire on a different thread than
-// the writer in main(). Default 30 matches today's behaviour in case the
-// signal fires before main() has finished assigning it.
-std::atomic<int> g_shutdown_grace_seconds{30};
+namespace bootstrap = turbo_ocr::server::bootstrap;
 
-int shutdown_grace_seconds() {
-  return g_shutdown_grace_seconds.load(std::memory_order_acquire);
-}
-
-// Runs from Drogon's main loop (registered via setTermSignalHandler) —
-// safe to start a thread, log, and call app().quit(). The detached
-// drainer waits for the WorkPool to quiesce before tearing down Drogon
-// so inflight requests get to send their response.
-void begin_graceful_shutdown(const char *signal_name) {
-  if (g_shutdown_requested.exchange(true)) return;
-  TOCR_LOG_INFO("Graceful shutdown requested",
-                "signal", std::string_view(signal_name),
-                "grace_seconds", shutdown_grace_seconds());
-  std::thread([signal_name]() {
-    if (g_work_pool_for_drain) {
-      auto deadline = std::chrono::seconds(shutdown_grace_seconds());
-      bool drained = g_work_pool_for_drain->wait_drain(deadline);
-      TOCR_LOG_INFO("Inflight work drain complete",
-                    "drained", drained, "signal", std::string_view(signal_name));
-    }
-    drogon::app().quit();
-  }).detach();
-}
-} // namespace
-
-int main(int argc, char **argv) {
+int main(int argc, char **argv) try {
   const auto cfg = turbo_ocr::server::ServerConfig::load_or_die(argc, argv);
   cfg.log_effective();
-  g_shutdown_grace_seconds.store(cfg.shutdown_grace_seconds,
-                                  std::memory_order_release);
+  bootstrap::g_shutdown_grace_seconds.store(cfg.shutdown_grace_seconds,
+                                            std::memory_order_release);
+
+  // Parallelism lives at the request level (work-pool threads); OpenCV's
+  // per-op thread pool on top of that just oversubscribes cores under load.
+  cv::setNumThreads(0);
+
+#if defined(__GLIBC__)
+  // Host-RSS containment under sustained high-concurrency, large-image load.
+  // A burst of large pages (OmniDocBench reaches >100 MP; in-spec pages up to
+  // the MAX_IMAGE_PIXELS_MP cap decode to hundreds of MB of BGR) at concurrency
+  // ~150 transiently allocates tens of GB of host buffers. glibc keeps that
+  // memory in its per-arena free lists after the request frees it, and its
+  // DYNAMIC mmap threshold ratchets UP as large blocks are freed — so later
+  // image-sized allocations grow the arena instead of being munmap'd, and RSS
+  // climbs toward a high-water mark without returning toward baseline.
+  //
+  //  - Freeze M_MMAP_THRESHOLD so every image-sized allocation is mmap'd and
+  //    returned to the OS the instant it's freed, not parked in an arena.
+  //    Setting it explicitly ALSO disables the upward auto-tuning (the ratchet).
+  //  - Bound M_TRIM_THRESHOLD so the main arena's top is returned promptly.
+  //  - Cap M_ARENA_MAX: with the large work-thread pool the default (8*ncpu)
+  //    arenas each retain their own high-water of freed pages.
+  // NOTE: this bounds the glibc-arena component only. Grow-only per-thread
+  // (image decode scratch across the work-thread pool) and per-pipeline (pinned
+  // upload staging, nvJPEG state) buffers still saturate to the largest-image
+  // footprint; that high-water is bounded but large for very-large-image corpora.
+  mallopt(M_MMAP_THRESHOLD, 1 * 1024 * 1024);
+  mallopt(M_TRIM_THRESHOLD, 4 * 1024 * 1024);
+  mallopt(M_ARENA_MAX, 8);
+
+  // Belt-and-braces: a low-frequency reaper returns each arena's accumulated
+  // free pages to the OS (madvise) so idle RSS settles back toward baseline
+  // between load bursts instead of pinning the peak. malloc_trim only releases
+  // ALREADY-FREE memory, so it never reclaims live buffers; cheap at 5 s cadence.
+  if (!turbo_ocr::server::env_present("TURBO_OCR_DISABLE_MALLOC_REAPER")) {
+    std::thread([] {
+      for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        malloc_trim(0);
+      }
+    }).detach();
+  }
+#endif
 
   const auto &rec_paths = cfg.rec_paths;
-  if (!cfg.ocr_lang_value.empty())
-    TOCR_LOG_INFO("Language selected via OCR_LANG",
-                  "lang",  std::string_view(cfg.ocr_lang_value),
+  if (!cfg.selected_model_name.empty())
+    TOCR_LOG_INFO("OCR model selected",
+                  "model", std::string_view(cfg.selected_model_name),
+                  "det",   std::string_view(cfg.det_onnx),
                   "rec",   std::string_view(rec_paths.rec),
                   "dict",  std::string_view(rec_paths.dict));
   auto rec_dict = rec_paths.dict;
@@ -90,19 +108,25 @@ int main(int argc, char **argv) {
   // pipeline construction. ensure_trt_engine() returns "" on missing ONNX,
   // which the dispatcher only notices much later.
   auto require_model = [](const std::string &path, const char *purpose) {
-    if (!std::filesystem::exists(path)) {
-      TOCR_LOG_ERROR("Model file missing",
-                     "purpose", std::string_view(purpose),
-                     "path", std::string_view(path));
-      std::cerr << "[FATAL] " << purpose << " model not found at: " << path
-                << "\n        Run scripts/download_models.sh or set "
-                << purpose << "_ONNX env var.\n";
-      std::exit(1);
-    }
+    bootstrap::require_model(path, purpose, "model", "_ONNX");
   };
   require_model(cfg.det_onnx, "DET");
   require_model(rec_paths.rec, "REC");
   require_model(cfg.cls_onnx, "CLS");
+
+  // Build the PdfRenderer here — AFTER the fail-fast model validation above
+  // (so a missing model std::exit(1)s without orphaning forked daemons) but
+  // BEFORE any CUDA/TRT call below. The renderer fork()s a pool of fastpdf2png
+  // daemons, and fork() in a process that has already initialized a CUDA
+  // context is undefined behaviour (CUDA's driver threads, pinned allocations
+  // and fds don't survive a fork cleanly). sweep_orphan_engine_temps /
+  // ensure_trt_engine / cudaMemGetInfo below all touch the CUDA context, so the
+  // daemons must be spawned ahead of them. The renderer depends on neither the
+  // dispatcher nor any model path, so hoisting it above them is safe.
+  const int pdf_daemons = cfg.pdf_daemons;
+  const int pdf_workers = cfg.pdf_workers;
+  PdfRenderer pdf_renderer(pdf_daemons, pdf_workers);
+  TOCR_LOG_INFO("PDF renderer initialized", "daemons", pdf_daemons, "workers", pdf_workers);
 
   // Auto-build TRT engines from ONNX (cached by TRT version + model hash)
   // Sweep orphan .trt.tmp.* files left by previous crashed processes; safe
@@ -111,7 +135,7 @@ int main(int argc, char **argv) {
   turbo_ocr::engine::sweep_orphan_engine_temps();
   auto det_model = turbo_ocr::engine::ensure_trt_engine(cfg.det_onnx, "det");
   auto rec_model = turbo_ocr::engine::ensure_trt_engine(rec_paths.rec, "rec");
-  auto cls_model = turbo_ocr::engine::ensure_trt_engine(cfg.cls_onnx, "cls");
+  std::string cls_model = turbo_ocr::engine::ensure_trt_engine(cfg.cls_onnx, "cls");
   if (cfg.disable_angle_cls) {
     cls_model.clear();
     TOCR_LOG_INFO("Angle classification disabled via DISABLE_ANGLE_CLS=1");
@@ -147,7 +171,12 @@ int main(int argc, char **argv) {
   }
   turbo_ocr::pdf::ensure_pdfium_initialized();
 
-  // Pipeline pool
+  // Pipeline pool. Throughput is GPU-compute-bound on this stack: a clean
+  // pool sweep (RTX 5090, FUNSD) plateaus by ~5 pipelines (5→278, 8→263,
+  // 10→258 img/s) because the det/rec kernels already saturate the GPU and
+  // extra pipelines only add scheduling/cache pressure. So the ladder caps at
+  // 5 deliberately — raising it costs VRAM for negative throughput. Explicit
+  // --pool-size overrides.
   int pool_size = 4;
   if (cfg.pipeline_pool_size) {
     pool_size = *cfg.pipeline_pool_size;
@@ -159,18 +188,58 @@ int main(int argc, char **argv) {
       else if (vram_gb >= 12) pool_size = 3;
       else if (vram_gb >= 8)  pool_size = 2;
       else                     pool_size = 1;
+
+      // Footprint-based safety floor: the tier above keys off TOTAL VRAM, but a
+      // card that *reports* 16 GB while another process already holds most of
+      // it would OOM during warmup. Estimate each pipeline's resident footprint
+      // (engines + activation/workspace buffers, generous to stay conservative)
+      // and reduce the tier so it fits in the FREE VRAM measured right now.
+      // This only ever LOWERS the count — never raises it above the tier cap —
+      // and never below 1, so a healthy 32 GB card with the tiny model still
+      // picks 5 (a few hundred MB per pipeline against ~31 GB free). The
+      // explicit --pool-size / PIPELINE_POOL_SIZE override above bypasses this
+      // entirely and always wins.
+      constexpr size_t kPerPipelineFootprintBytes = size_t{2} << 30;  // 2 GiB
+      // Leave a 1 GiB headroom so the renderer daemons / CUDA context / OS
+      // don't get squeezed to the byte.
+      constexpr size_t kVramHeadroomBytes = size_t{1} << 30;
+      size_t budget = free_mem > kVramHeadroomBytes ? free_mem - kVramHeadroomBytes : 0;
+      int fits = static_cast<int>(budget / kPerPipelineFootprintBytes);
+      if (fits < 1) fits = 1;
+      if (fits < pool_size) {
+        TOCR_LOG_WARN("Reducing pipeline pool to fit available VRAM",
+                      "tier_pool_size", pool_size, "footprint_capped", fits,
+                      "free_mem_gb", static_cast<int>(free_mem >> 30));
+        pool_size = fits;
+      }
       TOCR_LOG_INFO("Auto-detected pipeline pool size", "pool_size", pool_size, "vram_gb", vram_gb);
     }
   }
 
-  auto dispatcher = turbo_ocr::pipeline::make_pipeline_dispatcher(
-      pool_size, det_model, rec_model, rec_dict, cls_model, layout_model);
+  // Document-orientation engine (optional) — powers /ocr/pdf?autorotate=1.
+  // Soft-disable if the model is absent: ensure_trt_engine returns "" and
+  // autorotate requests are then rejected with AUTOROTATE_DISABLED.
+  std::string doc_ori_model =
+      turbo_ocr::engine::ensure_trt_engine(cfg.doc_ori_onnx, "doc_ori");
+  if (doc_ori_model.empty())
+    TOCR_LOG_WARN("Doc-orientation model (doc_ori.onnx) not found; autorotate disabled");
+  else
+    TOCR_LOG_INFO("Doc-orientation (autorotate) enabled");
 
-  // PDF renderer
-  const int pdf_daemons = cfg.pdf_daemons;
-  const int pdf_workers = cfg.pdf_workers;
-  PdfRenderer pdf_renderer(pdf_daemons, pdf_workers);
-  TOCR_LOG_INFO("PDF renderer initialized", "daemons", pdf_daemons, "workers", pdf_workers);
+  auto dispatcher = turbo_ocr::pipeline::make_pipeline_dispatcher(
+      pool_size, det_model, rec_model, rec_dict, cls_model, layout_model,
+      doc_ori_model, cfg.det_cfg);
+  // Some pipelines may have failed to init (logged); key downstream sizing
+  // off the count actually built.
+  pool_size = static_cast<int>(dispatcher->worker_count());
+
+  // Per-request inference deadline (C4). cfg.request_timeout_ms defaults to 0,
+  // which leaves the dispatcher in its legacy unbounded-wait mode (non-breaking
+  // for existing deployments). When an operator sets REQUEST_TIMEOUT_MS>0 the
+  // deadline is per-image/per-page, so it only trips a genuinely wedged worker,
+  // never a normal request. A timed-out future is ABANDONED, so every GPU submit
+  // below captures its request inputs BY VALUE (see the infer lambda).
+  dispatcher->set_request_timeout_ms(cfg.request_timeout_ms);
 
   // nvJPEG
   TOCR_LOG_INFO("Initializing nvJPEG decoders");
@@ -211,14 +280,41 @@ int main(int argc, char **argv) {
       [&dispatcher](const cv::Mat &img,
                     const turbo_ocr::server::InferOptions &opts)
           -> turbo_ocr::server::InferResult {
-    auto out = dispatcher->submit([&img, &opts](auto &e) {
-      return e.pipeline->run_with_layout(img, e.stream, opts.want_layout,
-                                          opts.want_reading_order);
-    }).get();
+    // submit_for_default may ABANDON the task on timeout, so the lambda owns
+    // its inputs BY VALUE: img is a cheap cv::Mat refcount bump, the flags are
+    // bools. The dispatcher itself is long-lived and captured by reference.
+    // On deadline this throws turbo_ocr::TimeoutError; the route's
+    // run_with_error_handling maps it to HTTP 504 (INFERENCE_TIMEOUT).
+    const bool want_layout = opts.want_layout;
+    const bool want_reading_order = opts.want_reading_order;
+    const bool want_tables = opts.want_tables;
+    const bool want_formulas = opts.want_formulas;
+    const auto routing_override = opts.routing_override;  // by-value (timeout-safe)
+    auto out = dispatcher->submit_for_default(
+        [img, want_layout, want_reading_order, want_tables, want_formulas,
+         routing_override](auto &e) {
+          return e.pipeline->run_with_layout(img, e.stream, want_layout,
+                                             want_reading_order, routing_override,
+                                             /*defer_external=*/false,
+                                             want_tables, want_formulas);
+        });
+    // dispatch_router_ ran synchronously (defer_external defaults false on this
+    // path), so out carries any table/formula structure + degradation flags.
+    // Forward all of them — emit_infer_result_json emits these keys, and
+    // dropping the *_degraded signal would make a degraded backend look
+    // byte-identical to a clean empty result (silent failure).
     return turbo_ocr::server::InferResult{
-        .results       = std::move(out.results),
-        .layout        = std::move(out.layout),
-        .reading_order = std::move(out.reading_order),
+        .results          = std::move(out.results),
+        .layout           = std::move(out.layout),
+        .reading_order    = std::move(out.reading_order),
+        .tables           = std::move(out.tables),
+        .formulas         = std::move(out.formulas),
+        .formula_degraded = out.formula_degraded,
+        .formula_warning  = std::move(out.formula_warning),
+        .table_degraded   = out.table_degraded,
+        .table_warning    = std::move(out.table_warning),
+        .text_degraded    = out.text_degraded,
+        .text_warning     = std::move(out.text_warning),
     };
   };
 
@@ -230,7 +326,8 @@ int main(int argc, char **argv) {
   // --- Register all routes ---
   turbo_ocr::server::Metrics::instance().set_pool_size(pool_size);
   turbo_ocr::server::register_observability_middleware();
-  turbo_ocr::server::register_metrics_route();
+  turbo_ocr::server::register_metrics_route(
+      &work_pool, [d = dispatcher.get()] { return d->queue_depth(); });
   // Single readiness probe shared by HTTP /health/ready and gRPC Health
   // so k8s probes behave identically across protocols.
   //
@@ -260,26 +357,104 @@ int main(int argc, char **argv) {
 
     bool ok = false;
     try {
-      dispatcher->submit([layout_available](auto &e) {
+      // submit_for_default honours the request timeout, so a wedged worker
+      // flips readiness to not-ready (TimeoutError, caught below) instead of
+      // blocking this probe thread forever. The dummy Mat is created inside the
+      // task, so there is nothing request-scoped to abandon on timeout.
+      dispatcher->submit_for_default([layout_available](auto &e) {
         cv::Mat dummy(48, 48, CV_8UC3, cv::Scalar(255, 255, 255));
         (void)e.pipeline->run_with_layout(dummy, e.stream,
                                           /*want_layout=*/layout_available,
                                           /*want_reading_order=*/false);
-      }).get();
+      });
       ok = true;
-    } catch (...) {}
+    } catch (const turbo_ocr::PoolExhaustedError &) {
+      // Queue full = the server is BUSY but healthy. Flipping to not-ready here
+      // would pull a fine-but-loaded pod out of rotation under a burst (and shed
+      // load exactly when it's needed). Keep the last verdict; reserve not-ready
+      // for a wedged worker (TimeoutError) or a genuine inference fault.
+      ok = probe->ok.load(std::memory_order_acquire);
+    } catch (...) {
+      ok = false;
+    }
     probe->ok.store(ok, std::memory_order_release);
     probe->last_check_ms.store(now_ms, std::memory_order_release);
     return ok;
   };
-  turbo_ocr::routes::register_health_route(readiness);
-  turbo_ocr::routes::register_ocr_base64_route(work_pool, infer, decode, layout_available);
-  turbo_ocr::routes::register_image_routes(work_pool, *dispatcher, decode, nvjpeg_available, layout_available);
-  turbo_ocr::routes::register_pdf_route(work_pool, *dispatcher, pdf_renderer, default_pdf_mode, layout_available);
+  turbo_ocr::routes::register_health_route(readiness, &work_pool);
+  // Structure-backend availability, read from a warmed pipeline itself (the
+  // exact default-entry pointers dispatch_router_ gates `tables=1`/`formulas=1`
+  // on) rather than re-deriving from config — single source of truth, can't
+  // drift. Computed once, fed to the HTTP routes, the gRPC service, and
+  // /capabilities so the fail-loud gate is consistent everywhere.
+  // Deadline-free submit().get() (not submit_for_default): this is a trivial
+  // pointer read on the warmed pool, not request work, so it must not be bound
+  // by REQUEST_TIMEOUT_MS — a stray TimeoutError here would abort startup.
+  const auto struct_avail = dispatcher->submit([](auto &e) {
+    return std::pair<bool, bool>{e.pipeline->has_default_table_backend(),
+                                 e.pipeline->has_default_formula_backend()};
+  }).get();
+  const bool table_avail   = struct_avail.first;
+  const bool formula_avail = struct_avail.second;
+  turbo_ocr::routes::register_ocr_base64_route(work_pool, infer, decode,
+                                               layout_available, table_avail,
+                                               formula_avail);
+  turbo_ocr::routes::register_image_routes(work_pool, *dispatcher, decode, nvjpeg_available, layout_available,
+                                           table_avail, formula_avail, cfg.max_batch_images);
+  turbo_ocr::routes::register_pdf_route(work_pool, *dispatcher, pdf_renderer, default_pdf_mode, layout_available,
+                                        table_avail, formula_avail,
+                                        /*default_dpi=*/100,
+                                        cfg.max_pdf_pages,
+                                        /*doc_ori_available=*/!doc_ori_model.empty());
 
-  // gRPC
+  // GET /capabilities (M6) — advertise this build's honored feature set so a
+  // client can discover the known GPU/CPU divergences without trial requests.
+  // GPU honors auto_verified as its own path and has no /profile endpoint.
+  {
+    turbo_ocr::routes::CapabilitiesInfo caps;
+    caps.is_gpu              = true;
+    caps.layout_available    = layout_available;
+    caps.table_available     = table_avail;
+    caps.formula_available   = formula_avail;
+    caps.autorotate_available = !doc_ori_model.empty();
+    caps.profile_endpoint    = false;
+    caps.grpc_response_mode  =
+        std::string(turbo_ocr::server::detail::grpc_mode_str(cfg.grpc_response_mode));
+    caps.honored_auto_verified = true;
+    caps.pdf_default_dpi     = 100;
+    caps.max_pdf_pages       = cfg.max_pdf_pages;
+    caps.max_body_mb         = cfg.max_body_mb;
+    caps.max_image_dim       = cfg.max_image_dim;
+    caps.max_batch_images    = cfg.max_batch_images;
+    turbo_ocr::routes::register_capabilities_route(caps);
+  }
+
+  // Seed the readiness cache once now (the dispatcher just warmed up), so the
+  // gRPC cached-only probe has a real verdict before the first HTTP probe runs.
+  (void)readiness();
+
+  // gRPC Health uses a CACHE-ONLY view of the readiness verdict (H2): it must
+  // never run the GPU probe inline, because Health() executes on the gRPC CQ
+  // poller thread and a fresh GPU pass there would stall every queued RPC on
+  // that poller. It reads the last cached value the HTTP /health/ready probe
+  // (above) refreshes; the cache TTL keeps it fresh under any real probe
+  // traffic and we seeded it just above. This also keeps gRPC liveness/
+  // readiness GPU-free (M2): a busy GPU can't make Health() block, so it can't
+  // flap the process out of service.
+  auto readiness_cached = [probe]() -> bool {
+    return probe->ok.load(std::memory_order_acquire);
+  };
+
+  // gRPC — same availability bools as the HTTP routes so the fail-loud gate is
+  // consistent across transports (TABLE_BACKEND_DISABLED / FORMULA_BACKEND_DISABLED).
   auto grpc_handle = turbo_ocr::server::start_grpc_server(
-      *dispatcher, cfg, &pdf_renderer, layout_available, readiness);
+      *dispatcher, cfg, &pdf_renderer, layout_available, readiness_cached,
+      table_avail, formula_avail);
+  // Published for the signal-handler drain thread. Not dangling: grpc_handle
+  // owns the server on main()'s stack and is destroyed only after run() returns
+  // (i.e. after the drain has driven app().quit()). See server_bootstrap.h.
+  // cppcheck-suppress danglingLifetime
+  bootstrap::g_grpc_server_for_drain = grpc_handle.server.get();
 
   // HTTP (Drogon) — behind nginx (port 8000), direct access on 8080
   const int port = cfg.http_port;
@@ -298,29 +473,41 @@ int main(int argc, char **argv) {
   const int max_body_mb = cfg.max_body_mb;
   int max_body_mem_mb = cfg.max_body_mem_mb;
   if (max_body_mem_mb > max_body_mb) max_body_mem_mb = max_body_mb;
-  size_t max_body_bytes = static_cast<size_t>(max_body_mb) * 1024 * 1024;
-  size_t max_mem_bytes  = static_cast<size_t>(max_body_mem_mb) * 1024 * 1024;
 
   TOCR_LOG_INFO("HTTP server starting", "port", port, "io_threads", io_threads,
            "work_threads", work_threads, "pool_size", dispatcher->worker_count(),
            "body_cap_mb_drogon", max_body_mb, "body_cap_mb_nginx", max_body_mb,
            "body_mem_mb", max_body_mem_mb);
 
-  // Graceful shutdown on SIGTERM (Docker / K8s) and SIGINT (Ctrl-C):
-  // drain WorkPool inflight up to SHUTDOWN_GRACE_SECONDS before quit().
-  g_work_pool_for_drain = &work_pool;
-  drogon::app()
-      .setTermSignalHandler([] { begin_graceful_shutdown("SIGTERM"); })
-      .setIntSignalHandler([]  { begin_graceful_shutdown("SIGINT");  })
-      .addListener(cfg.host, port)
-      .setThreadNum(io_threads)
-      .setIdleConnectionTimeout(120)
-      .setClientMaxBodySize(max_body_bytes)
-      .setClientMaxMemoryBodySize(max_mem_bytes)
-      .run();
+  // Background readiness refresher: periodically re-runs the GPU probe (off the
+  // gRPC CQ poller) so the cached verdict gRPC Health reads stays fresh even for
+  // deployments that probe ONLY gRPC Health and never hit HTTP /health/ready.
+  // The probe's own 5s TTL gates the real GPU work, so this just guarantees a
+  // wake within that window. Stopped + joined before gRPC/dispatcher teardown.
+  std::atomic<bool> refresher_stop{false};
+  std::thread readiness_refresher([&readiness, &refresher_stop]() {
+    while (!refresher_stop.load(std::memory_order_acquire)) {
+      (void)readiness();
+      for (int i = 0; i < 30 && !refresher_stop.load(std::memory_order_acquire); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
 
-  TOCR_LOG_INFO("HTTP server stopped, shutting down gRPC");
-  grpc_handle.server->Shutdown();
-  TOCR_LOG_INFO("Shutdown complete");
+  // Listener + body-size config + graceful-shutdown signal handlers + run().
+  // Blocks until app().quit() (the drain thread) returns.
+  bootstrap::run_http_server(cfg, io_threads, work_pool);
+
+  refresher_stop.store(true, std::memory_order_release);
+  readiness_refresher.join();
+  bootstrap::shutdown_grpc_after_run(grpc_handle.server.get());
   return 0;
+} catch (const std::exception &e) {
+  // Function-try-block on main(): any exception escaping startup (config,
+  // engine build, CUDA/TRT init, listener bind) becomes a clean non-zero exit
+  // with a logged reason instead of std::terminate + a useless core dump.
+  TOCR_LOG_ERROR("Fatal error during startup", "error", std::string_view(e.what()));
+  return 1;
+} catch (...) {
+  TOCR_LOG_ERROR("Fatal error during startup: unknown exception");
+  return 1;
 }

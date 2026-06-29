@@ -18,6 +18,45 @@ using turbo_ocr::GpuImage;
 
 PaddleRec::PaddleRec() { label_list_.push_back("blank"); }
 
+void PaddleRec::infer_bucket(int cur_batch, int imgW, cudaStream_t stream,
+                             int &seq_len, int &num_classes) {
+  // Pick the smallest baked (batch, width) profile that fits — but only when
+  // the batch fills ≥75% of it. Padded rows are real GPU work (their outputs
+  // are simply never decoded), so a poorly-filled bucket costs more compute
+  // than the launch overhead it saves; those batches run exact-size on the
+  // dynamic profile instead.
+  if (graphs_baked_) {
+    int best = -1;
+    for (int i = 0; i < engine::kNumRecGraphProfiles; ++i) {
+      const auto &gp = engine::kRecGraphProfiles[i];
+      if (gp.width != imgW || gp.batch < cur_batch)
+        continue;
+      if (best < 0 || gp.batch < engine::kRecGraphProfiles[best].batch)
+        best = i;
+    }
+    if (best >= 0 && 4 * cur_batch >= 3 * engine::kRecGraphProfiles[best].batch &&
+        baked_slots_[static_cast<size_t>(best)].slot >= 0) {
+      const auto &s = baked_slots_[static_cast<size_t>(best)];
+      if (!engine_->launch_baked(s.slot, stream))
+        throw turbo_ocr::InferenceError("Recognition graph launch failed");
+      seq_len = s.seq_len;
+      num_classes = actual_num_classes_;
+      return;
+    }
+  }
+  nvinfer1::Dims input_dims;
+  input_dims.nbDims = 4;
+  input_dims.d[0] = cur_batch;
+  input_dims.d[1] = 3;
+  input_dims.d[2] = rec_image_h_;
+  input_dims.d[3] = imgW;
+  if (!engine_->infer_dynamic(input_dims, stream))
+    throw turbo_ocr::InferenceError("Recognition TRT inference failed");
+  nvinfer1::Dims out_dims = engine_->get_output_dims();
+  seq_len = static_cast<int>(out_dims.d[1]);
+  num_classes = static_cast<int>(out_dims.d[2]);
+}
+
 PaddleRec::~PaddleRec() noexcept {
   // CudaPtr/CudaHostPtr members (including output_slots_) are cleaned up by RAII.
 }
@@ -44,7 +83,19 @@ bool PaddleRec::probe_and_init() {
 }
 
 bool PaddleRec::load_dict(const std::string &dict_path) {
-  return load_label_dict(dict_path, label_list_);
+  if (!load_label_dict(dict_path, label_list_))
+    return false;
+  // load_model probed the engine before load_dict (ocr_pipeline.cpp), so
+  // actual_num_classes_ holds the real output width here, not the placeholder.
+  // A dict whose [blank]+chars+space count differs from it silently maps every
+  // class to the wrong glyph — fail loud at boot instead.
+  const int probed_width = actual_num_classes_;
+  if (static_cast<int>(label_list_.size()) != probed_width)
+    throw turbo_ocr::ModelLoadError(std::format(
+        "Recognition dict/model mismatch: {} produced {} classes but model "
+        "output width is {} (expected blank+chars+space == width)",
+        dict_path, label_list_.size(), probed_width));
+  return true;
 }
 
 void PaddleRec::allocate_buffers() {
@@ -79,6 +130,38 @@ void PaddleRec::allocate_buffers() {
   engine_->bind_io(d_batch_input_.get(), d_output_.get());
 
   buffers_allocated_ = true;
+}
+
+void PaddleRec::bake_graphs(cudaStream_t stream) {
+  if (graphs_baked_ || !engine::TrtEngine::graphs_enabled())
+    return;
+  allocate_buffers();
+  // Engines cached before the static-profile builder change have only the
+  // dynamic profile — every batch then takes the plain-enqueue fallback.
+  if (engine_->num_profiles() < 1 + engine::kNumRecGraphProfiles)
+    return;
+  // Bake-time executions read whatever is in the input buffer; zero it so
+  // they run on well-formed values.
+  CUDA_CHECK(cudaMemsetAsync(d_batch_input_.get(), 0,
+                             static_cast<size_t>(rec_batch_num_) * 3 *
+                                 rec_image_h_ * kMaxRecWidth * sizeof(float),
+                             stream));
+  baked_slots_.assign(engine::kNumRecGraphProfiles, {});
+  int baked = 0;
+  for (int i = 0; i < engine::kNumRecGraphProfiles; ++i) {
+    const auto &gp = engine::kRecGraphProfiles[i];
+    nvinfer1::Dims4 dims{gp.batch, 3, rec_image_h_, gp.width};
+    const int slot = engine_->bake_graph(1 + i, dims, d_batch_input_.get(),
+                                         d_output_.get(), stream);
+    if (slot >= 0) {
+      const auto &od = engine_->baked_output_dims(slot);
+      baked_slots_[static_cast<size_t>(i)] = {slot,
+                                              static_cast<int>(od.d[1])};
+      ++baked;
+    }
+  }
+  graphs_baked_ = baked > 0;
+  std::cout << std::format("[PaddleRec] baked {} CUDA graphs\n", baked);
 }
 
 std::vector<std::pair<std::string, float>>
@@ -184,20 +267,9 @@ PaddleRec::run(const GpuImage &img, const std::vector<Box> &boxes,
                                      d_batch_input_.get(), cur_batch, rec_image_h_,
                                      imgW, stream);
 
-    nvinfer1::Dims input_dims;
-    input_dims.nbDims = 4;
-    input_dims.d[0] = cur_batch;
-    input_dims.d[1] = 3;
-    input_dims.d[2] = rec_image_h_;
-    input_dims.d[3] = imgW;
-
-    if (!engine_->infer_dynamic(input_dims, stream)) {
-      throw turbo_ocr::InferenceError("Recognition TRT inference failed");
-    }
-
-    nvinfer1::Dims out_dims = engine_->get_output_dims();
-    int seq_len = out_dims.d[1];
-    int num_classes = out_dims.d[2];
+    int seq_len = 0;
+    int num_classes = 0;
+    infer_bucket(cur_batch, imgW, stream, seq_len, num_classes);
 
     if (seq_len > actual_seq_len_ || num_classes > actual_num_classes_) {
       std::cerr << std::format("[PaddleRec] WARNING: output dims (seq_len={}, num_classes={}) "
@@ -350,7 +422,7 @@ PaddleRec::run_multi(const std::vector<ImageCrops> &image_crops,
                                 cur_batch * sizeof(int),
                                 cudaMemcpyHostToDevice, stream));
 
-    // Warp crops per source image
+    // Warp crops per source image.
     {
       size_t slot_stride = static_cast<size_t>(3) * rec_image_h_ * imgW;
       int j = 0;
@@ -370,20 +442,9 @@ PaddleRec::run_multi(const std::vector<ImageCrops> &image_crops,
       }
     }
 
-    nvinfer1::Dims input_dims;
-    input_dims.nbDims = 4;
-    input_dims.d[0] = cur_batch;
-    input_dims.d[1] = 3;
-    input_dims.d[2] = rec_image_h_;
-    input_dims.d[3] = imgW;
-
-    if (!engine_->infer_dynamic(input_dims, stream)) {
-      throw turbo_ocr::InferenceError("Recognition TRT inference failed");
-    }
-
-    nvinfer1::Dims out_dims = engine_->get_output_dims();
-    int seq_len = out_dims.d[1];
-    int num_classes = out_dims.d[2];
+    int seq_len = 0;
+    int num_classes = 0;
+    infer_bucket(cur_batch, imgW, stream, seq_len, num_classes);
 
     if (seq_len > actual_seq_len_ || num_classes > actual_num_classes_) {
       std::cerr << std::format("[PaddleRec] WARNING: output dims (seq_len={}, num_classes={}) "

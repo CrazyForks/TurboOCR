@@ -69,7 +69,7 @@ cmake --build build_asan -j$(nproc)
 ```bash
 # LSan is included with ASan by default on Linux
 ASAN_OPTIONS="detect_leaks=1:halt_on_error=0:log_path=asan.log" \
-  ./build_asan/paddle_highspeed_cpp
+  ./build_asan/turboocr-server
 ```
 
 Then run the test suite against it:
@@ -114,7 +114,7 @@ valgrind --tool=memcheck \
   --show-leak-kinds=all \
   --track-origins=yes \
   --log-file=valgrind.log \
-  ./build/paddle_highspeed_cpp
+  ./build/turboocr-server
 ```
 
 Then send a few requests manually and stop the server:
@@ -130,7 +130,7 @@ curl -X POST http://localhost:8000/ocr/raw \
   ```bash
   cmake -B build_valgrind -DUSE_CPU_ONLY=ON -DCMAKE_BUILD_TYPE=Debug
   cmake --build build_valgrind -j$(nproc)
-  valgrind --leak-check=full ./build_valgrind/paddle_cpu_server
+  valgrind --leak-check=full ./build_valgrind/turboocr-cpu-server
   ```
 
 ### 2.3 NVIDIA Compute Sanitizer (GPU Memory)
@@ -143,21 +143,21 @@ the CUDA Toolkit.
 compute-sanitizer --tool memcheck \
   --leak-check full \
   --log-file compute_memcheck.log \
-  ./build/paddle_highspeed_cpp
+  ./build/turboocr-server
 ```
 
 **Racecheck (shared memory data races):**
 ```bash
 compute-sanitizer --tool racecheck \
   --log-file compute_racecheck.log \
-  ./build/paddle_highspeed_cpp
+  ./build/turboocr-server
 ```
 
 **Initcheck (uninitialized GPU memory reads):**
 ```bash
 compute-sanitizer --tool initcheck \
   --log-file compute_initcheck.log \
-  ./build/paddle_highspeed_cpp
+  ./build/turboocr-server
 ```
 
 **Best practices for this project:**
@@ -192,7 +192,7 @@ cmake --build build_tsan -j$(nproc)
 **Run:**
 ```bash
 TSAN_OPTIONS="history_size=7:second_deadlock_stack=1:log_path=tsan.log" \
-  ./build_tsan/paddle_highspeed_cpp
+  ./build_tsan/turboocr-server
 ```
 
 Then run concurrent tests:
@@ -219,7 +219,7 @@ classes of issues.
 ```bash
 valgrind --tool=helgrind \
   --log-file=helgrind.log \
-  ./build_valgrind/paddle_cpu_server
+  ./build_valgrind/turboocr-cpu-server
 ```
 
 Best used with the CPU-only build due to Valgrind's CUDA incompatibility.
@@ -255,7 +255,7 @@ cmake --build build_ubsan -j$(nproc)
 **Run:**
 ```bash
 UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0:log_path=ubsan.log" \
-  ./build_ubsan/paddle_highspeed_cpp
+  ./build_ubsan/turboocr-server
 ```
 
 **Areas of concern in this codebase:**

@@ -11,19 +11,55 @@ namespace {
 
 // Every env var ServerConfig::from_env touches — wiped between cases so each
 // test starts from a known baseline.
-const char *const kAllEnvVars[] = {
-    "TURBO_OCR_HOST", "PORT", "GRPC_PORT",
-    "MAX_BODY_MB", "MAX_BODY_MEMORY_MB",
-    "PIPELINE_POOL_SIZE", "HTTP_THREADS",
-    "PDF_DAEMONS", "PDF_WORKERS", "SHUTDOWN_GRACE_SECONDS",
-    "GRPC_CQS", "GRPC_BATCH_WORKERS", "MAX_PDF_PAGES", "GRPC_RESPONSE_MODE",
-    "DET_ONNX", "DET_MODEL", "CLS_ONNX", "CLS_MODEL",
-    "LAYOUT_ONNX", "LAYOUT_TRT",
-    "REC_ONNX", "REC_MODEL", "REC_DICT", "OCR_LANG",
-    "DISABLE_ANGLE_CLS", "DISABLE_LAYOUT", "ENABLE_LAYOUT",
+const char* const kAllEnvVars[] = {
+    "TURBO_OCR_HOST",
+    "BIND_HOST",
+    "REQUEST_TIMEOUT_MS",
+    "PORT",
+    "GRPC_PORT",
+    "MAX_BODY_MB",
+    "MAX_BODY_MEMORY_MB",
+    "PIPELINE_POOL_SIZE",
+    "HTTP_THREADS",
+    "PDF_DAEMONS",
+    "PDF_WORKERS",
+    "SHUTDOWN_GRACE_SECONDS",
+    "GRPC_CQS",
+    "GRPC_BATCH_WORKERS",
+    "MAX_PDF_PAGES",
+    "GRPC_RESPONSE_MODE",
+    "DET_ONNX",
+    "DET_MODEL",
+    "CLS_ONNX",
+    "CLS_MODEL",
+    "LAYOUT_ONNX",
+    "LAYOUT_TRT",
+    "REC_ONNX",
+    "REC_MODEL",
+    "REC_DICT",
+    "OCR_LANG",
+    "OCR_MODEL",
+    "TURBO_OCR_REC_ALLOW_TINY",
+    "DISABLE_ANGLE_CLS",
+    "DISABLE_LAYOUT",
+    "LAYOUT_MERGE_MODE",
+    "ENABLE_LAYOUT",
     "ENABLE_PDF_MODE",
-    "DET_MAX_SIDE", "TRT_OPT_LEVEL", "TRT_ENGINE_CACHE", "MAX_IMAGE_DIM",
-    "LOG_LEVEL", "LOG_FORMAT",
+    "DET_MAX_SIDE",
+    "DET_MAX_SIDE_LIMIT",
+    "DET_LIMIT_TYPE",
+    "DET_LIMIT_SIDE_LEN",
+    "DET_DB_THRESH",
+    "DET_BOX_THRESH",
+    "DET_UNCLIP",
+    "TRT_OPT_LEVEL",
+    "TRT_ENGINE_CACHE",
+    "MAX_IMAGE_DIM",
+    "LOG_LEVEL",
+    "LOG_FORMAT",
+    "MAX_BATCH_IMAGES",
+    "MAX_PDF_PAGE_PIXELS_MP",
+    "DOC_ORI_ONNX",
 };
 
 void reset_env() {
@@ -51,7 +87,9 @@ TEST_CASE("from_env defaults are sane (GPU)", "[server_config]") {
   CHECK(c.grpc_cqs == 10);
   CHECK(c.grpc_batch_workers == 8);
   CHECK(c.max_pdf_pages == 2000);
-  CHECK(c.det_onnx == "models/det.onnx");
+  // Default model is "tiny" (the throughput tier), whose per-tier detector is
+  // det_tiny.onnx (not the shared det.onnx, which backs only the V5Lang rows).
+  CHECK(c.det_onnx == "models/det_tiny.onnx");
   CHECK(c.cls_onnx == "models/cls.onnx");
   CHECK_FALSE(c.disable_angle_cls);
   CHECK_FALSE(c.layout_disabled);
@@ -214,6 +252,19 @@ TEST_CASE("GRPC_RESPONSE_MODE validates", "[server_config]") {
   REQUIRE_FALSE(bad.errors.empty());
 }
 
+TEST_CASE("LAYOUT_MERGE_MODE validates", "[server_config]") {
+  // Canonical names plus the deprecated "large"/"small"/"union" aliases.
+  for (const char *ok :
+       {"all", "outer", "inner", "large", "small", "union"}) {
+    reset_env();
+    ::setenv("LAYOUT_MERGE_MODE", ok, 1);
+    CHECK(ServerConfig::from_env().errors.empty());
+  }
+  reset_env();
+  ::setenv("LAYOUT_MERGE_MODE", "outerr", 1);  // typo must be fatal, not silent
+  REQUIRE_FALSE(ServerConfig::from_env().errors.empty());
+}
+
 TEST_CASE("cross-field: PORT == GRPC_PORT is fatal", "[server_config]") {
   reset_env();
   ::setenv("PORT",      "9000", 1);
@@ -249,7 +300,11 @@ TEST_CASE("cross-field: MAX_BODY_MEMORY_MB > MAX_BODY_MB clamps + warns",
 TEST_CASE("from_env strict-validates engine/decode/logging knobs", "[server_config]") {
   reset_env();
   auto def = ServerConfig::from_env();
-  CHECK(def.det_max_side == 960);
+  // Effective det max-side comes from the selected model's per-model
+  // max_side_limit when DET_MAX_SIDE is unset. Every v6 tier caps at 1280 (the
+  // official PaddleOCR 4000 OOMs the pooled pre-allocation — det_config.h), so
+  // the default is 1280, not 4000; the env knob still wins when set (below).
+  CHECK(def.det_max_side == 1280);
   CHECK(def.trt_opt_level == 5);
   CHECK(def.max_image_dim == 16384);
   CHECK(def.log_level == "info");
@@ -316,4 +371,47 @@ TEST_CASE("to_json produces non-empty JSON object", "[server_config]") {
   CHECK(j.back() == '}');
   CHECK(j.find("\"host\":\"0.0.0.0\"") != std::string::npos);
   CHECK(j.find("\"http_port\":8080") != std::string::npos);
+}
+
+TEST_CASE("exposure-hardening caps: defaults, env override, bounds", "[server_config]") {
+  reset_env();
+  auto def = ServerConfig::from_env(Profile::Gpu);
+  CHECK(def.errors.empty());
+  CHECK(def.max_batch_images == 1024);
+  CHECK(def.max_pdf_page_pixels == 40000000);  // 40 MP
+
+  reset_env();
+  ::setenv("MAX_BATCH_IMAGES", "64", 1);
+  ::setenv("MAX_PDF_PAGE_PIXELS_MP", "20", 1);
+  auto on = ServerConfig::from_env(Profile::Gpu);
+  CHECK(on.errors.empty());
+  CHECK(on.max_batch_images == 64);
+  CHECK(on.max_pdf_page_pixels == 20000000);
+  auto j = on.to_json();
+  CHECK(j.find("\"max_batch_images\":64") != std::string::npos);
+
+  reset_env();
+  ::setenv("MAX_BATCH_IMAGES", "0", 1);          // below min 1
+  ::setenv("MAX_PDF_PAGE_PIXELS_MP", "999", 1);  // above max 268
+  auto bad = ServerConfig::from_env(Profile::Gpu);
+  REQUIRE_FALSE(bad.errors.empty());
+}
+
+TEST_CASE("BIND_HOST aliases the bind address; REQUEST_TIMEOUT_MS validates", "[server_config]") {
+  // BIND_HOST is an additive alias for TURBO_OCR_HOST (non-breaking; default
+  // stays 0.0.0.0 — auth/exposure are the fronting gateway's job).
+  reset_env();
+  ::setenv("BIND_HOST", "127.0.0.1", 1);
+  CHECK(ServerConfig::from_env(Profile::Gpu).host == "127.0.0.1");
+
+  // TURBO_OCR_HOST wins when both are set (it predates BIND_HOST).
+  reset_env();
+  ::setenv("BIND_HOST", "127.0.0.1", 1);
+  ::setenv("TURBO_OCR_HOST", "0.0.0.0", 1);
+  CHECK(ServerConfig::from_env(Profile::Gpu).host == "0.0.0.0");
+
+  // REQUEST_TIMEOUT_MS validates like the other strict ints (M3).
+  reset_env();
+  ::setenv("REQUEST_TIMEOUT_MS", "not_a_number", 1);
+  CHECK_FALSE(ServerConfig::from_env(Profile::Gpu).errors.empty());
 }

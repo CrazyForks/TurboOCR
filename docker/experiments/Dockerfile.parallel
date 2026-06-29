@@ -1,0 +1,31 @@
+# Incremental rebuild on top of turboocr:vlm — only rebuilds changed C++ sources.
+# Produces turboocr:parallel with formula||table parallel dispatch (Improvement 1)
+# and CJK low-conf VLM text re-recognition (Improvement 2).
+FROM turboocr:vlm AS builder
+
+USER root
+
+# Copy only the changed source and header files to minimize rebuild scope.
+COPY CMakeLists.txt /app/CMakeLists.txt
+COPY src/formula/CMakeLists.txt /app/src/formula/CMakeLists.txt
+COPY src/formula/vlm_text_rerec.cpp /app/src/formula/vlm_text_rerec.cpp
+COPY src/pipeline/ocr_pipeline.cpp /app/src/pipeline/ocr_pipeline.cpp
+COPY include/turbo_ocr/pipeline/ocr_pipeline.h /app/include/turbo_ocr/pipeline/ocr_pipeline.h
+COPY include/turbo_ocr/formula/vlm_text_rerec.h /app/include/turbo_ocr/formula/vlm_text_rerec.h
+
+# Rebuild: re-run cmake to pick up CMakeLists changes, then build only turboocr-server.
+# vlm_text_rerec.cpp is picked up via GLOB in the formula CMakeLists;
+# TURBO_OCR_HAVE_VLM_FORMULA is set unconditionally on turbo_ocr_gpu.
+RUN cd /app/build && \
+    cmake .. -DTENSORRT_DIR=/usr/lib/x86_64-linux-gnu -DFETCH_MODELS=OFF && \
+    make -j$(nproc) turboocr-server
+
+RUN chown -R ocr:ocr /app/build
+
+FROM turboocr:vlm
+USER root
+COPY --from=builder /app/build/turboocr-server /app/build/turboocr-server
+RUN chown ocr:ocr /app/build/turboocr-server
+
+ENTRYPOINT ["/app/scripts/entrypoint.sh"]
+CMD ["./build/turboocr-server"]

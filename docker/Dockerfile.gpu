@@ -16,6 +16,13 @@
 #     https://nvcr.io/v2/nvidia/tensorrt/manifests/26.03-py3 | grep -i docker-content-digest
 FROM nvcr.io/nvidia/tensorrt:26.03-py3@sha256:ade1b30517b3d66b911a3cd7faf0146484ab8956098abe66b96b944fa36f4861
 
+# Target architecture, set automatically by `docker buildx` (amd64 | arm64).
+# The nvcr TensorRT base image is multi-arch, so the right CUDA/TRT stack is
+# pulled per platform; the steps below select matching ONNX Runtime / CMake /
+# PDFium / TensorRT-lib paths. Build aarch64 with:
+#   docker buildx build --platform linux/arm64 -f docker/Dockerfile.gpu -t turbo-ocr .
+ARG TARGETARCH
+
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -24,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nginx \
     gosu \
     libwebp-dev \
+    libturbojpeg0-dev \
     libgrpc++-dev \
     libprotobuf-dev \
     protobuf-compiler-grpc \
@@ -35,6 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     wget \
     curl \
+    libcurl4-openssl-dev \
     gettext-base \
     && rm -rf /var/lib/apt/lists/*
 
@@ -53,10 +62,11 @@ RUN cd /tmp && \
 # Upgrade cmake (base image has 3.24, need 3.17+ for CUDA C++20)
 ARG CMAKE_VERSION=3.31.6
 RUN cd /tmp && \
-    wget -q "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" && \
-    tar xzf cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz && \
-    cp -r cmake-${CMAKE_VERSION}-linux-x86_64/bin/* /usr/local/bin/ && \
-    cp -r cmake-${CMAKE_VERSION}-linux-x86_64/share/* /usr/local/share/ && \
+    case "${TARGETARCH:-amd64}" in arm64) CM_ARCH=aarch64 ;; *) CM_ARCH=x86_64 ;; esac && \
+    wget -q "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${CM_ARCH}.tar.gz" && \
+    tar xzf cmake-${CMAKE_VERSION}-linux-${CM_ARCH}.tar.gz && \
+    cp -r cmake-${CMAKE_VERSION}-linux-${CM_ARCH}/bin/* /usr/local/bin/ && \
+    cp -r cmake-${CMAKE_VERSION}-linux-${CM_ARCH}/share/* /usr/local/share/ && \
     rm -rf /tmp/cmake*
 
 # Install ONNX Runtime C++ SDK (for CPU mode).
@@ -65,13 +75,20 @@ RUN cd /tmp && \
 #   curl -sL https://github.com/microsoft/onnxruntime/releases/download/v<NEW>/onnxruntime-linux-x64-<NEW>.tgz | sha256sum
 ARG ORT_VERSION=1.22.0
 ARG ORT_SHA256=8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3
+# The aarch64 tarball has a different hash; override with --build-arg
+# ORT_SHA256_ARM64=... after an ORT_VERSION bump (empty = download without checksum).
+ARG ORT_SHA256_ARM64=bb76395092d150b52c7092dc6b8f2fe4d80f0f3bf0416d2f269193e347e24702
 RUN cd /tmp && \
-    wget -q "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" -O onnxruntime-linux-x64-${ORT_VERSION}.tgz && \
-    echo "${ORT_SHA256}  onnxruntime-linux-x64-${ORT_VERSION}.tgz" | sha256sum -c - && \
-    tar xzf onnxruntime-linux-x64-${ORT_VERSION}.tgz && \
-    cp -r onnxruntime-linux-x64-${ORT_VERSION}/include/* /usr/local/include/ && \
-    cp onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so* /usr/local/lib/ && \
-    ldconfig && rm -rf /tmp/onnxruntime*
+    case "${TARGETARCH:-amd64}" in \
+      arm64) ORT_ARCH=aarch64; ORT_SHA=${ORT_SHA256_ARM64} ;; \
+      *)     ORT_ARCH=x64;     ORT_SHA=${ORT_SHA256} ;; \
+    esac && \
+    wget -q "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}.tgz" -O ort.tgz && \
+    if [ -n "${ORT_SHA}" ]; then echo "${ORT_SHA}  ort.tgz" | sha256sum -c -; else echo "WARN: no SHA256 pinned for ${ORT_ARCH} ONNX Runtime; skipping checksum"; fi && \
+    tar xzf ort.tgz && \
+    cp -r onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}/include/* /usr/local/include/ && \
+    cp onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}/lib/libonnxruntime.so* /usr/local/lib/ && \
+    ldconfig && rm -rf /tmp/onnxruntime* /tmp/ort.tgz
 
 WORKDIR /app
 
@@ -85,14 +102,18 @@ COPY tools/ tools/
 COPY third_party/ third_party/
 COPY tests/ tests/
 COPY scripts/install_fastpdf2png.sh scripts/install_fastpdf2png.sh
+COPY scripts/install_pdfium.sh scripts/install_pdfium.sh
 
-# Install fastpdf2png v2.0 (PDF renderer — daemon pool, raw PPM, /dev/shm)
-RUN bash scripts/install_fastpdf2png.sh && \
+# Install fastpdf2png v2.0 (PDF renderer — daemon pool, raw PPM, /dev/shm).
+# On arm64 this also swaps third_party/pdfium to the aarch64 PDFium build.
+RUN TARGETARCH=${TARGETARCH} bash scripts/install_fastpdf2png.sh && \
     cp bin/libpdfium.so /usr/lib/ && ldconfig
 
-# Build GPU mode (HTTP + gRPC)
+# Build GPU mode (HTTP + gRPC). TensorRT libs live under the Debian multiarch
+# triplet, which differs per architecture.
 RUN mkdir -p build && cd build && \
-    cmake .. -DTENSORRT_DIR=/usr/lib/x86_64-linux-gnu -DFETCH_MODELS=OFF && \
+    case "${TARGETARCH:-amd64}" in arm64) TRT_DIR=/usr/lib/aarch64-linux-gnu ;; *) TRT_DIR=/usr/lib/x86_64-linux-gnu ;; esac && \
+    cmake .. -DTENSORRT_DIR=${TRT_DIR} -DFETCH_MODELS=OFF && \
     make -j$(nproc)
 
 # Runtime-only layers — edits here do not trigger a rebuild.
@@ -103,25 +124,29 @@ EXPOSE 8000 50051
 
 # Create the ocr user + redirect /app/models/rec into the persisted cache
 # volume BEFORE fetching models, so fetch_release_models.sh writes each
-# non-latin bundle straight into the volume path. The layout:
-#   /app/models/{det,cls,rec,keys.txt}           -- latin default (flat)
-#   /app/models/rec/<lang>/{rec.onnx, dict.txt}  -- every other language,
-#       via the symlink, into /home/ocr/.cache/turbo-ocr/models/rec/<lang>/.
+# retained-script bundle straight into the volume path. The layout:
+#   /app/models/{det,rec,cls}.onnx + keys.txt    -- v6 default tier (flat)
+#   /app/models/rec/<script>/{rec.onnx, dict.txt}  -- retained PP-OCRv5
+#       recognizers, via the symlink, into
+#       /home/ocr/.cache/turbo-ocr/models/rec/<script>/.
 # Named-volume mounting the cache dir persists both TRT engines and the
-# language bundles from a single -v flag.
+# script bundles from a single -v flag.
 RUN useradd -m -s /bin/bash ocr \
     && chmod +x /app/scripts/entrypoint.sh \
     && mkdir -p /home/ocr/.cache/turbo-ocr/models/rec /app/models \
     && ln -s /home/ocr/.cache/turbo-ocr/models/rec /app/models/rec
 
-# Fetch every supported PP-OCRv5 bundle from the pinned GitHub Release, with
-# SHA256 verification. The symlink above means /app/models/rec/<lang>/ writes
-# land in the cache dir; anything the image user's named volume seeds from
-# the image will include the baked bundles.
-ARG OCR_INCLUDE_SERVER=1
-ENV OCR_INCLUDE_SERVER=${OCR_INCLUDE_SERVER}
+# Fetch the PP-OCRv6 tiers + retained PP-OCRv5 script bundles from the pinned
+# GitHub Release, with SHA256 verification. The symlink above means
+# /app/models/rec/<script>/ writes land in the cache dir, so a named volume
+# seeded from the image includes the baked bundles.
 RUN bash scripts/fetch_release_models.sh \
     && chown -R ocr:ocr /app /home/ocr/.cache
 
+# nginx fronts the app on 8000; /health is GPU-free liveness.
+# start-period covers cold-start TRT engine build from ONNX (~90s).
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD curl -sf http://localhost:8000/health || exit 1
+
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
-CMD ["./build/paddle_highspeed_cpp"]
+CMD ["./build/turboocr-server"]

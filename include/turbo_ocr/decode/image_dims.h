@@ -15,9 +15,12 @@
 // width/height directly from the file header.
 //
 // This is the SOTA pattern used by every public image API (AWS Rekognition,
-// Google Vision, Cloudinary, ImageMagick MAGICK_AREA_LIMIT). For formats we
-// don't sniff (BMP, TIFF, WEBP), the route handler still does a post-decode
-// check as a safety net.
+// Google Vision, Cloudinary, ImageMagick MAGICK_AREA_LIMIT). We sniff every
+// *compressible* container (PNG, JPEG, WebP, TIFF, GIF) so the aggregate
+// batch-pixel budget can bound a batch of decompression bombs before any are
+// materialized. For residual uncompressed formats (BMP, PNM) the encoded body
+// is ~the decoded size, so MAX_BODY_MB already bounds them and the route
+// handler's post-decode check is the safety net.
 namespace turbo_ocr::decode {
 
 struct ImageDims {
@@ -124,6 +127,72 @@ peek_webp_dims(const unsigned char *data, size_t len) {
   return std::nullopt;
 }
 
+// GIF: "GIF87a" / "GIF89a" magic (6 bytes) + logical-screen descriptor.
+// Width is 2 LE bytes at offset 6, height 2 LE bytes at offset 8. GIF's LZW
+// stream is highly compressible, so a tiny body can claim a huge canvas —
+// sniff it so the per-image and aggregate caps bound it like PNG/JPEG.
+inline std::optional<ImageDims>
+peek_gif_dims(const unsigned char *data, size_t len) {
+  if (len < 10) return std::nullopt;
+  if (std::memcmp(data, "GIF87a", 6) != 0 &&
+      std::memcmp(data, "GIF89a", 6) != 0)
+    return std::nullopt;
+  uint32_t w = uint32_t(data[6]) | (uint32_t(data[7]) << 8);
+  uint32_t h = uint32_t(data[8]) | (uint32_t(data[9]) << 8);
+  if (w == 0 || h == 0) return std::nullopt;
+  return ImageDims{int(w), int(h)};
+}
+
+// TIFF: "II\x2A\x00" (little-endian) or "MM\x00\x2A" (big-endian) header, then
+// a 4-byte offset to the first IFD. The IFD is a 2-byte entry count followed
+// by 12-byte entries; ImageWidth (tag 256) and ImageLength (tag 257) carry the
+// pixel grid as SHORT (type 3, inlined) or LONG (type 4). LZW/deflate/PackBits
+// TIFF is a compressible bomb vector, so sniff the first IFD's dims. All reads
+// are bounds-checked against len; a malformed/truncated header returns nullopt
+// and falls through to the post-decode safety net.
+inline std::optional<ImageDims>
+peek_tiff_dims(const unsigned char *data, size_t len) {
+  if (len < 8) return std::nullopt;
+  bool le;
+  if (std::memcmp(data, "II\x2A\x00", 4) == 0) le = true;
+  else if (std::memcmp(data, "MM\x00\x2A", 4) == 0) le = false;
+  else return std::nullopt;
+  auto rd16 = [le](const unsigned char *p) -> uint32_t {
+    return le ? (uint32_t(p[0]) | (uint32_t(p[1]) << 8))
+              : (uint32_t(p[1]) | (uint32_t(p[0]) << 8));
+  };
+  auto rd32 = [le](const unsigned char *p) -> uint32_t {
+    return le ? (uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
+                 (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24))
+              : (uint32_t(p[3]) | (uint32_t(p[2]) << 8) |
+                 (uint32_t(p[1]) << 16) | (uint32_t(p[0]) << 24));
+  };
+  uint32_t ifd_off = rd32(data + 4);
+  if (ifd_off < 8 || static_cast<uint64_t>(ifd_off) + 2 > len)
+    return std::nullopt;
+  uint32_t count = rd16(data + ifd_off);
+  const uint64_t entries_start = static_cast<uint64_t>(ifd_off) + 2;
+  if (entries_start >= len) return std::nullopt;
+  // Clamp to the entries that actually fit; never read past len.
+  const uint64_t max_fit = (len - entries_start) / 12;
+  if (count > max_fit) count = static_cast<uint32_t>(max_fit);
+  uint32_t w = 0, h = 0;
+  for (uint32_t e = 0; e < count; ++e) {
+    const unsigned char *ent = data + entries_start + static_cast<uint64_t>(e) * 12;
+    uint16_t tag = static_cast<uint16_t>(rd16(ent));
+    if (tag != 256 && tag != 257) continue;
+    uint16_t type = static_cast<uint16_t>(rd16(ent + 2));
+    uint32_t val;
+    if (type == 3) val = rd16(ent + 8);       // SHORT (value inlined)
+    else if (type == 4) val = rd32(ent + 8);  // LONG
+    else continue;
+    if (tag == 256) w = val;
+    else h = val;
+  }
+  if (w == 0 || h == 0 || w > INT_MAX || h > INT_MAX) return std::nullopt;
+  return ImageDims{static_cast<int>(w), static_cast<int>(h)};
+}
+
 // Try every supported format. Returns nullopt if format is unrecognised
 // (callers should fall through to post-decode validation, which still
 // catches the rest as a safety net).
@@ -132,6 +201,8 @@ peek_image_dimensions(const unsigned char *data, size_t len) {
   if (auto d = peek_png_dims(data, len)) return d;
   if (auto d = peek_jpeg_dims(data, len)) return d;
   if (auto d = peek_webp_dims(data, len)) return d;
+  if (auto d = peek_gif_dims(data, len)) return d;
+  if (auto d = peek_tiff_dims(data, len)) return d;
   return std::nullopt;
 }
 

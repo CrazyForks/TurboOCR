@@ -24,26 +24,86 @@
 #include "turbo_ocr/common/types.h"
 #include "turbo_ocr/decode/fast_png_decoder.h"
 #include "turbo_ocr/layout/layout_types.h"
+#include "turbo_ocr/routing/routing_config.h"
 #include "turbo_ocr/server/metrics.h"
+
+#include <set>
 
 namespace turbo_ocr::server {
 
-/// Combined result of one inference: text OCR results + optional layout.
+/// Combined result of one inference: text OCR results + optional layout +
+/// optional table/formula structure. Populated on both the CPU pipeline and
+/// the GPU /ocr (base64) path (whose infer lambda forwards the synchronous
+/// dispatch_router_ output); emit_infer_result_json serializes these keys.
+/// The GPU /ocr/raw + /ocr/batch routes bypass this struct and emit via the
+/// full OcrPipelineResult emitter in image_routes.cpp directly.
 struct InferResult {
   std::vector<OCRResultItem>            results;
   std::vector<layout::LayoutBox>        layout;
   std::vector<int>                      reading_order;
+  std::vector<router::TableResult>      tables;
+  std::vector<router::FormulaResult>    formulas;
+  bool                                  formula_degraded = false;
+  std::string                           formula_warning;
+  bool                                  table_degraded = false;
+  std::string                           table_warning;
+  // Detection found text regions but recognition produced nothing usable — the no-silent-
+  // failure signal for the TEXT stage (the pipeline computes it via flag_text_degraded; it
+  // was previously dropped here, so /ocr + CPU /ocr/raw returned a clean empty 200).
+  bool                                  text_degraded = false;
+  std::string                           text_warning;
 };
+
+// Serialize an InferResult, emitting `tables`/`formulas` (+ degraded signals)
+// when present. Reuses the shared OcrPipelineResult emitter so the CPU `/ocr`
+// + `/ocr/raw` responses are byte-identical to the GPU server's structure JSON.
+// On a text-only result the structure vectors are empty and their keys are
+// omitted — byte-identical to the legacy emit_results_json output.
+[[nodiscard]] inline std::string
+emit_infer_result_json(InferResult &inf, bool want_blocks) {
+  if (inf.tables.empty() && inf.formulas.empty() && !inf.formula_degraded &&
+      !inf.table_degraded && !inf.text_degraded) {
+    return turbo_ocr::emit_results_json(inf.results, inf.layout,
+                                        inf.reading_order, want_blocks);
+  }
+  pipeline::OcrPipelineResult out;
+  out.results = std::move(inf.results);
+  out.layout = std::move(inf.layout);
+  out.reading_order = std::move(inf.reading_order);
+  out.tables = std::move(inf.tables);
+  out.formulas = std::move(inf.formulas);
+  out.formula_degraded = inf.formula_degraded;
+  out.formula_warning = std::move(inf.formula_warning);
+  out.table_degraded = inf.table_degraded;
+  out.table_warning = std::move(inf.table_warning);
+  out.text_degraded = inf.text_degraded;
+  out.text_warning = std::move(inf.text_warning);
+  return turbo_ocr::emit_pipeline_result_json(out, want_blocks);
+}
 
 /// Per-request feature flags parsed from query parameters.
 struct InferOptions {
   bool want_layout = false;
   bool want_reading_order = false;
+  // ?tables=1 / ?formulas=1 — strict opt-in. Even when a table/formula backend
+  // is configured at startup, the stage runs ONLY when the request asks for it.
+  // Both imply layout (recognition runs on layout-detected regions), so either
+  // auto-enables want_layout. Default false: layout alone never triggers them.
+  bool want_tables = false;
+  bool want_formulas = false;
   // ?as_blocks=1 — emit a `blocks` array (paragraph-level aggregate,
   // one entry per non-empty layout cell, mirrors PaddleX's
   // PP-StructureV3 parsing_res_list granularity). Auto-enables layout
   // and reading_order since aggregation needs both.
   bool want_blocks = false;
+
+  // Per-request routing override (Tier-A): a backend NAME per modality (empty
+  // == use the configured route default). Parsed from /ocr/raw query params
+  // (?route_table=/?route_formula=) and /ocr JSON body (routing{}). Validated
+  // against the registry name-set at the route layer (unknown => 400) before
+  // it reaches the pipeline. Rides the by-value `opts` capture into the
+  // dispatcher lambda, so it's timeout-safe like the other flags.
+  routing::RequestRouting routing_override;
 };
 
 /// Image decoder: (raw_bytes_ptr, length) -> cv::Mat
@@ -52,11 +112,18 @@ using ImageDecoder = std::function<cv::Mat(const unsigned char *data, size_t len
 /// Inference function: given cv::Mat + feature flags, run OCR pipeline.
 using InferFunc = std::function<InferResult(const cv::Mat &, const InferOptions &)>;
 
+/// Orientation detector: rendered page -> clockwise rotation deg (0/90/180/270).
+/// Empty/unset when the doc-orientation model isn't loaded (autorotate off).
+using OrientFunc = std::function<int(const cv::Mat &)>;
+
 /// Drogon callback alias.
 using DrogonCallback = std::function<void(const drogon::HttpResponsePtr &)>;
 
 // ── UUID v7 (timestamp-ordered, ~50ns) ──────────────────────────────────
-
+//
+// Request-id only — used for log correlation / X-Request-Id, never as a
+// security token. mt19937_64 is fast but predictable; do NOT reuse these IDs
+// to gate access or authorize anything.
 [[nodiscard]] inline std::string generate_uuid_v7() {
   auto ms = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -91,7 +158,7 @@ using DrogonCallback = std::function<void(const drogon::HttpResponsePtr &)>;
 
 /// Structured JSON error response: {"error":{"code":"...","message":"..."}}
 [[nodiscard]] inline drogon::HttpResponsePtr error_response(
-    drogon::HttpStatusCode status, const char *code, std::string message) {
+    drogon::HttpStatusCode status, const char *code, const std::string &message) {
   std::string body;
   body.reserve(64 + std::strlen(code) + message.size());
   body += R"({"error":{"code":")";
@@ -135,8 +202,15 @@ template <typename F>
 void run_with_error_handling(DrogonCallback &cb, const char *route, F &&fn) {
   try {
     fn();
+  } catch (const turbo_ocr::TimeoutError &e) {
+    // C4: a per-request deadline overrun. Must map to 504 INFERENCE_TIMEOUT —
+    // same as the GPU image routes — not the generic 500 below. /ocr (base64)
+    // is the one inference route still on this shared handler in the GPU build.
+    cb(error_response(drogon::k504GatewayTimeout, "INFERENCE_TIMEOUT", e.what()));
   } catch (const turbo_ocr::PoolExhaustedError &e) {
     cb(error_response(drogon::k503ServiceUnavailable, "SERVER_BUSY", e.what()));
+  } catch (const turbo_ocr::ImageTooLargeError &e) {
+    cb(error_response(drogon::k400BadRequest, "DIMENSIONS_TOO_LARGE", e.what()));
   } catch (const turbo_ocr::ImageDecodeError &e) {
     cb(error_response(drogon::k400BadRequest, "IMAGE_DECODE_FAILED", e.what()));
   } catch (const std::exception &e) {
@@ -209,7 +283,11 @@ inline void register_observability_middleware() {
             auto ms = (now_ns - start_ns) / 1'000'000;
             resp->addHeader("X-Inference-Time-Ms", std::to_string(ms));
             duration_s = static_cast<double>(now_ns - start_ns) / 1e9;
-          } catch (...) {}
+          } catch (...) {
+            // Best-effort timing only: a malformed X-Start-Ns (std::stoll
+            // throws) just omits the X-Inference-Time-Ms header — never fail
+            // the response over an observability detail.
+          }
         }
 
         // Retry-After on 503
@@ -245,27 +323,6 @@ inline void register_observability_middleware() {
   return opencv_decode();
 }
 
-[[nodiscard]] inline std::string parse_layout_query(const drogon::HttpRequestPtr &req,
-                                                     bool layout_available,
-                                                     bool *out) {
-  *out = false;
-  auto v = req->getParameter("layout");
-  if (v.empty()) return {};
-  std::string s(v);
-  for (char &c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  bool on;
-  if (s == "1" || s == "true" || s == "on" || s == "yes")       on = true;
-  else if (s == "0" || s == "false" || s == "off" || s == "no") on = false;
-  else return std::format("Invalid layout param: '{}' (expected 0|1)", s);
-  if (on && !layout_available) {
-    return std::string("Layout requested but the layout model is not loaded. "
-                       "Either models/layout/layout.onnx is missing from the "
-                       "image, or the server was started with DISABLE_LAYOUT=1.");
-  }
-  *out = on;
-  return {};
-}
-
 // Parse a generic boolean query param ("1"/"true"/"on"/"yes" etc.).
 // Returns empty string on success and writes to *out; otherwise returns an
 // error message. When the parameter is absent, *out is set to false and an
@@ -298,9 +355,19 @@ parse_query_options(const drogon::HttpRequestPtr &req,
                     bool layout_available,
                     InferOptions *out) {
   *out = {};
-  if (auto err = parse_layout_query(req, layout_available, &out->want_layout);
+  if (auto err = parse_bool_query(req, "layout", &out->want_layout);
       !err.empty())
     return {err, "INVALID_PARAMETER"};
+  if (out->want_layout && !layout_available) {
+    // One stable code for one condition: every "layout feature
+    // unavailable" rejection (layout=1, reading_order=1, as_blocks=1)
+    // returns LAYOUT_DISABLED — the code docs/api/http.md documents.
+    // Malformed values stay INVALID_PARAMETER.
+    return {"Layout requested but the layout model is not loaded. "
+            "Either models/layout/layout.onnx is missing from the "
+            "image, or the server was started with DISABLE_LAYOUT=1.",
+            "LAYOUT_DISABLED"};
+  }
 
   if (auto err = parse_bool_query(req, "reading_order",
                                    &out->want_reading_order);
@@ -334,6 +401,82 @@ parse_query_options(const drogon::HttpRequestPtr &req,
     out->want_layout = true;
   }
 
+  if (auto err = parse_bool_query(req, "tables", &out->want_tables);
+      !err.empty())
+    return {err, "INVALID_PARAMETER"};
+  if (auto err = parse_bool_query(req, "formulas", &out->want_formulas);
+      !err.empty())
+    return {err, "INVALID_PARAMETER"};
+  // Table/formula recognition runs on layout-detected regions, so either flag
+  // implies layout. Auto-enable it (mirrors as_blocks) so ?tables=1 / ?formulas=1
+  // work standalone; require the layout model to be present.
+  if ((out->want_tables || out->want_formulas) && !layout_available) {
+    return {"tables=1/formulas=1 require the layout model: start the server "
+            "without DISABLE_LAYOUT=1 (layout is on by default)",
+            "LAYOUT_DISABLED"};
+  }
+  if (out->want_tables || out->want_formulas)
+    out->want_layout = true;
+
+  return {};
+}
+
+// Fail loud when the client opted into a structure stage the server can't do:
+// tables=1 / formulas=1 with no backend configured at startup. Returns
+// TABLE_BACKEND_DISABLED / FORMULA_BACKEND_DISABLED (a 400) rather than the
+// silent empty result a missing backend would otherwise produce — clients can
+// discover availability up front via GET /capabilities. Call after
+// parse_query_options at every route that honors the user's tables/formulas
+// flags (NOT /ocr/markdown, which sets them best-effort).
+// `table_available`/`formula_available` must reflect what the pipeline ACTUALLY
+// loaded for the route DEFAULT (not the routing-name set): a per-request
+// ?route_table=/?route_formula= override is deliberately NOT treated as
+// satisfying availability here, because `synth_from_env` always names the
+// default formula route ("formula-env") even with no model loaded — honoring an
+// override would let `?formulas=1&route_formula=formula-env` slip past the gate
+// and then return a silent empty result. To use tables/formulas the route
+// default backend must be configured; an override only selects among loaded
+// backends once the default gate passes.
+[[nodiscard]] inline ParseOptionsResult
+check_structure_backends(const InferOptions &o, bool table_available,
+                         bool formula_available) {
+  if (o.want_tables && !table_available)
+    return {"tables=1 requested but no table backend is configured. Start the "
+            "server with TABLE_BACKEND= + TABLE_SLANEXT_ENCODER_ONNX= (see GET "
+            "/capabilities for what this server supports).",
+            "TABLE_BACKEND_DISABLED"};
+  if (o.want_formulas && !formula_available)
+    return {"formulas=1 requested but no formula backend is configured. Start "
+            "the server with FORMULA_ONNX= + FORMULA_TOKENIZER= (see GET "
+            "/capabilities for what this server supports).",
+            "FORMULA_BACKEND_DISABLED"};
+  return {};
+}
+
+// Validate a per-request routing override (raw backend names extracted from
+// query params or the JSON body) against the sets of names the pipeline
+// actually registered (routing::routable_backend_names). An unknown name is a
+// 400 (ROUTING_UNKNOWN_OVERRIDE) — fail loudly rather than silently ignore an
+// override the operator expected to take effect. Empty names => no override.
+[[nodiscard]] inline ParseOptionsResult
+validate_routing_override(const std::string &table, const std::string &formula,
+                          const std::set<std::string> &valid_table,
+                          const std::set<std::string> &valid_formula,
+                          routing::RequestRouting *out) {
+  if (!table.empty()) {
+    if (valid_table.find(table) == valid_table.end())
+      return {"route_table override '" + table +
+                  "' names no configured table backend (see /capabilities)",
+              "ROUTING_UNKNOWN_OVERRIDE"};
+    out->table = table;
+  }
+  if (!formula.empty()) {
+    if (valid_formula.find(formula) == valid_formula.end())
+      return {"route_formula override '" + formula +
+                  "' names no configured formula backend (see /capabilities)",
+              "ROUTING_UNKNOWN_OVERRIDE"};
+    out->formula = formula;
+  }
   return {};
 }
 

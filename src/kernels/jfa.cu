@@ -14,30 +14,41 @@
 #include <cuda_runtime.h>
 #include <cfloat>
 #include <climits>
+#include <cmath>
 
 namespace turbo_ocr::kernels {
 
-__global__ void jfa_init_kernel(int2 *seeds, const uint8_t *bitmap, int w, int h) {
+// Packed seed: x in the high 16 bits, y in the low 16 bits. 0xFFFFFFFF = empty.
+// Halves the JFA buffer footprint (vs int2) and the per-step memory traffic.
+// Safe because det resize dims are capped well under 65535 (caller asserts).
+static constexpr uint32_t kSeedEmpty = 0xFFFFFFFFu;
+__device__ __forceinline__ uint32_t pack_seed(int x, int y) {
+    return ((uint32_t)x << 16) | ((uint32_t)y & 0xFFFFu);
+}
+__device__ __forceinline__ int seed_x(uint32_t s) { return (int)(s >> 16); }
+__device__ __forceinline__ int seed_y(uint32_t s) { return (int)(s & 0xFFFFu); }
+
+__global__ void jfa_init_kernel(uint32_t *seeds, const uint8_t *bitmap, int w, int h) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     int idx = y * w + x;
-    seeds[idx] = bitmap[idx] ? make_int2(x, y) : make_int2(-1, -1);
+    seeds[idx] = bitmap[idx] ? pack_seed(x, y) : kSeedEmpty;
 }
 
 // Ping-pong: read from in_seeds, write to out_seeds. Avoids the in-place
 // race where neighbor reads see partial writes from concurrent blocks.
-__global__ void jfa_step_kernel(const int2 *in_seeds, int2 *out_seeds,
+__global__ void jfa_step_kernel(const uint32_t *in_seeds, uint32_t *out_seeds,
                                 int w, int h, int s) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
 
     int idx = y * w + x;
-    int2 best = in_seeds[idx];
-    long long best_d2 = (best.x < 0) ? LLONG_MAX :
-        ((long long)(x - best.x) * (x - best.x) +
-         (long long)(y - best.y) * (y - best.y));
+    uint32_t best = in_seeds[idx];
+    long long best_d2 = (best == kSeedEmpty) ? LLONG_MAX :
+        ((long long)(x - seed_x(best)) * (x - seed_x(best)) +
+         (long long)(y - seed_y(best)) * (y - seed_y(best)));
 
     const int dx[8] = {s, s, 0, -s, -s, -s, 0, s};
     const int dy[8] = {0, -s, -s, -s, 0, s, s, s};
@@ -46,10 +57,11 @@ __global__ void jfa_step_kernel(const int2 *in_seeds, int2 *out_seeds,
     for (int d = 0; d < 8; d++) {
         int nx = x + dx[d], ny = y + dy[d];
         if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
-        int2 ns = in_seeds[ny * w + nx];
-        if (ns.x < 0) continue;
-        long long d2 = (long long)(x - ns.x) * (x - ns.x) +
-                        (long long)(y - ns.y) * (y - ns.y);
+        uint32_t ns = in_seeds[ny * w + nx];
+        if (ns == kSeedEmpty) continue;
+        int sx = seed_x(ns), sy = seed_y(ns);
+        long long d2 = (long long)(x - sx) * (x - sx) +
+                        (long long)(y - sy) * (y - sy);
         if (d2 < best_d2) { best = ns; best_d2 = d2; }
     }
     out_seeds[idx] = best;
@@ -59,7 +71,7 @@ __global__ void jfa_step_kernel(const int2 *in_seeds, int2 *out_seeds,
 // Per-component expand cutoff: expand_per_comp[cid] = area_i*ratio/perimeter_i,
 // matching Clipper's polygon offset distance. This closes the F1 gap to CPU.
 __global__ void jfa_expand_labels_kernel(uint32_t *expanded_labels,
-                                          const int2 *seeds,
+                                          const uint32_t *seeds,
                                           const int32_t *compact_ids,
                                           const float *expand_per_comp,
                                           int w, int h) {
@@ -67,14 +79,15 @@ __global__ void jfa_expand_labels_kernel(uint32_t *expanded_labels,
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     int idx = y * w + x;
-    int2 s = seeds[idx];
-    if (s.x < 0) { expanded_labels[idx] = 0; return; }
-    int cid = compact_ids[s.y * w + s.x];
+    uint32_t s = seeds[idx];
+    if (s == kSeedEmpty) { expanded_labels[idx] = 0; return; }
+    int sx = seed_x(s), sy = seed_y(s);
+    int cid = compact_ids[sy * w + sx];
     if (cid < 0) { expanded_labels[idx] = 0; return; }
     float e = expand_per_comp[cid]; // 0 for filtered-out / empty slots
     if (e <= 0.0f) { expanded_labels[idx] = 0; return; }
-    long long d2 = (long long)(x - s.x) * (x - s.x) +
-                    (long long)(y - s.y) * (y - s.y);
+    long long d2 = (long long)(x - sx) * (x - sx) +
+                    (long long)(y - sy) * (y - sy);
     double e2 = (double)e * (double)e;
     if ((double)d2 > e2) { expanded_labels[idx] = 0; return; }
     expanded_labels[idx] = (uint32_t)(cid + 1); // +1 so 0=bg
@@ -143,32 +156,41 @@ void cuda_jfa_expand_labels(const uint8_t *d_bitmap,
                             const int32_t *d_compact_ids,
                             const float *d_expand_per_comp,
                             uint32_t *d_expanded_labels,
-                            int w, int h,
-                            int2 *d_seeds, int2 *d_seeds_alt,
+                            int w, int h, float max_expand,
+                            uint32_t *d_seeds, uint32_t *d_seeds_alt,
                             cudaStream_t stream) {
+    // 16-bit packed coords require dims < 65536. The det resize cap keeps us
+    // far under this; abort loudly rather than silently corrupt seeds if a
+    // caller ever violates it.
+    if (w > 65535 || h > 65535) {
+        throw turbo_ocr::CudaError(
+            "cuda_jfa_expand_labels: image dim exceeds 65535 (packed-seed limit)");
+    }
+
     dim3 block(32, 8);
     dim3 grid((w + 31) / 32, (h + 7) / 8);
 
     jfa_init_kernel<<<grid, block, 0, stream>>>(d_seeds, d_bitmap, w, h);
     CUDA_CHECK(cudaGetLastError());
 
-    int2 *in_seeds  = d_seeds;
-    int2 *out_seeds = d_seeds_alt;
-    int max_dim = max(w, h);
-    for (int s = 1 << (31 - __builtin_clz(max_dim)); s > 0; s >>= 1) {
+    uint32_t *in_seeds  = d_seeds;
+    uint32_t *out_seeds = d_seeds_alt;
+    // Bounded JFA: any pixel within max_expand of a seed is resolved by jumps
+    // <= that range; pixels beyond it are discarded by expand. So start the
+    // step at the next pow2 >= ceil(max_expand) instead of the image size,
+    // cutting ~11 passes (at 1280) down to ~4-5.
+    int start = 1;
+    int bound = (max_expand < 1.0f) ? 1 : (int)ceilf(max_expand);
+    while (start < bound) start <<= 1;
+    for (int s = start; s > 0; s >>= 1) {
         jfa_step_kernel<<<grid, block, 0, stream>>>(in_seeds, out_seeds, w, h, s);
         CUDA_CHECK(cudaGetLastError());
-        int2 *tmp = in_seeds; in_seeds = out_seeds; out_seeds = tmp;
-    }
-    // Final result must land in d_seeds (downstream consumer).
-    if (in_seeds != d_seeds) {
-        CUDA_CHECK(cudaMemcpyAsync(d_seeds, in_seeds,
-                                   (size_t)w * h * sizeof(int2),
-                                   cudaMemcpyDeviceToDevice, stream));
+        uint32_t *tmp = in_seeds; in_seeds = out_seeds; out_seeds = tmp;
     }
 
+    // Consume whichever ping-pong buffer holds the final result (no D2D copy).
     jfa_expand_labels_kernel<<<grid, block, 0, stream>>>(
-        d_expanded_labels, d_seeds, d_compact_ids, d_expand_per_comp, w, h);
+        d_expanded_labels, in_seeds, d_compact_ids, d_expand_per_comp, w, h);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -1,16 +1,23 @@
 #include "turbo_ocr/render/pdf_renderer.h"
 #include "turbo_ocr/common/errors.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
+#include <string>
 #include <format>
 #include <memory>
 #include <mutex>
 #include <thread>
+
+#include <pthread.h>
 
 #include <opencv2/imgproc.hpp>
 #include <fcntl.h>
@@ -22,6 +29,35 @@
 #include <unistd.h>
 
 using namespace turbo_ocr::render;
+
+// PPM RGB→BGR swap implementation selector (TURBO_PPM_SWAP=scalar forces the
+// old byte loop; validated to {simd, scalar} at startup by ServerConfig).
+// Default uses OpenCV's SIMD cvtColor, markedly faster on a single core.
+// CPU-only path — no GPU required.
+static bool ppm_swap_use_simd() {
+  static const bool simd = [] {
+    const char *e = std::getenv("TURBO_PPM_SWAP");
+    return !(e && std::strcmp(e, "scalar") == 0);
+  }();
+  return simd;
+}
+
+// Max rendered pixels per page (width*height). The per-side 16384 cap below
+// still bounds a single dimension, but a 16384x16384 page is ~268MP → ~768MB
+// raster + a same-size encoded image held in the response: this area cap
+// rejects such pages (decode_ppm returns empty → the route reports a decode
+// failure). Reads MAX_PDF_PAGE_PIXELS_MP (megapixels); ServerConfig validates
+// it to [1,268] at startup. Default 40 MP (e.g. 5000x8000 at ~600 DPI A4).
+static int64_t ppm_max_pixels() {
+  static const int64_t px = [] {
+    const char *e = std::getenv("MAX_PDF_PAGE_PIXELS_MP");
+    int mp = 40;
+    // Best-effort env parse: keep the default on any malformed value.
+    if (e) { try { mp = std::clamp(std::stoi(e), 1, 268); } catch (...) { /* keep default on malformed value */ } }
+    return static_cast<int64_t>(mp) * 1000000;
+  }();
+  return px;
+}
 
 static std::string find_binary() {
   // Explicit override — used by tests and by deployments that put the binary
@@ -90,10 +126,12 @@ struct TempGuard {
   TempGuard(std::string p, bool dir) : path(std::move(p)), is_dir(dir) {}
   ~TempGuard() noexcept {
     if (path.empty()) return;
+    // Best-effort cleanup from a noexcept destructor: a failed unlink/remove
+    // only leaks a temp file the OS reclaims, and we must not throw here.
     try {
       if (is_dir) std::filesystem::remove_all(path);
       else unlink(path.c_str());
-    } catch (...) {}
+    } catch (...) { /* noexcept dtor: leaked temp is reclaimed by the OS */ }
   }
   void release() { path.clear(); }
   TempGuard(const TempGuard &) = delete;
@@ -158,6 +196,7 @@ cv::Mat PdfRenderer::decode_ppm(const std::string &path) {
   int w = 0, h = 0, maxval = 0;
   if (!next_int(w) || !next_int(h) || !next_int(maxval)) return {};
   if (w <= 0 || h <= 0 || w > 16384 || h > 16384 || maxval != 255) return {};
+  if (static_cast<int64_t>(w) * h > ppm_max_pixels()) return {};  // area bomb guard
   // After maxval there's exactly one whitespace byte before the payload.
   if (p >= end) return {};
   ++p;
@@ -173,17 +212,27 @@ cv::Mat PdfRenderer::decode_ppm(const std::string &path) {
     return bgr;
   }
 
-  // Color: single-pass RGB→BGR copy, one write-back over the pixels.
+  // Color: RGB (PPM) → BGR. OpenCV's cvtColor is a SIMD-vectorized channel
+  // swap — meaningfully faster than a scalar byte loop on the single core that
+  // bottlenecks PDF page-image throughput. The scalar loop is kept as a
+  // fallback selectable with TURBO_PPM_SWAP=scalar.
   cv::Mat bgr(h, w, CV_8UC3);
-  const unsigned char *src = p;
-  unsigned char *dst = bgr.data;
-  const size_t n_px = static_cast<size_t>(w) * h;
-  for (size_t i = 0; i < n_px; ++i) {
-    dst[0] = src[2];
-    dst[1] = src[1];
-    dst[2] = src[0];
-    src += 3;
-    dst += 3;
+  if (ppm_swap_use_simd()) {
+    // Header over the mmap'd RGB payload — no copy; cvtColor reads it and
+    // writes the owned `bgr`, both completing before the munmap at return.
+    cv::Mat rgb(h, w, CV_8UC3, const_cast<unsigned char *>(p));
+    cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+  } else {
+    const unsigned char *src = p;
+    unsigned char *dst = bgr.data;
+    const size_t n_px = static_cast<size_t>(w) * h;
+    for (size_t i = 0; i < n_px; ++i) {
+      dst[0] = src[2];
+      dst[1] = src[1];
+      dst[2] = src[0];
+      src += 3;
+      dst += 3;
+    }
   }
   return bgr;
 }
@@ -199,40 +248,86 @@ cv::Mat PdfRenderer::decode_ppm(const std::string &path) {
 // materialises under normal operation — the daemon stays alive across
 // the process lifetime. ~PdfRenderer reaps the daemons explicitly.
 
+// Fork+exec a fresh daemon into `d`. Shared by the constructor and the
+// runtime crash-recovery path (respawn_daemon). The pipes are created
+// O_CLOEXEC so every sibling daemon's parent-side fd (and our own unused pipe
+// ends) is dropped automatically at execl(); only the two fds dup2()'d onto
+// STDIN/STDOUT survive (dup2 clears CLOEXEC on its target). This is what makes
+// runtime respawn safe: the forked child never reads another daemon's FILE*
+// fields, so it can't race a concurrent sibling respawn mutating them. pipe2()
+// sets the flag atomically — no fd-leak window for a concurrent fork.
+// L4: dup2() can fail (EBADF/EINTR/EMFILE); an un-rewired child would speak the
+// daemon protocol on the wrong fds and wedge the parent's pipe, so check both
+// dup2() calls and _exit on failure.
+void PdfRenderer::spawn_daemon(Daemon &d) {
+  int in_pipe[2], out_pipe[2];
+  if (pipe2(in_pipe, O_CLOEXEC) < 0)
+    throw turbo_ocr::PdfRenderError("pipe2() failed for PDF renderer daemon");
+  if (pipe2(out_pipe, O_CLOEXEC) < 0) {
+    close(in_pipe[0]); close(in_pipe[1]);
+    throw turbo_ocr::PdfRenderError("pipe2() failed for PDF renderer daemon");
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(in_pipe[0]); close(in_pipe[1]);
+    close(out_pipe[0]); close(out_pipe[1]);
+    throw turbo_ocr::PdfRenderError("fork() failed for PDF renderer daemon");
+  }
+
+  if (pid == 0) {
+    // dup2 clears CLOEXEC on STDIN/STDOUT so they survive exec; all other
+    // (CLOEXEC) fds — our unused pipe ends and every sibling's pipe fd — are
+    // closed automatically by execl(). No manual cross-daemon close loop, so
+    // nothing here touches another daemon's FILE* (race-free vs respawn).
+    if (dup2(in_pipe[0], STDIN_FILENO) < 0) _exit(127);
+    if (dup2(out_pipe[1], STDOUT_FILENO) < 0) _exit(127);
+    execl(binary_path_.c_str(), binary_path_.c_str(), "--daemon", nullptr);
+    _exit(1);
+  }
+
+  close(in_pipe[0]);
+  close(out_pipe[1]);
+  d.pid = pid;
+  d.cmd_in = fdopen(in_pipe[1], "w");
+  d.result_out = fdopen(out_pipe[0], "r");
+  if (!d.cmd_in || !d.result_out)
+    throw turbo_ocr::PdfRenderError("fdopen failed for PDF renderer daemon");
+}
+
+// Crash recovery for a wedged/dead daemon. Caller holds d.mutex. Reap the
+// dead child (best-effort; the no-SIGCHLD-reaper design means it's still
+// ours to wait on), tear down its stale pipe handles, then fork a fresh one.
+// Returns false (without throwing) if the respawn fails so send_cmd can
+// surface the original protocol error instead of masking it.
+bool PdfRenderer::respawn_daemon(Daemon &d) {
+  if (d.cmd_in)     { fclose(d.cmd_in);     d.cmd_in = nullptr; }
+  if (d.result_out) { fclose(d.result_out); d.result_out = nullptr; }
+  if (d.pid > 0) {
+    // The dead child may be a zombie (exited) or still dying (e.g. crashing
+    // mid-write). Don't block shutdown-style: try non-blocking, then SIGKILL.
+    if (waitpid(d.pid, nullptr, WNOHANG) == 0) {
+      kill(d.pid, SIGKILL);
+      waitpid(d.pid, nullptr, 0);
+    }
+  }
+  d.pid = 0;
+  try {
+    spawn_daemon(d);
+  } catch (const std::exception &) {
+    // Leave the slot dead (pid==0, null handles); a later request retries.
+    return false;
+  }
+  return d.pid > 0;
+}
+
 PdfRenderer::PdfRenderer(int pool_size, int workers_per_render)
     : pool_size_(pool_size), workers_per_render_(workers_per_render),
       daemons_(pool_size) {
   binary_path_ = find_binary();
 
-  for (int i = 0; i < pool_size_; ++i) {
-    int in_pipe[2], out_pipe[2];
-    if (pipe(in_pipe) < 0 || pipe(out_pipe) < 0)
-      throw turbo_ocr::PdfRenderError("pipe() failed for PDF renderer daemon");
-
-    pid_t pid = fork();
-    if (pid < 0) throw turbo_ocr::PdfRenderError("fork() failed for PDF renderer daemon");
-
-    if (pid == 0) {
-      dup2(in_pipe[0], STDIN_FILENO);
-      dup2(out_pipe[1], STDOUT_FILENO);
-      close(in_pipe[0]); close(in_pipe[1]);
-      close(out_pipe[0]); close(out_pipe[1]);
-      for (int j = 0; j < i; ++j) {
-        if (daemons_[j].cmd_in) fclose(daemons_[j].cmd_in);
-        if (daemons_[j].result_out) fclose(daemons_[j].result_out);
-      }
-      execl(binary_path_.c_str(), binary_path_.c_str(), "--daemon", nullptr);
-      _exit(1);
-    }
-
-    close(in_pipe[0]);
-    close(out_pipe[1]);
-    daemons_[i].pid = pid;
-    daemons_[i].cmd_in = fdopen(in_pipe[1], "w");
-    daemons_[i].result_out = fdopen(out_pipe[0], "r");
-    if (!daemons_[i].cmd_in || !daemons_[i].result_out)
-      throw turbo_ocr::PdfRenderError("fdopen failed for PDF renderer daemon");
-  }
+  for (int i = 0; i < pool_size_; ++i)
+    spawn_daemon(daemons_[i]);
 
   // Liveness probe: if the binary was missing a shared lib, wasn't executable,
   // or crashed during its own startup, the child calls _exit(1) within ~micro-
@@ -293,15 +388,105 @@ int PdfRenderer::acquire_daemon() {
   return idx;
 }
 
-std::string PdfRenderer::send_cmd(Daemon &d, const std::string &cmd) {
-  fprintf(d.cmd_in, "%s\n", cmd.c_str());
-  fflush(d.cmd_in);
+// Block SIGPIPE on the calling thread for the lifetime of the guard, draining
+// any pending instance on destruction. Writing to a daemon whose read end has
+// died would otherwise raise SIGPIPE and take down the whole server — exactly
+// the M9 crash we must instead recover from. Thread-local mask only; no
+// process-wide signal disposition change.
+namespace {
+struct SigpipeBlocker {
+  sigset_t old_set;
+  bool blocked = false;
+  SigpipeBlocker() {
+    sigset_t pipe_set;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    if (pthread_sigmask(SIG_BLOCK, &pipe_set, &old_set) == 0) blocked = true;
+  }
+  ~SigpipeBlocker() {
+    if (!blocked) return;
+    // Drain a SIGPIPE that fired while blocked so it doesn't get delivered
+    // once we unblock. sigtimedwait with a zero timeout is non-blocking.
+    sigset_t pipe_set;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    struct timespec zero{0, 0};
+    while (sigtimedwait(&pipe_set, nullptr, &zero) >= 0) {}
+    pthread_sigmask(SIG_SETMASK, &old_set, nullptr);
+  }
+};
+} // namespace
+
+// Single write+read round-trip to the daemon. Returns false (not throws) on a
+// pipe write/read failure so the caller (send_cmd) can decide whether to
+// respawn+retry vs. surface the error.
+bool PdfRenderer::send_cmd_once(Daemon &d, const std::string &cmd,
+                                std::string &out) {
+  if (!d.cmd_in || !d.result_out) return false;
+  {
+    SigpipeBlocker no_sigpipe;
+    if (fprintf(d.cmd_in, "%s\n", cmd.c_str()) < 0) return false;
+    if (fflush(d.cmd_in) != 0) return false;  // EPIPE if reader is dead
+  }
+  // Bound the blocking reply read: a daemon that accepted the command but never
+  // answers (wedged mid-render) would otherwise hang the worker forever. The
+  // initial "OK N" wait is NOT covered by the 30 s missed-page net in
+  // render_streamed, so poll the result fd first. On timeout/error return false
+  // and let send_cmd's existing respawn+retry path recover. Configurable via
+  // PDF_RENDER_REPLY_TIMEOUT_MS (default 120000).
+  static const int reply_timeout_ms = [] {
+    const char *e = std::getenv("PDF_RENDER_REPLY_TIMEOUT_MS");
+    int v = e ? std::atoi(e) : 120000;
+    return v > 0 ? v : 120000;
+  }();
+  struct pollfd pfd = {fileno(d.result_out), POLLIN, 0};
+  // poll() returns -1/EINTR on signal delivery — that is NOT a daemon failure, so
+  // retry against the remaining budget rather than tripping the respawn path. A
+  // genuine timeout (0) or real error (-1, errno != EINTR) still returns false.
+  {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(reply_timeout_ms);
+    for (;;) {
+      const auto now = std::chrono::steady_clock::now();
+      int remaining = static_cast<int>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+              .count());
+      if (remaining < 0) remaining = 0;
+      const int pr = ::poll(&pfd, 1, remaining);
+      if (pr > 0) break;                        // fd readable
+      if (pr == 0) return false;                // timed out
+      if (errno == EINTR) continue;             // signal: retry with remaining budget
+      return false;                             // real poll error
+    }
+  }
+
   char buf[4096];
-  if (!fgets(buf, sizeof(buf), d.result_out))
-    throw turbo_ocr::PdfRenderError("PDF renderer daemon read failed (daemon may have crashed)");
+  if (!fgets(buf, sizeof(buf), d.result_out)) return false;
   auto len = std::strlen(buf);
   if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
-  return buf;
+  out.assign(buf);
+  return true;
+}
+
+// M9: on a read/write failure the daemon has crashed. Under the caller-held
+// per-daemon mutex, reap+re-fork a fresh daemon and retry the command exactly
+// once. A single retry caps tight re-fork loops: a daemon that dies again on
+// the retry surfaces the error (and a brief backoff before the re-fork avoids
+// hammering exec when the binary itself is the problem). Steady-state callers
+// hit zero overhead — the first attempt succeeds and we never touch fork().
+std::string PdfRenderer::send_cmd(Daemon &d, const std::string &cmd) {
+  std::string out;
+  if (send_cmd_once(d, cmd, out)) return out;
+
+  // First attempt failed — assume crash, re-fork and retry once.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));  // re-fork backoff
+  if (!respawn_daemon(d))
+    throw turbo_ocr::PdfRenderError(
+        "PDF renderer daemon crashed and could not be re-forked");
+  if (send_cmd_once(d, cmd, out)) return out;
+
+  throw turbo_ocr::PdfRenderError(
+      "PDF renderer daemon read failed after re-fork (daemon may be crash-looping)");
 }
 
 std::vector<cv::Mat> PdfRenderer::render(const uint8_t *data, size_t len,
@@ -359,10 +544,12 @@ std::vector<cv::Mat> PdfRenderer::render(const uint8_t *data, size_t len,
 // finish decoding, otherwise workers will try to open a file that's been
 // unlinked under them.
 void PdfRenderer::StreamHandle::cleanup() noexcept {
+  // Best-effort cleanup from a noexcept path: a failed unlink/remove only
+  // leaks a temp file the OS reclaims later, and we must not throw here.
   try {
     if (!pdf_tmpfile.empty()) ::unlink(pdf_tmpfile.c_str());
     if (!ppm_tmpdir.empty())  std::filesystem::remove_all(ppm_tmpdir);
-  } catch (...) {}
+  } catch (...) { /* noexcept cleanup: leaked temp is reclaimed by the OS */ }
   pdf_tmpfile.clear();
   ppm_tmpdir.clear();
   num_pages = 0;

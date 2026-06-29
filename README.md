@@ -1,97 +1,82 @@
 <p align="center">
-  <img src="tests/benchmark/comparison/images/banner.png" alt="Turbo OCR — Fast GPU OCR server. 270 img/s on FUNSD." width="100%">
-</p>
-
-<!--
-Turbo OCR — Fast GPU OCR server. C++ / CUDA / TensorRT. 270 img/s on FUNSD.
--->
-
-<p align="center">
-  <strong>GPU-accelerated OCR server. 50x faster than PaddleOCR Python.</strong><br>
-  C++ / CUDA / TensorRT / PP-OCRv5 &mdash; Linux + NVIDIA GPU
+  <img src="tests/benchmark/comparison/images/banner.png" alt="TurboOCR — the fastest GPU document parser." width="100%">
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/throughput-270_img%2Fs-blue?style=flat-square&logo=speedtest&logoColor=white" alt="270 img/s">
+  <strong>The fastest GPU document parser — OCR · layout · tables · formulas → Markdown, at 200–556 images/s on one GPU.</strong><br>
+  C++ / CUDA / TensorRT / PP-OCRv6 &mdash; Linux + NVIDIA GPU
+</p>
+
+<h3 align="center">🎉 v3.0 — now powered by PP-OCRv6</h3>
+<p align="center">
+  <sub>New <code>medium</code> / <code>small</code> / <code>tiny</code> tiers · higher accuracy · faster defaults · <a href="#upgrading-to-v3-breaking-changes">breaking changes ↓</a></sub>
+</p>
+
+<p align="center">
+  <a href="https://github.com/aiptimizer/TurboOCR"><strong>⭐ Star TurboOCR on GitHub</strong></a> — it helps others (and agents) find it.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/throughput-up_to_556_img%2Fs-blue?style=flat-square&logo=speedtest&logoColor=white" alt="up to 556 img/s">
   <a href="https://turboocr.com"><img src="https://img.shields.io/badge/website-turboocr.com-3B82F6?style=flat-square&logo=googlechrome&logoColor=white" alt="turboocr.com"></a>
   <a href="https://github.com/aiptimizer/TurboOCR/releases/latest"><img src="https://img.shields.io/github/v/release/aiptimizer/TurboOCR?style=flat-square&logo=github&logoColor=white" alt="Release"></a>
   <a href="https://ghcr.io/aiptimizer/turboocr"><img src="https://img.shields.io/badge/docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker"></a>
   <img src="https://img.shields.io/badge/C%2B%2B20-00599C?style=flat-square&logo=cplusplus&logoColor=white" alt="C++20">
   <img src="https://img.shields.io/badge/CUDA-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="CUDA">
   <img src="https://img.shields.io/badge/TensorRT-10.16-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="TensorRT 10.16">
-  <a href="https://drogon.org"><img src="https://img.shields.io/badge/Drogon-1.9-009688?style=flat-square&logo=cplusplus&logoColor=white" alt="Drogon"></a>
-  <img src="https://img.shields.io/badge/nginx-009639?style=flat-square&logo=nginx&logoColor=white" alt="nginx">
   <img src="https://img.shields.io/badge/gRPC-4285F4?style=flat-square&logo=google&logoColor=white" alt="gRPC">
-  <a href="https://github.com/PaddlePaddle/PaddleOCR"><img src="https://img.shields.io/badge/PP--OCRv5-PaddleOCR-0053D6?style=flat-square&logo=paddlepaddle&logoColor=white" alt="PaddleOCR"></a>
-  <a href="#monitoring"><img src="https://img.shields.io/badge/Prometheus-E6522C?style=flat-square&logo=prometheus&logoColor=white" alt="Prometheus"></a>
+  <a href="https://github.com/PaddlePaddle/PaddleOCR"><img src="https://img.shields.io/badge/PP--OCRv6-PaddleOCR-0053D6?style=flat-square&logo=paddlepaddle&logoColor=white" alt="PaddleOCR"></a>
   <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square&logo=opensourceinitiative&logoColor=white" alt="MIT License">
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> &middot;
-  <a href="#api">API</a> &middot;
   <a href="#benchmarks">Benchmarks</a> &middot;
-  <a href="#monitoring">Monitoring</a> &middot;
-  <a href="#configuration">Configuration</a> &middot;
-  <a href="#building-from-source">Build</a> &middot;
-  <a href="#roadmap">Roadmap</a> &middot;
-  <a href="https://turboocr.com">Website</a>
+  <a href="#models">Models</a> &middot;
+  <a href="#upgrading-to-v3-breaking-changes">v3 changes</a> &middot;
+  <a href="#api">API</a> &middot;
+  <a href="docs/index.md">Docs</a>
 </p>
 
 ---
 
-![Turbo-OCR vs alternatives on FUNSD](tests/benchmark/comparison/images/hero.png)
+An extremely fast GPU **document parser** — not just OCR. PP-OCRv6 detection +
+recognition, plus layout, tables (→ HTML), formulas (→ LaTeX) and reading-order
+**Markdown**, the whole pipeline on a single multi-stream CUDA/TensorRT engine,
+locally (no VLM), behind HTTP and gRPC. Whole-page OCR runs at **up to 559 images/s
+on receipts** (one RTX 5090), and full structured parsing (layout + tables + formulas)
+at **~20 pages/s** — where VLM document parsers like PaddleOCR-VL run ~1 page/s. On
+forms and receipts it is accurate and 15–90× faster than classic OCR engines.
 
-<!--
-The image above is a chart that may be blocked by robots.txt. Below is the chart data as a text table for LLMs, scrapers, and other automated readers.
-Turbo-OCR vs PaddleOCR · EasyOCR · VLMs — FUNSD (50 pages, RTX 5090)
-| Engine | F1 (%) | Throughput (img/s) |
-|---|---:|---:|
-| Turbo-OCR (C++/TRT) | 90.2 | 268.4 |
-| PaddleOCR mobile latin | 86.6 | 5.1 |
-| Qwen3-VL-2B | 84.3 | 1.3 |
-| PaddleOCR-VL (pipeline) | 83.1 | 2.0 |
-| EasyOCR (Python) | 63.0 | 2.8 |
--->
+- 🚀 **Up to 559 img/s** (receipts) / **520 img/s** (forms) on one RTX 5090, fastest by default
+- 🎯 **Accurate on forms & receipts** &mdash; competitive with PaddleOCR-VL, PaddleOCR-Python, RapidOCR, EasyOCR and Tesseract ([benchmarks](#benchmarks))
+- 🧠 **PP-OCRv6** &mdash; one model covers Latin + Chinese + Japanese; pick `tiny` (default) / `small` / `medium`
+- 🌐 **More scripts** &mdash; Arabic, Cyrillic, Korean, Thai, Greek via retained PP-OCRv5 recognizers
+- 📄 **PDF native** &mdash; pages rendered and OCR'd in parallel, optional page-image export & auto-rotation
+- 🧩 **Layout + reading order** &mdash; PP-DocLayoutV3 (25 classes) and class-aware XY-cut, opt-in per request
+- 🔢 **Tables & formulas** &mdash; opt-in SLANet+ table → HTML and PP-FormulaNet-S formula → LaTeX, emitted alongside the text ([how to enable](#tables--formulas))
+- 🐳 **One-line Docker deploy** with TensorRT engines auto-built on first start, **Prometheus** metrics on `/metrics`
 
-### Highlights
-
-- 🚀 **270 img/s** on FUNSD A4 forms (c=16) &mdash; **1,200+ img/s** on sparse images
-- ⚡ **11 ms p50 latency**, single request
-- 🎯 **F1 = 90.2%** on FUNSD &mdash; higher accuracy than PaddleOCR Python with the same weights
-- 🖨️ **Prints & handwriting** &mdash; PP-OCRv5 handles both out of the box
-- 📄 **PDF native** &mdash; pages rendered and OCR'd in parallel
-- 🔒 **4 PDF modes** &mdash; pure OCR, native text layer, auto-dispatch, detection-verified hybrid
-- 🧩 **Layout detection** &mdash; PP-DocLayoutV3 with 25 region classes, per-request `?layout=1` toggle
-- 📖 **Reading order** &mdash; class-aware XY-cut (header → body → footer/reference), row-tolerant table-cell sort, orphan-aware placement, opt-in via `?reading_order=1`
-- 🌐 **HTTP + gRPC** from a single binary, sharing the same GPU pipeline pool
-- 🐳 **One-line Docker deploy** &mdash; `docker run` with auto TRT engine build on first start
-- 📊 **Prometheus metrics** &mdash; request counters, latency histograms, VRAM usage on `/metrics`
-- 🌐 Configurable languages (Latine e.g., English, French, German, Spanish, Portuguese; Chinese, Greek, Russian, Arabic, Korean, Thai)
-
-*RTX 5090, PP-OCRv5 mobile latin, TensorRT FP16, pool=5. Prints, handwriting, layout detection. This is the fast lane.*
-
-### 🗺️ Roadmap
-- 🔍 Structured extraction
-- 📝 Markdown output
-- 📊 Table parsing
+Full documentation: **[docs/](docs/index.md)**
 
 ---
 
 ## Quick Start
 
-**Requirements:** Linux, NVIDIA driver 595+, Turing or newer GPU (RTX 20-series / GTX 16-series+).
+**Requirements:** Linux, NVIDIA driver 595+, Turing or newer GPU (RTX 20-series / GTX 16-series+). Plan for ~4 GB VRAM text-only and ~8 GB for the full pipeline (layout + tables + formulas); each extra `PIPELINE_POOL_SIZE` replica adds roughly another full set, so lower it on smaller cards.
 
 ```bash
 docker run --gpus all -p 8000:8000 -p 50051:50051 \
   -v trt-cache:/home/ocr/.cache/turbo-ocr \
-  ghcr.io/aiptimizer/turboocr:v2.3.0
+  ghcr.io/aiptimizer/turboocr:latest
 ```
 
-First startup builds TensorRT engines from ONNX. This takes about 90 seconds on a 5090 GPU and up to an hour on older ones. Set TRT_OPT_LEVEL=3 to
-  cut build time 3 to 5x with a small speed regression. The volume caches the engines, so subsequent starts are instant. During the build, requests will
-  return a connection refused error from nginx until the backend is ready. nginx (port 8000) reverse-proxies to Drogon (port 8080), and both start
-  automatically.
+First startup builds TensorRT engines from ONNX. This takes about 90 seconds on a
+5090 GPU and up to an hour on older ones. Set `TRT_OPT_LEVEL=3` to cut build time
+3 to 5x with a small speed regression. The named volume caches the engines, so
+subsequent starts are instant. During the build, requests return a connection
+refused error from nginx until the backend is ready. nginx (port 8000)
+reverse-proxies to Drogon (port 8080), and both start automatically.
 
 ```bash
 curl -X POST http://localhost:8000/ocr/raw \
@@ -99,380 +84,202 @@ curl -X POST http://localhost:8000/ocr/raw \
 ```
 
 ```json
-{
-  "results": [
-    {"text": "Invoice Total", "confidence": 0.97, "bounding_box": [[42,10],[210,10],[210,38],[42,38]]}
-  ]
-}
-```
-
----
-
-## API
-
-HTTP on port 8000, gRPC on port 50051 — single binary, shared GPU pipeline pool.
-
-> **Important:** Use persistent connections (HTTP keep-alive). Sending many short-lived connections (e.g. one `curl` per request in a loop) can overwhelm the server and cause it to stall. All standard HTTP client libraries (`requests.Session`, `aiohttp`, Go `http.Client`, etc.) reuse connections by default.
-
-### Endpoints
-
-| Endpoint | Input | Description |
-|----------|-------|-------------|
-| `/health` | — | Returns `"ok"` |
-| `/health/live` | — | Kubernetes liveness probe |
-| `/health/ready` | — | Readiness probe — verifies GPU pipeline is responsive |
-| `/ocr/raw` | Raw image bytes | Fastest path — PNG, JPEG, etc. |
-| `/ocr` | `{"image": "<base64>"}` | For clients that can only send JSON |
-| `/ocr/batch` | `{"images": ["<b64>", ...]}` | Multiple images in one request |
-| `/ocr/pixels` | Raw BGR bytes + `X-Width` / `X-Height` / `X-Channels` headers | Zero-decode path — see [/ocr/pixels](#ocrpixels-zero-decode-path) |
-| `/ocr/pdf` | Raw bytes, `{"pdf": "<b64>"}`, or `multipart/form-data` | All pages OCR'd in parallel |
-| `/metrics` | — | Prometheus metrics (text exposition format) |
-| gRPC | Raw bytes (protobuf) | Port 50051 — see `proto/ocr.proto` |
-
-### Query Parameters
-
-| Parameter | Endpoints | Values | Default |
-|-----------|-----------|--------|---------|
-| `layout` | all | `0` / `1` | `0` — include [layout regions](#layout-detection) (~20% throughput cost) |
-| `reading_order` | image routes | `0` / `1` | `0` — emit `reading_order` array indexing `results` in proper reading order (auto-enables `layout=1`). Class-aware: header → body → footer/footnote/reference; XY-cut on body with row-tolerant table-cell sort and orphan placement |
-| `as_blocks` | image + PDF routes | `0` / `1` | `0` — when `1`, response includes a `blocks` array: paragraph-level aggregate, one entry per non-empty layout cell, in reading order. Auto-enables `layout=1` and `reading_order=1`. Each block has `{id, layout_id, class, bounding_box, content, order_index}`. Mirrors PaddleX PP-StructureV3 `parsing_res_list` granularity. |
-| `mode` | `/ocr/pdf` | `ocr` / `geometric` / `auto` / `auto_verified` | `ocr` — on the CPU binary, `auto_verified` is silently aliased to `auto` (no native text re-verifier on CPU). Inspect the per-page `mode` field in the response to see which path actually ran. |
-| `dpi` | `/ocr/pdf` | `50`–`600` | `100` — render resolution |
-
-**Parameter parsing rules.** Parameter *names* are case-sensitive: `?layout=1` works, `?Layout=1` is silently ignored. Boolean values for `layout`, `reading_order`, and `as_blocks` accept any case of `1/0`, `true/false`, `on/off`, `yes/no`, and reject anything else with `400 INVALID_PARAMETER`. Values for `mode=` are **case-sensitive and silently fall back to the configured default** when unrecognized — `?mode=Auto`, `?mode=AUTO`, or `?mode=foobar` all run as `mode=ocr` (or whatever `ENABLE_PDF_MODE` is set to) without error. Always pass exactly `ocr`, `geometric`, `auto`, or `auto_verified`.
-
-### Examples
-
-```bash
-# Image — raw bytes (fastest)
-curl -X POST http://localhost:8000/ocr/raw \
-  --data-binary @doc.png -H "Content-Type: image/png"
-
-# Image — base64 JSON
-curl -X POST http://localhost:8000/ocr \
-  -H "Content-Type: application/json" \
-  -d '{"image":"'$(base64 -w0 doc.png)'"}'
-
-# PDF — raw bytes
-curl -X POST http://localhost:8000/ocr/pdf \
-  --data-binary @document.pdf
-
-# PDF — multipart (works from any client, including browsers)
-curl -X POST http://localhost:8000/ocr/pdf \
-  -F "file=@document.pdf"
-
-# PDF — with layout + auto mode
-curl -X POST "http://localhost:8000/ocr/pdf?layout=1&mode=auto" \
-  --data-binary @document.pdf
-
-# gRPC (grpcurl uses base64 for CLI; real clients send raw bytes)
-grpcurl -plaintext -d '{"image":"'$(base64 -w0 doc.png)'"}' \
-  localhost:50051 ocr.OCRService/Recognize
-```
-
-### `/ocr/pixels` (zero-decode path)
-
-For clients that already hold a decoded image in memory (NumPy, OpenCV, custom pipelines), `/ocr/pixels` skips the PNG/JPEG decode step entirely. The body is sent as raw pixel bytes; dimensions travel in HTTP headers.
-
-| Header | Required | Values | Meaning |
-|--------|:---:|--------|---------|
-| `X-Width` | yes | `1`–`MAX_IMAGE_DIM` (default `16384`) | Image width in pixels |
-| `X-Height` | yes | `1`–`MAX_IMAGE_DIM` (default `16384`) | Image height in pixels |
-| `X-Channels` | no | `1` or `3` (default `3`) | `3` = BGR (OpenCV order, **not** RGB), `1` = grayscale |
-
-- **Body:** raw pixel bytes, length must equal `width * height * channels` exactly. A mismatch returns `400 BODY_SIZE_MISMATCH`.
-- **Query parameters:** the same `?layout=` and `?reading_order=` as `/ocr` apply.
-- **Errors:** `MISSING_HEADER` (no `X-Width` / `X-Height`), `INVALID_HEADER` (unparseable values), `INVALID_DIMENSIONS` (non-positive size or channels other than 1/3), `DIMENSIONS_TOO_LARGE` (exceeds `MAX_IMAGE_DIM`).
-- **Use case:** the hot path when upstream code already has a decoded `cv::Mat` / `np.ndarray` and you don't want to round-trip through PNG.
-
-```bash
-# Python — send a decoded OpenCV image (BGR)
-python -c "
-import cv2, requests
-img = cv2.imread('doc.png')        # BGR, HxWx3
-h, w, c = img.shape
-requests.post('http://localhost:8000/ocr/pixels',
-              data=img.tobytes(),
-              headers={'X-Width': str(w), 'X-Height': str(h), 'X-Channels': str(c)})
-"
-```
-
-### Response Format
-
-**Image endpoints** return:
-```json
 {"results": [{"text": "Invoice Total", "confidence": 0.97, "bounding_box": [[42,10],[210,10],[210,38],[42,38]]}]}
 ```
 
-**With `?layout=1`**, a `layout` array is added. Each OCR result gets a `layout_id` linking it to the containing layout region:
-```json
-{
-  "results": [{"text": "...", "confidence": 0.97, "id": 0, "layout_id": 2, "bounding_box": [...]}],
-  "layout": [{"id": 0, "class": "header", "confidence": 0.91, "bounding_box": [...]},
-             {"id": 2, "class": "table", "confidence": 0.95, "bounding_box": [...]}]
-}
-```
-
-**PDF endpoint** wraps results per page:
-```json
-{
-  "pages": [{
-    "page": 1, "page_index": 0, "dpi": 100, "width": 1047, "height": 1389,
-    "mode": "ocr", "text_layer_quality": "absent", "results": [...]
-  }]
-}
-```
-Coordinate conversion: `x_pdf = x_px * 72 / dpi`.
-
-Per-page fields:
-- `mode` — the **resolved** mode that actually ran on this page (`ocr` / `geometric` / `auto_verified`). For `?mode=auto` requests, each page resolves to either `geometric` (text layer accepted) or `ocr` (fell back to OCR), never `auto`. On the CPU binary, `?mode=auto_verified` resolves to `auto` semantics, so per-page `mode` will be `geometric` or `ocr` — `auto_verified` only appears on the GPU binary.
-- `text_layer_quality` — assessment of the page's native text layer:
-  - `absent` — no usable text layer (image-only PDF, fewer than 10 chars, or empty lines)
-  - `rejected` — text layer present but failed sanity checks (non-zero rotation, >5% replacement chars, >10% non-printable chars)
-  - `trusted` — native text passed sanity checks and was used (`geometric` / `auto`) or considered for cross-check (`auto_verified`)
-  - For `mode=ocr` this is always `absent` (the text-layer pre-pass is skipped entirely).
-
-### PDF Extraction Modes
-
-| Mode | What it does | Speed |
-|------|-------------|-------|
-| `ocr` | Render + full OCR pipeline | Baseline |
-| `geometric` | PDFium text layer only, no rasterization | ~10x faster |
-| `auto` | Per-page: text layer if available, else OCR | Fastest for mixed PDFs |
-| `auto_verified` | Full pipeline + replace with native text where sanity check passes | Slightly slower than OCR |
-
-> [!CAUTION]
-> **PDF text-layer trust model.** Modes other than `ocr` read the PDF's native text layer, which the PDF author controls. A malicious PDF can embed invisible text, remap glyphs via ToUnicode, or inject arbitrary strings that differ from what's visually rendered.
->
-> **When to use each mode:**
-> | Scenario | Recommended mode | Why |
-> |----------|-----------------|-----|
-> | Untrusted uploads (user-submitted PDFs) | `ocr` | Only trusts pixel data — immune to text-layer manipulation |
-> | Internal/trusted documents | `auto` or `geometric` | Safe when you control the PDF source; much faster |
-> | High-accuracy with verification | `auto_verified` | OCR runs first, then results are cross-checked against the text layer. Accepts native text only if it passes heuristic validation (character count, non-printable ratio < 10%, replacement char ratio < 5%, no rotation) |
->
-> **Default:** `mode=ocr` (safest). Override per-request via `?mode=` query parameter or globally via `ENABLE_PDF_MODE` env var.
->
-> **Deployment recommendation:** If your service accepts PDFs from untrusted sources, do **not** set `ENABLE_PDF_MODE` to `geometric` or `auto` globally. Keep the default `ocr` and only use text-layer modes for trusted internal workflows.
-
-### Layout Detection
-
-All endpoints accept `?layout=1` to detect document regions using [PP-DocLayoutV3](https://huggingface.co/PaddlePaddle/PP-DocLayoutV3) (25 classes):
-
-`abstract` · `algorithm` · `aside_text` · `chart` · `content` · `display_formula` · `doc_title` · `figure_title` · `footer` · `footer_image` · `footnote` · `formula_number` · `header` · `header_image` · `image` · `inline_formula` · `number` · `paragraph_title` · `reference` · `reference_content` · `seal` · `table` · `text` · `vertical_text` · `vision_footnote`
-
-#### Layout classes (reading-order buckets)
-
-When `?reading_order=1` is set, classes are partitioned into three strata before XY-cut runs, so common page furniture lands in the right slot regardless of where the layout model placed it spatially: `TOP` is read first, then `BODY` (sorted by XY-cut), then `BOTTOM`.
-
-| Class ID | Name | Bucket |
-|---:|---|---|
-| 0  | `abstract`           | BODY   |
-| 1  | `algorithm`          | BODY   |
-| 2  | `aside_text`         | BODY   |
-| 3  | `chart`              | BODY   |
-| 4  | `content`            | BODY   |
-| 5  | `display_formula`    | BODY   |
-| 6  | `doc_title`          | BODY   |
-| 7  | `figure_title`       | BODY   |
-| 8  | `footer`             | BOTTOM |
-| 9  | `footer_image`       | BOTTOM |
-| 10 | `footnote`           | BOTTOM |
-| 11 | `formula_number`     | BODY   |
-| 12 | `header`             | TOP    |
-| 13 | `header_image`       | TOP    |
-| 14 | `image`              | BODY   |
-| 15 | `inline_formula`     | BODY   |
-| 16 | `number`             | BODY   |
-| 17 | `paragraph_title`    | BODY   |
-| 18 | `reference`          | BOTTOM |
-| 19 | `reference_content`  | BOTTOM |
-| 20 | `seal`               | BODY   |
-| 21 | `table`              | BODY   |
-| 22 | `text`               | BODY   |
-| 23 | `vertical_text`      | BODY   |
-| 24 | `vision_footnote`    | BOTTOM |
-
-Class 16 (`number`, page numbers) deliberately stays in BODY because page numbers can appear at the top **or** the bottom of a page — XY-cut places them by geometry. Class IDs are pinned with `static_assert` against the PaddleX label list, so a future re-shuffle would fail the build rather than silently misroute classes.
-
-<p align="center">
-  <img src="tests/benchmark/comparison/images/layout_example.png" alt="Layout detection overlay" width="500">
-  <br><sub>Layout detection overlay — color-coded regions: <span style="color:#9C27B0">paragraph_title</span>, <span style="color:#2196F3">text</span>, <span style="color:#00BCD4">chart</span>, <span style="color:#FFC107">figure_title</span>, <span style="color:#F44336">header</span>, <span style="color:#607D8B">footer</span>, <span style="color:#646464">number</span></sub>
-</p>
+→ [Docker & deployment](docs/build/docker.md) · [Build from source](docs/build/native.md)
 
 ---
 
 ## Benchmarks
 
-FUNSD form-understanding dataset (50 pages, ~170 words/page). Same word-level F1 metric for all engines. Single RTX 5090.
+On a single RTX 5090, vs every common OCR engine:
 
-![Accuracy](tests/benchmark/comparison/images/accuracy_v2.png)
+- **Forms & receipts (English):** accurate (FUNSD 92% / CORD 93% word-F1 on the medium tier) and **15–90× faster** than every other engine — up to **559 img/s** (receipts) on the default tiny tier. FUNSD/CORD are English/Latin-script datasets; the EN+ZH full-document numbers below include Chinese.
+- **Full document parsing (EN+ZH):** **0.90** Overall on a **125-doc OmniDocBench subset** at **20 pages/s**, within ~5 points of PaddleOCR-VL (0.95, same subset) which runs at ~1 pg/s — fully local, no API. (Subset including Chinese pages, not the full 1651-page set — see [benchmarks](#benchmarks).)
 
-<!--
-OCR Accuracy — FUNSD · 50 images · ~174 words/img
-| Engine | F1 (%) | Recall (%) | Precision (%) |
-|---|---:|---:|---:|
-| Turbo-OCR (C++/TRT) | 90.2 | 91.6 | 88.8 |
-| PaddleOCR mobile latin | 86.6 | 85.5 | 88.2 |
-| Qwen3-VL-2B | 84.3 | 82.8 | 87.5 |
-| PaddleOCR-VL (pipeline) | 83.1 | 82.5 | 85.0 |
-| EasyOCR (Python) | 63.0 | 66.2 | 60.4 |
--->
+→ [Full benchmarks & methodology](docs/benchmarks/comparison.md)
 
-![Throughput](tests/benchmark/comparison/images/throughput_v2.png)
+---
 
-<!--
-OCR Throughput — FUNSD Dataset · Higher is Better
-| Engine | Throughput (img/s) |
-|---|---:|
-| Turbo-OCR (C++/TRT) | 268.4 |
-| PaddleOCR mobile latin | 5.1 |
-| EasyOCR (Python) | 2.8 |
-| PaddleOCR-VL (pipeline) | 2.0 |
-| Qwen3-VL-2B | 1.3 |
--->
+## Models
 
-![Latency](tests/benchmark/comparison/images/latency_v2.png)
+The pipeline is a small stack of specialised models, not one monolith. Text
+detection + recognition + orientation always run; layout, table, and formula are
+opt-in and only load when configured. Each stage links to its own model page.
 
-<!--
-OCR Latency — FUNSD Dataset · Lower is Better
-| Engine | p50 (ms) | p95 (ms) |
-|---|---:|---:|
-| Turbo-OCR (C++/TRT) | 11 | 16 |
-| PaddleOCR mobile latin | 182 | 352 |
-| Qwen3-VL-2B | 2859 | 6191 |
-| PaddleOCR-VL (pipeline) | 1513 | 6517 |
-| EasyOCR (Python) | 559 | 948 |
--->
+| Stage | Model / arch | Size | Selected by | Docs |
+|---|---|---:|---|---|
+| **Text detection** | PP-OCRv6 det (DB, three tiers) | 1.7 / 9.4 / 59 MB | `OCR_MODEL` tier (`tiny`/`small`/`medium`) | [detection](docs/models/detection.md) |
+| **Text recognition** | PP-OCRv6 rec (CRNN + CTC, Latin + Chinese + Japanese) | 4.3 / 20 / 73 MB | `OCR_MODEL` tier — default `tiny` | [recognition](docs/models/recognition.md) · [selection](docs/models/selection.md) |
+| **Orientation** | PP-LCNet textline angle classifier | ~1 MB | always on (runs only on vertical lines) | [classification](docs/models/classification.md) |
+| **Layout** | PP-DocLayoutV3 (RT-DETR-L, 25 classes) | ~124 MB | per request via `?layout=1`; disable with `DISABLE_LAYOUT=1` | [layout](docs/models/layout.md) |
+| **Table → HTML** | SLANet-Plus (TRT FP16 CNN encoder + hand-written C++ GRU decoder) | ~5 MB | `TABLE_BACKEND=slanext` *(encoder auto-resolved from the bundle)* | [table](docs/models/table.md) |
+| **Formula → LaTeX** | PP-FormulaNet-S, in-process pure-C++ (ORT-CUDA-13, no Python) | ~294 MB | `FORMULA_BACKEND=ppformulanet_s` | [formula](docs/models/formula.md) |
 
-<details>
-<summary>Benchmark caveats</summary>
+The three OCR tiers (`tiny`/`small`/`medium`) all cover the same Latin + Chinese +
+Japanese scripts via `OCR_MODEL` — they trade accuracy for speed, not language coverage:
+`tiny` (default) for max throughput, `small` for a balance, `medium` for best accuracy
+(per-tier FUNSD F1 + throughput are in the forms benchmark above). Other scripts use
+retained PP-OCRv5 recognizers, also via `OCR_MODEL`: `arabic`, `eslav` (Cyrillic),
+`korean`, `thai`, `greek`.
 
-- **Crude accuracy metric.** Bag-of-words F1 ignores order and duplicate counts. CER or reading-order metrics would likely help VLM systems.
-- **VLMs could run faster.** Served via off-the-shelf vLLM in fp16. Quantization, speculative decoding, or a dedicated stack would push throughput higher.
-- **VLM prompts are untuned.** With prompt engineering both VLMs would likely surpass every CTC engine here.
-- **Single domain.** FUNSD is English business forms; other document types would look different.
+The table/formula stages always run **locally** in C++ by default (SLANet-Plus, and
+PP-FormulaNet-S on ORT-CUDA-13).
 
-Reproduce: `python tests/benchmark/comparison/bench_turbo_ocr.py` (requires running server + `datasets` library).
-</details>
+→ [Model selection guide](docs/models/selection.md)
+
+---
+
+## Tables & formulas
+
+Table and formula recognition are **strictly opt-in, per request**. The router
+only loads a backend when one is configured at startup, *and* a stage runs only
+when the request explicitly asks for it with `?tables=1` and/or `?formulas=1`
+(gRPC: the `tables` / `formulas` request fields). `layout` alone never triggers
+them, so the default path pays nothing. When requested (and a backend is loaded),
+the response gains `tables` (HTML + cell quads) and/or `formulas` (LaTeX) arrays.
+`tables=1`/`formulas=1` auto-enable layout. Asking for a stage the server wasn't
+started with is a hard error (`400 TABLE_BACKEND_DISABLED` / `FORMULA_BACKEND_DISABLED`),
+never a silent empty result — check `GET /capabilities` for what a server supports.
+(`/ocr/markdown` always includes both, best-effort, since a faithful Markdown export
+needs them.)
+
+| Capability | Enable at startup | Recognizer |
+|---|---|---|
+| Formula → LaTeX | `FORMULA_BACKEND=ppformulanet_s` | PP-FormulaNet-S |
+| Table → HTML | `TABLE_BACKEND=slanext` (encoder auto-resolved from the bundle) | SLANet-Plus |
+
+```bash
+docker run --gpus all -p 8000:8000 \
+  -e FORMULA_BACKEND=ppformulanet_s -e TABLE_BACKEND=slanext \
+  -v trt-cache:/home/ocr/.cache/turbo-ocr ghcr.io/aiptimizer/turboocr:latest
+
+curl -X POST "http://localhost:8000/ocr/raw?layout=1&tables=1&formulas=1" \
+  --data-binary @paper.png -H "Content-Type: image/png"
+```
+
+→ [Tables](docs/models/table.md) · [Formulas](docs/models/formula.md)
+
+---
+
+## Running the legacy PP-OCRv5 models
+
+The previous-generation **PP-OCRv5** detection + recognition models
+(`models/det_v5.onnx`, `models/rec_v5.onnx`, `models/keys_v5.txt`) are **not**
+part of the default v3 release bundle — `scripts/fetch_release_models.sh` ships
+only the v6 tiers and the retained per-script v5 recognizers. To use the v5
+Latin detector/recognizer, supply those three files yourself, then point the
+per-stage path overrides at them — everything else (layout, table, formula,
+orientation) is unchanged, so it is a drop-in swap of just the text detector +
+recognizer:
+
+```bash
+DET_ONNX=models/det_v5.onnx \
+REC_ONNX=models/rec_v5.onnx \
+REC_DICT=models/keys_v5.txt \
+LD_LIBRARY_PATH=/usr/local/tensorrt/lib ./build/turboocr-server
+```
+
+`DET_ONNX` / `REC_ONNX` / `REC_DICT` override `OCR_MODEL` per stage; the TensorRT
+engine cache rebuilds for the v5 ONNX on first start (clear `~/.cache/turbo-ocr`
+if v6 engines were cached under the default model names).
+
+**Coverage caveat — Latin only.** The retained PP-OCRv5 recognizer dictionary
+(`keys_v5.txt`) is 836 characters with **no CJK**. On English forms/receipts v5 is
+within ~1.5–2 points of PP-OCRv6-medium (measured this release: FUNSD 90.3% vs
+91.9%, CORD 91.7% vs 93.4% word-F1), but on the EN+ZH **OmniDocBench-125** set it
+scores far lower (**52.7% vs 91.0%** text accuracy) because it cannot read the
+Chinese pages. Use the v6 default for mixed-script documents; the v5 path is for
+Latin-only workloads or direct A/B comparison.
+
+---
+
+## Upgrading to v3 (breaking changes)
+
+v3 moves the default engine from PP-OCRv5 to **PP-OCRv6** and turns the server into
+a full document parser — adding layout-aware **tables → HTML** and **formulas →
+LaTeX** (both new in v3). The changes since v2.3 sort into three buckets; only the
+first needs any action.
+
+**Breaking / config-incompatible** (action required):
+
+- **Server binary renamed.** The GPU server is now `turboocr-server` (was `paddle_highspeed_cpp`) and the CPU server `turboocr-cpu-server` (was `paddle_cpu_server`). Update any direct launch command, systemd unit, or wrapper script. Docker users are unaffected — the image entrypoint/`CMD` handle it.
+- **Clear the TensorRT engine cache and pull the new models on upgrade.** PP-OCRv6 ships new det/rec ONNX from the `models-v3.0.0-ppocrv6` release, so cached v5 engines must rebuild — wipe `~/.cache/turbo-ocr` (or the mounted `trt-cache` volume) once. The Docker image and the native build fetch the new release automatically; pull the new image (or rebuild) to get it.
+
+**Default-behaviour changes** (no config change, but output or runtime differ):
+
+- **PP-OCRv6 is the default engine** (was PP-OCRv5), shipped as three tiers (`tiny`/`small`/`medium`) from the new `models-v3.0.0-ppocrv6` release. Recognition output changes vs v5.
+- **Default tier is `tiny`** (max throughput). Set `OCR_MODEL=small` or `medium` for higher accuracy.
+- **`LAYOUT_MERGE_MODE` default changed to `all`** (was effectively `large` / keep-outer). `all` keeps every detected box and drops nothing, so formulas/tables/titles nested inside a larger region survive (≈ +0.008 table TEDS, ≈ −0.006 formula CDM on OmniDocBench). Set `LAYOUT_MERGE_MODE=outer` to restore the previous behaviour. The mode *names* also changed (`outer`/`inner`/`all`, formerly `large`/`small`/`union`), but the old names still work as **deprecated aliases** — so the rename itself is not breaking. Modes: `outer` keeps the outer/container box and drops boxes nested inside it; `inner` keeps the innermost boxes and drops the pure containers; `all` keeps both.
+- **Requests now time out at 60 s** instead of hanging unbounded. `REQUEST_TIMEOUT_MS` default changed `0` → `60000`: a wedged GPU slot returns `504 INFERENCE_TIMEOUT` and frees itself. Set `REQUEST_TIMEOUT_MS=0` to opt back into the old unbounded wait. A companion watchdog (`PIPELINE_HARD_KILL_MS`, default `600000` = 10 min) `_Exit`s the process for the orchestrator to restart **only** if a worker stays wedged mid-CUDA long after a recycle was already requested — so a genuine hang can now terminate the process instead of leaking a slot forever (this watchdog is inert when `REQUEST_TIMEOUT_MS=0`).
+- **Detection resize defaults changed** (max-side `960` → `limit_type=min`, `limit_side_len=64`, `max_side_limit=1280`), so detection boxes — and therefore OCR output — differ slightly. Tune via `DET_MAX_SIDE_LIMIT` / `DET_LIMIT_TYPE` / `DET_LIMIT_SIDE_LEN` (`DET_MAX_SIDE` still honored).
+- **GPU out-of-memory now returns `500 INFERENCE_ERROR`** instead of a blank `200`, and a sticky CUDA fault `_Exit`s the process for a clean restart. Under sustained overload, queued work whose client deadline already elapsed is dropped (the caller gets its `504`) rather than processed late. Clients should handle 5xx/504 and retry.
+- **A bare launch announces text-only mode.** With neither `FORMULA_BACKEND` nor `TABLE_BACKEND` set, the server runs text-only (tables/formulas empty) and now logs a one-time `[Pipeline] NOTE: table + formula stages are DISABLED — running TEXT-ONLY …`, so a text-only run can't be silently mistaken for a full-document one.
+- **New input-size caps** (previously-accepted requests are now rejected): `/ocr/batch` and gRPC `RecognizeBatch` cap at **1024 images** → `400 BATCH_TOO_LARGE` (split the batch or raise `MAX_BATCH_IMAGES`); `/ocr/pdf` rendered pages cap at **~40 MP/page** → very large pages at high DPI fail to render (lower `?dpi=` or raise `MAX_PDF_PAGE_PIXELS_MP`); and `/ocr`, `/ocr/raw`, `/ocr/batch`, `/infer` now also reject images over **128 MP total area** → `400 PIXELS_TOO_LARGE`, in addition to the existing per-side `MAX_IMAGE_DIM` guard (downscale, or raise `MAX_IMAGE_PIXELS_MP`).
+
+**Additive / transparent** (nothing to do):
+
+- **`OCR_MODEL` is the new selector name; `OCR_LANG` still works** as a deprecated alias (warns on use), so this is backward-compatible. Select by tier/model name (`tiny`/`small`/`medium`, or `arabic`/`eslav`/`korean`/`thai`/`greek`).
+- **New: formula recognition → LaTeX.** `FORMULA_BACKEND=ppformulanet_s` adds an **in-process pure-C++ PP-FormulaNet-S recognizer** (ORT-CUDA-13 on the GPU build, ORT-CPU on the CPU build — no Python, no sidecar). Use `ppformulanet_plus_m` for Chinese-capable formulas, or `vlm` to route to a VLM. Opt-in; off by default.
+- **New: table recognition → HTML.** `TABLE_BACKEND=slanext` adds the SLANet-Plus structure model (TRT FP16 encoder + hand-written C++ decoder); the encoder auto-resolves from the bundled model, so no extra path env is needed. Opt-in; off by default.
+- **New `POST /ocr/markdown` route** (GPU build) exports a parsed page as faithful Markdown. Purely additive — existing routes are unchanged.
+- **Oversized-image guard on `/infer`.** Like the other image routes, `/infer` now rejects inputs whose dimensions exceed `MAX_IMAGE_DIM` (default `16384`) with `400 DIMENSIONS_TOO_LARGE` (a decompression-bomb guard). Only affects callers that were sending images larger than 16384 px on a side.
+- **New `*_degraded` response signals.** When a configured stage produces nothing, the JSON now carries `text_degraded` / `table_degraded` / `formula_degraded` (+ a `*_warning` string) on `/ocr`, `/ocr/raw`, `/ocr/batch` and `/ocr/pdf`, and `/ocr/markdown` sets an `X-OCR-Degraded` header — so a partial result is never a silent clean `200` (a configured-but-failed stage also now fails at boot rather than serving empties). New fields only; ignore them and nothing changes.
+- **New: document auto-rotation.** `?autorotate=1` straightens rotated/skewed pages with a PP-LCNet orientation model before OCR (opt-in per request).
+- **New `GET /capabilities`** (runtime feature/route discovery) — opt-in and additive.
+
+---
+
+## API
+
+One binary serves HTTP and gRPC from a shared GPU pipeline pool.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /ocr/raw` | OCR raw image bytes (fastest) |
+| `POST /ocr` | OCR base64 image in JSON |
+| `POST /ocr/pixels` | Zero-decode raw pixel buffer |
+| `POST /ocr/batch` | Batch of images |
+| `POST /ocr/pdf` | PDF → text (optional page images & auto-rotate) |
+| `POST /ocr/markdown` | Page → faithful Markdown (GPU build; requires layout) |
+| `POST /infer` | OCR + layout / reading-order / blocks in one structured response |
+| `GET /capabilities` | Runtime feature & route discovery |
+| `GET /metrics` | Prometheus metrics |
+| `GET /health` · `/health/live` · `/health/ready` | Liveness / readiness probes |
+
+All endpoints accept `?layout=1` (region detection + reading order), and
+`?tables=1` / `?formulas=1` to additionally run table → HTML / formula → LaTeX on
+detected regions (strict opt-in — see [Tables & formulas](#tables--formulas)). Example:
+
+```bash
+curl -X POST "http://localhost:8000/ocr/raw?layout=1&tables=1&formulas=1" \
+  --data-binary @document.png -H "Content-Type: image/png"
+```
+
+→ [HTTP API](docs/api/http.md) · [gRPC API](docs/api/grpc.md) · [Monitoring](docs/api/monitoring.md)
 
 ---
 
 ## Configuration
 
+Everything is configured by environment variable (and an equivalent CLI flag).
+Common ones:
+
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `OCR_LANG` | *(unset = latin)* | Language bundle: `latin`, `chinese`, `greek`, `eslav`, `arabic`, `korean`, `thai`. All bundles are baked into the image at build time — no runtime download. |
-| `OCR_SERVER` | *(unset)* | With `OCR_LANG=chinese`, set to `1` to use the 84 MB PP-OCRv5 server rec instead of the 16 MB mobile rec. Ignored for other languages. |
-| `PIPELINE_POOL_SIZE` | auto | Concurrent GPU pipelines (~1.4 GB each) |
-| `DISABLE_LAYOUT` | `0` | Set to `1` to disable PP-DocLayoutV3 layout detection and save ~300-500 MB VRAM |
-| `ENABLE_PDF_MODE` | `ocr` | Default PDF mode: `ocr` / `geometric` / `auto` / `auto_verified` |
-| `DISABLE_ANGLE_CLS` | `0` | Skip angle classifier (~0.4 ms savings) |
-| `DET_MAX_SIDE` | `960` | Max detection input side (px). Bounds: 32–4096. The TRT engine profile is built to match this value; changing it invalidates the cached engine and triggers a one-time rebuild. |
-| `TRT_OPT_LEVEL` | `5` | TensorRT builder optimization level. Bounds: 0–5. Lower values trade runtime perf for faster cold builds (`3` typically builds ~3-5× faster with <5% runtime regression). The cache key includes the level, so different values produce separate engines. |
-| `TRT_ENGINE_CACHE` | `~/.cache/turbo-ocr` | Directory for cached TensorRT engines. Set to a host-mounted path to share engines across container restarts. |
-| `TURBO_OCR_HOST` | `0.0.0.0` | Bind address for HTTP and gRPC listeners. Default binds every IPv4 interface; use `127.0.0.1` for loopback only, `::` for all interfaces incl. IPv6, or a specific interface IP. Equivalent CLI flag: `--host`. |
-| `PORT` / `GRPC_PORT` | `8080` / `50051` | Server ports. The binary listens on `PORT=8080` by default; the Docker image runs nginx in front of it on port `8000`, so external clients use `8000` and `PORT` only matters for direct/native runs. |
-| `PDF_DAEMONS` / `PDF_WORKERS` | `16` / `4` | PDF render parallelism |
-| `GRPC_BATCH_WORKERS` | `8` | Parallel workers in gRPC `RecognizeBatch` for fan-out across pipeline pool |
-| `HTTP_THREADS` | `pool * 32` | Work pool threads for blocking inference |
-| `MAX_PDF_PAGES` | `2000` | Maximum pages per PDF request |
-| `SHUTDOWN_GRACE_SECONDS` | `30` | Seconds to wait for inflight requests to drain on SIGTERM/SIGINT before tearing down. Set to stay below your orchestrator's SIGKILL grace (K8s default 30s). |
-| `GRPC_CQS` | `10` | Number of gRPC completion queues. Higher values trade memory for connection-handling parallelism on high-fanout deployments. |
-| `GRPC_RESPONSE_MODE` | `json_bytes` | gRPC response format: `json_bytes` (default — full JSON in `json_response` field) or `structured` (typed protobuf fields). |
-| `MAX_BODY_MB` | `100` | Max request body size in MB. Applied at all three layers: nginx (413 at proxy), Drogon HTTP (`setClientMaxBodySize`), and gRPC (`SetMaxReceive/SendMessageSize`). Bounds: 1–102400. |
-| `MAX_BODY_MEMORY_MB` | `min(1024, MAX_BODY_MB)` — effectively `100` with stock config | Per-request in-memory buffer threshold. Bodies up to this size stay in RAM; larger ones spill to a tempfile under `/tmp`. Always clamped to `[1, MAX_BODY_MB]`, so the effective default tracks `MAX_BODY_MB`. Raise `MAX_BODY_MB` first to unlock larger in-memory buffers. Lower on memory-constrained hosts (e.g. `MAX_BODY_MEMORY_MB=50` caps buffer RSS at ~50 MB × concurrent requests). |
-| `MAX_IMAGE_DIM` | `16384` | Max width or height (px) accepted on `/ocr/pixels` and image-decode routes. Bounds: 64–65535. |
-| `LOG_LEVEL` | `info` | Log level: `debug` / `info` / `warn` / `error` |
-| `LOG_FORMAT` | `json` | Log format: `json` (structured) / `text` (human-readable) |
-| `TOCR_LOG_RATELIMIT` | `10` | Max rate-limited logs per call site per 1s window (applies to per-request error paths). `0` disables. Format `N` or `N:W_MS` (e.g. `5:2000` = 5 logs / 2s). On window roll a single `[suppressed logs]` rollup line is emitted. |
+|---|---|---|
+| `OCR_MODEL` | `tiny` | `tiny` / `small` / `medium`, or a PP-OCRv5 script model |
+| `DISABLE_LAYOUT` | `0` | `1` skips the layout model (~300–500 MB VRAM) |
+| `LAYOUT_MERGE_MODE` | `all` | Nested-box policy: `all` (keep every box) / `outer` (outer regions only) / `inner` (innermost only). Old `large`/`small`/`union` accepted as aliases. |
+| `LAYOUT_KEEP_NESTED_CHILDREN` | `0` | Only affects `outer`/`inner` modes: `1` still keeps the model's nested child regions (`figure_title`, `footnote`, `formula_number`, `paragraph_title`) instead of dropping them inside a parent. Formulas are always kept; no effect under default `all`. |
+| `REQUEST_TIMEOUT_MS` | `60000` | Per-request inference deadline; on overrun returns `504` and frees the slot. `0` = unbounded (pre-v3 behaviour). |
+| `PIPELINE_POOL_SIZE` | auto | Concurrent GPU pipelines |
 
-Every knob above is also exposed as a CLI flag (`--http-port`, `--max-body-mb`, `--disable-layout`, `--det-max-side`, `--log-level`, etc.). The two exceptions, which remain env-only because their valid set is context-dependent, are `OCR_LANG` (validated against installed model bundles at first request) and `TOCR_LOG_RATELIMIT` (custom `N` or `N:W_MS` format). CLI flags override env vars when both are set. Useful flags for inspection:
-
-```
-paddle_highspeed_cpp --help            # full flag listing
-paddle_highspeed_cpp --print-config    # resolved JSON config; exit 0
-paddle_highspeed_cpp --check-config    # validate only; exit 0 on valid, 2 on errors
-```
-
-Malformed env vars or out-of-range values cause startup to fail with a clear error list — the server refuses to bind rather than silently coerce bad input (e.g. `PORT=abc` used to become `1`; it now exits with `[config error] PORT="abc" is not a valid integer`). Validate config without booting the pipeline using `--check-config`.
-
-Layout detection is **enabled by default**. The model is loaded at startup but only runs when a request includes `?layout=1`. Requests without `?layout=1` have zero overhead. Requests with `?layout=1` reduce throughput by ~20%. Set `DISABLE_LAYOUT=1` to skip loading the model entirely and save ~300-500 MB VRAM.
-
-> **Migration note (v2.3+):** The legacy `ENABLE_LAYOUT` env var has been removed. If set, startup fails with a clear error — use `DISABLE_LAYOUT=1` to disable layout, or remove the var (layout is on by default).
-
-```bash
-docker run --gpus all -p 8000:8000 \
-  -v trt-cache:/home/ocr/.cache/turbo-ocr \
-  -e PIPELINE_POOL_SIZE=3 \
-  ghcr.io/aiptimizer/turboocr:v2.3.0
-```
-
-Add `MAX_PDF_PAGES` (default `2000`) to limit the number of pages processed per PDF request. `LOG_LEVEL` (`debug`/`info`/`warn`/`error`) and `LOG_FORMAT` (`json`/`text`) control structured logging output.
-
----
-
-## Monitoring
-
-### Prometheus Metrics
-
-Scrape `GET /metrics` for Prometheus-compatible metrics:
-
-```
-turbo_ocr_requests_total{route="/ocr/raw",status="2xx"} 1042
-turbo_ocr_request_duration_seconds_bucket{route="/ocr/raw",le="0.025"} 980
-turbo_ocr_request_duration_seconds_sum{route="/ocr/raw"} 12.345
-turbo_ocr_request_duration_seconds_count{route="/ocr/raw"} 1042
-turbo_ocr_gpu_vram_used_bytes 9052815360
-turbo_ocr_gpu_vram_total_bytes 33661911040
-turbo_ocr_pipeline_pool_size 5
-turbo_ocr_pool_exhaustions_total 0
-turbo_ocr_request_bytes_total 49493243
-turbo_ocr_request_body_avg_bytes 9407
-```
-
-### Response Headers
-
-Every response includes:
-
-| Header | Description |
-|--------|-------------|
-| `X-Request-Id` | UUID v7 (or propagated from client `X-Request-Id` header) |
-| `X-Inference-Time-Ms` | End-to-end processing time in milliseconds |
-| `Retry-After` | Seconds to wait (only on 503 responses) |
-
-### Health Endpoints
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /health` | Basic liveness check |
-| `GET /health/live` | Kubernetes liveness probe |
-| `GET /health/ready` | Readiness probe &mdash; verifies GPU pipeline is responsive |
-
-### Structured Errors
-
-All error responses return JSON with `Content-Type: application/json`:
-
-```json
-{"error": {"code": "EMPTY_BODY", "message": "Empty body"}}
-```
-
-Error codes: `EMPTY_BODY`, `INVALID_JSON`, `MISSING_IMAGE`, `BASE64_DECODE_FAILED`, `IMAGE_DECODE_FAILED`, `INVALID_PARAMETER`, `UNSUPPORTED_PARAMETER`, `INVALID_DPI`, `INVALID_DIMENSIONS`, `DIMENSIONS_TOO_LARGE`, `BODY_SIZE_MISMATCH`, `MISSING_HEADER`, `INVALID_HEADER`, `EMPTY_BATCH`, `MISSING_FILE`, `MISSING_PDF`, `INVALID_MULTIPART`, `PDF_RENDER_FAILED`, `PDF_TOO_LARGE`, `EMPTY_PDF`, `SERVER_BUSY`, `NOT_READY`, `INFERENCE_ERROR`.
+→ [Full configuration reference (35+ variables)](docs/build/config.md)
 
 ---
 
 ## Building from Source
-
-| Dependency | GPU | CPU |
-|-----------|:---:|:---:|
-| GCC 13.3+ / C++20 | x | x |
-| CUDA + TensorRT 10.2+ | x | |
-| OpenCV 4.x | x | x |
-| Drogon 1.9+ | x | x |
-| gRPC + Protobuf | x | |
-| ONNX Runtime 1.22+ | | x |
-
-Wuffs, Clipper, PDFium vendored in `third_party/`.
 
 ```bash
 # Docker (recommended)
@@ -480,80 +287,34 @@ docker build -f docker/Dockerfile.gpu -t turboocr .
 docker run --gpus all -p 8000:8000 -p 50051:50051 \
   -v trt-cache:/home/ocr/.cache/turbo-ocr turboocr
 
-# CPU only (Docker) — ~2-3 img/s, mainly for testing
-docker build -f docker/Dockerfile.cpu -t turboocr-cpu .
-docker run -p 8000:8000 turboocr-cpu
-
-# Native build — PP-OCRv5 models auto-fetched into ./models/ on first build
+# Native (PP-OCRv6 models auto-fetched into ./models/ on first build)
 cmake -B build -DTENSORRT_DIR=/usr/local/tensorrt
 cmake --build build -j$(nproc)
-LD_LIBRARY_PATH=/usr/local/tensorrt/lib ./build/paddle_highspeed_cpp
-
-# CPU-only native
-cmake -B build_cpu -DUSE_CPU_ONLY=ON
-cmake --build build_cpu -j$(nproc)
-./build_cpu/paddle_cpu_server
-
-# If your distro's gRPC CMake config conflicts with system protobuf,
-# add -DCMAKE_DISABLE_FIND_PACKAGE_gRPC=ON to fall back to pkg-config.
-# To skip the model auto-fetch (e.g. in CI), add -DFETCH_MODELS=OFF.
-
-# CUDA SM target. Native builds default to sm_120 (Blackwell, RTX 50-series)
-# only — the full multi-arch fat binary is ~12.5 GB and adds 10-15 s of
-# PTX-JIT to first-start on cold cache. To target other GPUs, opt back in:
-#   cmake -B build -DCMAKE_CUDA_ARCHITECTURES="86;89;120" ...
-# Reference: 75=Turing, 80=A100, 86=Ampere consumer, 89=Ada, 90=Hopper,
-# 100=Blackwell DC, 120=Blackwell consumer.
+LD_LIBRARY_PATH=/usr/local/tensorrt/lib ./build/turboocr-server
 ```
 
----
+Needs GCC 13.3+/C++20, CUDA + TensorRT 10.2+, OpenCV 4.x, Drogon 1.9+, gRPC.
+Wuffs, Clipper, and PDFium are vendored in `third_party/`.
 
-## Supported Languages
-
-Set via the `OCR_LANG` environment variable. Every supported language bundle is baked into the image at build time from the pinned PP-OCRv5 GitHub Release (SHA256-verified). No runtime downloads, no network dependency at container start.
-
-| `OCR_LANG` | Script / family | Notes |
-|---|---|---|
-| *(unset)* / `latin` | Latin + basic Greek (English, German, French, Italian, Polish, Czech, …) | 836-char dict; what powers the benchmarks above |
-| `chinese` | Simplified + Traditional Chinese | 18,385-class mobile rec (16 MB); set `OCR_SERVER=1` for the 84 MB server variant |
-| `greek` | dedicated Greek rec | 356-class Greek-specialized rec (7.8 MB) — higher accuracy than Latin's combined dict |
-| `korean` | Hangul + basic Latin | 11,947-class rec (13 MB) |
-| `arabic`, `eslav`, `thai` | per-script PP-OCRv5 | 7-8 MB each |
-
-```bash
-# Chinese
-docker run --gpus all -p 8000:8000 -p 50051:50051 \
-  -v trt-cache:/home/ocr/.cache/turbo-ocr \
-  -e OCR_LANG=chinese \
-  ghcr.io/aiptimizer/turboocr:v2.3.0
-```
-
-> **Volume tip:** use a **named** volume (`trt-cache:`) as shown above, not a
-> host bind-mount. Named volumes auto-populate from the image on first use,
-> so the baked language bundles survive. A bind-mount of an empty host
-> directory would shadow `/home/ocr/.cache/turbo-ocr` and leave the server
-> with nothing to load.
-
-Run `tests/language_smoketest.py` to verify any language end-to-end on your
-hardware (renders a short phrase, OCRs it, checks char-recall against a
-per-language threshold).
+→ [Build guide & GPU-architecture notes](docs/build/native.md)
 
 ---
 
 ## Acknowledgements
 
-This project builds on the work of several open-source projects:
+Built on open-source work:
 
-- **[PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)** (Baidu) — PP-OCRv5 detection, recognition, and classification models. PP-DocLayoutV3 layout detection model. This project would not exist without their research and pre-trained weights.
-- **[Drogon](https://drogon.org)** — high-performance async C++ HTTP framework
-- **[Wuffs](https://github.com/google/wuffs)** — fast PNG decoder by Google (vendored)
-- **[PDFium](https://pdfium.googlesource.com/pdfium/)** — PDF rendering and text extraction (vendored)
-- **[Clipper](http://www.angusj.com/delphi/clipper.php)** — polygon clipping for text detection post-processing (vendored)
+- **[PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)** (Baidu) — PP-OCRv6 / PP-OCRv5 detection, recognition, and classification models, plus PP-DocLayoutV3 layout detection. This project would not exist without their research and pre-trained weights.
+- **[Drogon](https://drogon.org)** — high-performance async C++ HTTP framework.
+- **[Wuffs](https://github.com/google/wuffs)** — fast PNG decoder by Google (vendored).
+- **[PDFium](https://pdfium.googlesource.com/pdfium/)** — PDF rendering and text extraction (vendored).
+- **[Clipper](http://www.angusj.com/delphi/clipper.php)** — polygon clipping for text-detection post-processing (vendored).
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
 
 <p align="center">
-  <sub>Main Sponsor: <a href="https://miruiq.com"><strong>Miruiq</strong></a> — AI-powered data extraction from PDFs and documents.</sub>
+  <a href="https://github.com/aiptimizer/TurboOCR"><strong>⭐ Star TurboOCR on GitHub</strong></a><br>
+  <sub>Sponsored by <a href="https://miruiq.com"><strong>Miruiq</strong></a> — AI-powered data extraction from PDFs and documents — and <a href="https://diaiq.com"><strong>DiaIQ</strong></a>.</sub>
 </p>

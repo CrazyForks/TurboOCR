@@ -367,7 +367,8 @@ void cuda_batch_roi_warp(const GpuImage &src, const float *d_M_invs,
 // --- ArgMax ---
 
 // Shared-memory parallel reduction argmax: one block per sequence position
-// 256 threads cooperate to find max across ~7000 classes
+// 256 threads cooperate to find max across the class dim (v6 width 18,710;
+// tiny tier 6,906). Class-agnostic — the reduction loop strides num_classes.
 __global__ __launch_bounds__(256)
 void argmax_kernel(const float *input_probs, int *output_indices,
                               float *output_scores, int total_steps,

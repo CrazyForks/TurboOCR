@@ -7,6 +7,7 @@
 #include <opencv2/core.hpp>
 
 #include "turbo_ocr/decode/gpu_image.h"
+#include "turbo_ocr/detection/det_config.h"
 #include "turbo_ocr/engine/trt_engine.h"
 #include "turbo_ocr/common/box.h"
 #include "turbo_ocr/common/cuda_check.h"
@@ -21,8 +22,14 @@ public:
   PaddleDet() = default;
   ~PaddleDet() noexcept = default; // RAII handles all GPU cleanup
 
-  /// Load a TensorRT detection engine and allocate GPU buffers.
-  [[nodiscard]] bool load_model(const std::string &model_path);
+  /// Load a TensorRT detection engine and allocate GPU buffers. resize/db are
+  /// this model's official PaddleOCR detection config (server::DetInferConfig
+  /// fields); both default to the kDetResizeDefault/kDbDefaults base so
+  /// explicit-DET-override callers and tests keep working. Env vars layered on
+  /// top by read_det_resize/read_db_params in init_buffers() always win.
+  [[nodiscard]] bool load_model(const std::string &model_path,
+                                const DetResizeParams &resize = kDetResizeDefault,
+                                const DbParams &db = kDbDefaults);
 
   // Takes GpuImage directly - no double upload
   [[nodiscard]] std::vector<Box> run(const GpuImage &gpu_img, int orig_h, int orig_w,
@@ -37,10 +44,21 @@ public:
             cudaStream_t stream = 0);
 
 private:
-  static constexpr float kDetDbThresh = 0.3f;
-  static constexpr float kDetDbBoxThresh = 0.6f;
-  static constexpr float kDetDbUnclipRatio = 1.5f;
-  int kMaxSideLen_ = 960; // Configurable via DET_MAX_SIDE env var
+  // Per-model resize policy (this model's official config + env overrides).
+  // Set from read_det_resize(cfg) in init_buffers(); drives compute_det_resize()
+  // at every resize site. Buffers size off effective_det_max_side(resize_).
+  DetResizeParams resize_ = kDetResizeDefault;
+
+  // DB post-processing parameters (PP-OCRv6 defaults). Set from
+  // detection/det_config.h read_db_params() in init_buffers(); env-overridable
+  // via DET_DB_THRESH/DET_BOX_THRESH/DET_UNCLIP.
+  float db_thresh_ = kDbDefaults.thresh;
+  float unclip_ratio_ = kDbDefaults.unclip_ratio;
+  // Engine optimization-profile MAX side. Set to effective_det_max_side(resize_)
+  // (resize_.max_side_limit, DET_MAX_SIDE env wins) in init_buffers(); sizes the
+  // pinned buffers. Pre-init to the config default so the value is sane before
+  // load_model runs.
+  int kMaxSideLen_ = kDetResizeDefault.max_side_limit;
   static constexpr float kMinBoxSide = 3.0f;
   static constexpr float kMinUnclippedSide = 5.0f; // kMinBoxSide + 2
 
@@ -52,7 +70,9 @@ private:
   //       no CPU contours; F1 within run-to-run noise of CCL=1; axis-aligned
   //       quads only)
   int gpu_ccl_mode_ = 1;
-  float box_thresh_ = kDetDbBoxThresh;
+  // Set from read_db_params() in init_buffers(); GPU_BOX_THRESH/
+  // GPU_UNCLIP_SCALE remain as overrides on top.
+  float box_thresh_ = kDbDefaults.box_thresh;
   float unclip_scale_ = 1.0f;
 
   std::unique_ptr<engine::TrtEngine> engine_;
@@ -102,6 +122,11 @@ private:
   CudaPtr<int> d_ccl_num_boxes_;
   // Host-side result buffer for GPU CCL (pinned memory, RAII)
   CudaHostPtr<kernels::GpuDetBox> h_ccl_boxes_;
+  // Pinned destination for the bitmap download in run_gpu_ccl — a pageable
+  // cv::Mat there degrades the async copy to a ~47µs staged blocking copy
+  // per image.
+  CudaHostPtr<uint8_t> h_bitmap_;
+  size_t h_bitmap_pixels_ = 0;
 
   // Reusable contour/mask buffers (avoid per-call heap allocation)
   std::vector<cv::Point> shifted_buf_;
@@ -117,15 +142,17 @@ private:
   // Used by run_gpu_ccl_fast (GPU_CCL=2): all-GPU post-processing path that
   // matches CPU CCL=1 accuracy without downloading the prediction map.
   CudaPtr<uint32_t> d_jfa_labels_;     // [max_pixels] expanded label map
-  CudaPtr<int2> d_jfa_seeds_;          // [max_pixels] JFA nearest-seed coords (primary)
-  CudaPtr<int2> d_jfa_seeds_alt_;      // [max_pixels] JFA ping-pong buffer
+  CudaPtr<uint32_t> d_jfa_seeds_;      // [max_pixels] packed JFA nearest-seed coords (primary)
+  CudaPtr<uint32_t> d_jfa_seeds_alt_;  // [max_pixels] JFA ping-pong buffer
   CudaPtr<float> d_expand_per_comp_;   // [kMaxGpuComponents] per-component expand
   // Pinned host buffer for post-expand bboxes. Pre-allocated once so
   // run_gpu_ccl_fast doesn't cudaMallocHost on every request.
   CudaHostPtr<kernels::GpuDetBox> h_exp_boxes_;
 
-  // Common buffer allocation (called by both load_model overloads)
-  [[nodiscard]] bool init_buffers();
+  // Common buffer allocation. resize/db are the per-model config base; env
+  // overrides (read_det_resize/read_db_params) are applied here so they win.
+  [[nodiscard]] bool init_buffers(const DetResizeParams &resize,
+                                  const DbParams &db);
 
   // GPU CCL path: returns boxes from GPU + per-ROI findContours (accurate)
   [[nodiscard]] std::vector<Box> run_gpu_ccl(int resize_h, int resize_w,

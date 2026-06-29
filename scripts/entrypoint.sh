@@ -1,31 +1,26 @@
 #!/bin/bash
 set -euo pipefail
 
-# ---- Validate OCR_LANG and ensure the bundle is on disk --------------------
-# The Dockerfile bakes every supported bundle at build time via
-# fetch_release_models.sh (flat /app/models/{det,rec,cls}.onnx + keys.txt
-# for Latin; /app/models/rec/<lang>/ for every other script). So in a
-# normal deployment the `[[ ! -f ]]` branch below never fires — it exists
-# as a self-heal path in case /app/models gets mounted over with an empty
-# volume, or the bundle is deleted.
+# ---- Self-heal a retained-script rec bundle if it's missing ----------------
+# Model selection itself happens in the binary (resolve_model: OCR_MODEL,
+# with OCR_LANG as a deprecated alias). The Dockerfile bakes every bundle at
+# build time via fetch_release_models.sh (flat /app/models/{det,rec,cls}.onnx
+# + keys.txt for the v6 default tiers; /app/models/rec/<script>/ for the
+# retained PP-OCRv5 recognizers). So in a normal deployment the `[[ ! -f ]]`
+# branch below never fires — it exists as a self-heal path in case
+# /app/models/rec gets mounted over with an empty volume.
 #
-# Setting OCR_SERVER=1 with OCR_LANG=chinese selects the 84 MB server rec
-# variant instead of the default 16 MB mobile rec. Ignored for other
-# languages.
-SUPPORTED_LANGS="arabic chinese eslav greek korean latin thai"
+# Only the nested PP-OCRv5 scripts are fetchable here; the v6 tiers
+# (medium/small/tiny) are flat siblings baked into the image. An OCR_MODEL of
+# medium/small/tiny needs no per-script fetch, so it falls through untouched.
+RETAINED_SCRIPTS="arabic eslav greek korean thai"
 
-if [[ -n "${OCR_LANG:-}" && "${OCR_LANG}" != "latin" ]]; then
-  # Guard against typos before touching the network.
-  if ! grep -qw "${OCR_LANG}" <<<"${SUPPORTED_LANGS}"; then
-    echo "[entrypoint] FATAL: OCR_LANG='${OCR_LANG}' is not a supported language." >&2
-    echo "[entrypoint]        Supported: ${SUPPORTED_LANGS}" >&2
-    exit 1
-  fi
-
-  REC_ONNX="/app/models/rec/${OCR_LANG}/rec.onnx"
+SELECTED_SCRIPT="${OCR_MODEL:-${OCR_LANG:-}}"
+if [[ -n "${SELECTED_SCRIPT}" ]] && grep -qw "${SELECTED_SCRIPT}" <<<"${RETAINED_SCRIPTS}"; then
+  REC_ONNX="/app/models/rec/${SELECTED_SCRIPT}/rec.onnx"
   if [[ ! -f "${REC_ONNX}" ]]; then
-    echo "[entrypoint] OCR_LANG=${OCR_LANG} requested, fetching bundle…"
-    bash /app/scripts/download_models.sh --lang "${OCR_LANG}" ${OCR_SERVER:+--server}
+    echo "[entrypoint] ${SELECTED_SCRIPT} rec bundle missing, fetching…"
+    bash /app/scripts/download_models.sh --lang "${SELECTED_SCRIPT}"
     # chown only when we own uid 0 — the Dockerfile installs the ocr user
     # and today the base image runs as root, but this stays correct if that
     # ever changes.
@@ -33,7 +28,7 @@ if [[ -n "${OCR_LANG:-}" && "${OCR_LANG}" != "latin" ]]; then
       chown -R ocr:ocr /app/models
     fi
   else
-    echo "[entrypoint] OCR_LANG=${OCR_LANG} bundle already present, skipping download"
+    echo "[entrypoint] ${SELECTED_SCRIPT} rec bundle already present, skipping download"
   fi
 fi
 
@@ -101,6 +96,44 @@ envsubst '${MAX_BODY_MB}' < /app/docker/nginx.conf.template > "$NGINX_CONF"
 # Start nginx reverse proxy (absorbs connection storms, keep-alive to Drogon)
 nginx -c "$NGINX_CONF"
 
-# Drop to non-root user and run the OCR server
-# TRT engines are auto-built from ONNX on first startup (cached by TRT version + model hash)
-exec gosu ocr "$@"
+# TRT's engine builder dlopen()s libnvinfer_builder_resource*.so by bare name
+# at first-startup engine build. The nvcr base ldconfig's the core TRT libs,
+# but the builder-resource lib is resolved via the loader search path — so the
+# TRT lib dir must be on LD_LIBRARY_PATH or the build aborts with an opaque
+# "Failed to build engine" and no diagnostic. Prepend whichever TRT lib dirs
+# exist; absent on the CPU-only image, where this is a harmless no-op.
+for _trt_lib in /usr/local/tensorrt/lib /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu; do
+  if [[ -d "$_trt_lib" ]]; then
+    LD_LIBRARY_PATH="${_trt_lib}:${LD_LIBRARY_PATH:-}"
+  fi
+done
+export LD_LIBRARY_PATH
+
+# Drop to non-root user and run the OCR server.
+# TRT engines are auto-built from ONNX on first startup (cached by TRT version + model hash).
+#
+# nginx runs as a detached daemon and so never sees the container's stop
+# signal. We can't `exec` the server (that would replace this shell and a trap
+# could never fire), so run it in the background and relay the signal: the
+# trap forwards SIGTERM/SIGINT to the server so it drives its own HTTP/gRPC
+# drain first; we then `nginx -s quit` to drain the proxy AFTER the backend is
+# down so no in-flight proxied request is cut. gosu execs the binary, so $! is
+# the server's own PID — it stays the effective signal target for k8s.
+gosu ocr "$@" &
+server_pid=$!
+
+trap 'kill -s TERM "$server_pid" 2>/dev/null || true' TERM
+trap 'kill -s INT  "$server_pid" 2>/dev/null || true' INT
+
+# `wait` is interrupted (returns 128+signo) when a trapped signal arrives; loop
+# until the server has actually exited, then keep its real status for k8s.
+# `|| true` so `set -e` doesn't abort on the server's non-zero exit.
+status=0
+while true; do
+  wait "$server_pid" && { status=0; break; } || status=$?
+  (( status > 128 )) && continue   # signal-interrupted wait; the server is still draining
+  break                            # server exited with $status
+done
+
+nginx -s quit 2>/dev/null || true
+exit "$status"

@@ -1,6 +1,8 @@
 #include "turbo_ocr/engine/onnx_to_trt.h"
 #include "turbo_ocr/common/cuda_check.h"
 #include "turbo_ocr/detection/det_config.h"
+#include "turbo_ocr/engine/rec_graph_profiles.h"
+#include "turbo_ocr/engine/trt_engine.h"
 #include "turbo_ocr/server/env_utils.h"
 
 #include <NvInfer.h>
@@ -27,8 +29,34 @@ namespace fs = std::filesystem;
 
 namespace turbo_ocr::engine {
 
-using turbo_ocr::detection::read_det_max_side;
+using turbo_ocr::detection::read_det_resize;
+using turbo_ocr::detection::effective_det_max_side;
 using turbo_ocr::detection::kDetMaxSideMin;
+
+// Effective det profile MAX for the engine being built. The builder is
+// process-level (no per-model ServerConfig handle), so it resolves the resize
+// policy the same way the detector ctor does — read_det_resize() applies the
+// per-model default base (kDetResizeDefault, max_side_limit=1280) and any
+// DET_* env overrides, then effective_det_max_side() folds in DET_MAX_SIDE
+// and clamps. The detector (paddle_det.cpp / cpu_paddle_det.cpp) sizes its
+// pinned input buffers from effective_det_max_side(read_det_resize(cfg.resize));
+// because every catalog row uses kDetResizeDefault as its base, the two
+// agree field-for-field, so engine profile MAX == runtime buffer MAX. They can
+// only diverge if a future model ships a non-default max_side_limit AND no
+// DET_MAX_SIDE/DET_MAX_SIDE_LIMIT env is set — when that happens, set the
+// matching DET_MAX_SIDE_LIMIT env so both sides see it.
+[[nodiscard]] static int read_det_effective_max_side() {
+  return effective_det_max_side(read_det_resize());
+}
+
+// OPT batch size for the det optimization profile. Profile range is [1,8];
+// OPT picks which batch TRT tunes tactics for. Default 4 balances single-image
+// (batch 1) latency against the dynamic-batch throughput path. Set 1 to favor
+// single-image latency, up to 8 to favor batched throughput.
+[[nodiscard]] static int read_det_opt_batch() {
+  static const int v = server::env_int("DET_OPT_BATCH", 4, 1, 8);
+  return v;
+}
 
 // TensorRT builder optimization level: 0..5 (TRT 10 range). Higher = better
 // kernel selection at the cost of build time. Default 5 — same as before
@@ -104,9 +132,13 @@ std::string get_cached_engine_path(const std::string &onnx_path,
   // Bump kProfileVersion when optimization profiles change for det/rec/cls.
   // Adding a NEW model type (e.g. "layout") does NOT require a bump because
   // the cache key includes `type` — new types live in their own hash space.
-  // 2026-04-26: bumped because the det profile MAX now tracks DET_MAX_SIDE
-  // instead of being hardcoded at 960.
-  static constexpr int kProfileVersion = 20260426;
+  // 2026-04-26: bumped because the det profile MAX now tracks DET_MAX_SIDE.
+  // 2026-06-15: v5->v6 det/rec swap — v5 engines are not reusable; bump
+  // invalidates them belt-and-suspenders over the path+size+mtime key.
+  // The det profile MAX follows the per-model effective max-side (default
+  // 1280); the `:dms` suffix below separates engines built at different
+  // effective max-sides by hash, so a max-side change needs no bump.
+  static constexpr int kProfileVersion = 20260615;
 
   auto key = "v" + std::to_string(kProfileVersion) + ":" + type + ":" +
       onnx_path + ":" + std::to_string(onnx_size) + ":" +
@@ -115,10 +147,19 @@ std::string get_cached_engine_path(const std::string &onnx_path,
       std::to_string(gpu_major) + "." + std::to_string(gpu_minor) +
       ":drv" + std::to_string(cuda_driver) +
       ":rt" + std::to_string(cuda_runtime);
-  // For det, the MAX dim of the optimization profile depends on DET_MAX_SIDE,
-  // so each operator config gets its own engine (Triton/vLLM pattern).
+  // For det, the MAX dim of the optimization profile is the effective det
+  // max-side (per-model max_side_limit, overridden by DET_MAX_SIDE), so each
+  // operator config gets its own engine (Triton/vLLM pattern). A different
+  // effective max => a different profile => a different cache key.
   if (type == "det")
-    key += ":dms" + std::to_string(read_det_max_side());
+    key += ":dms" + std::to_string(read_det_effective_max_side()) +
+           ":dob" + std::to_string(read_det_opt_batch());
+  // rec gets extra static (batch,width) profiles + maxAuxStreams=0 ONLY when
+  // CUDA graphs are opted into. Default (graphs off) keeps the original
+  // single-profile cache key, so existing cached engines are reused as-is and
+  // no rebuild is triggered on upgrade.
+  if (type == "rec" && TrtEngine::graphs_enabled())
+    key += ":gp12aux0";
   // TRT_OPT_LEVEL changes which kernels TensorRT picks, so the produced
   // engine differs. Operators that toggle the level get separate cached
   // engines instead of silently reusing a stale one.
@@ -128,33 +169,69 @@ std::string get_cached_engine_path(const std::string &onnx_path,
   return cache_dir + "/" + type + "_" + std::to_string(hash) + ".trt";
 }
 
+// A QDQ-bearing ONNX (modelopt INT8/FP8 output) carries explicit Quantize/
+// Dequantize nodes whose zero-point dtypes pin the compute precision. TRT 10
+// honors light QDQ under a weakly-typed FP16 network, but heavier modelopt
+// exports (INT32 zero-points on weight reshapes, mixed FP8/INT8) hit
+// "DequantizeLayer can only run in INT8/FP8/FP4/INT4" under weak typing — the
+// modelopt-recommended fix is a STRONGLY-TYPED network, where every tensor's
+// type comes from the graph and the autotuner only picks tactics. Detected by
+// the quantized-variant filename convention used across the repo's scripts.
+[[nodiscard]] static bool is_quantized_onnx(const std::string &p) {
+  return p.find(".int8.") != std::string::npos ||
+         p.find("_int8") != std::string::npos ||
+         p.find("_fp8") != std::string::npos ||
+         p.find(".fp8.") != std::string::npos;
+}
+
 static bool build_engine(const std::string &onnx_path,
                           const std::string &trt_path,
                           const std::string &type) {
+  const bool quantized = is_quantized_onnx(onnx_path);
+  // Quantized (QDQ-embedded) ONNX. det/rec exports carry LIGHT per-tensor/
+  // per-channel Q/DQ on convs and build correctly under a WEAKLY-typed FP16
+  // network: TRT honors the embedded Q/DQ (running those ops in INT8) and keeps
+  // everything else in FP16. Heavier exports (mixed FP8/INT8, INT32 zero-points)
+  // need a STRONGLY-typed network where every tensor's type comes from the graph
+  // — reserved for non-det/rec models. Engaged only when the operator explicitly
+  // points DET_ONNX/REC_ONNX at a quantized-named file, so it's opt-in and the
+  // default FP16 models are unaffected.
+  const bool strongly_typed = quantized && type != "det" && type != "rec";
   std::cout << "Building TRT engine: " << onnx_path << " -> " << trt_path;
-  if (type == "det") std::cout << " (DET_MAX_SIDE=" << read_det_max_side() << ")";
+  if (type == "det") std::cout << " (det_max_side=" << read_det_effective_max_side() << ")";
+  if (quantized)
+    std::cout << (strongly_typed ? " [strongly-typed QDQ]" : " [weakly-typed FP16+QDQ]");
   std::cout << '\n';
 
   auto builder = std::unique_ptr<nvinfer1::IBuilder>(
       nvinfer1::createInferBuilder(s_logger));
   if (!builder) return false;
 
-  // Pass 0 — no NetworkDefinitionCreationFlag bits. In TRT 10 networks are
-  // always explicit batch (kEXPLICIT_BATCH is value 0, deprecated, ignored),
-  // and bit 0 now means kSTRONGLY_TYPED. The legacy `1U << kEXPLICIT_BATCH`
-  // expression therefore evaluated to 1 — silently selecting a strongly-
-  // typed network, which forbids setFlag(kFP16) below. TRT then silently
-  // returns a null serialized plan with no kERROR log, surfacing only as
-  // "Failed to build engine from <onnx_path>" on cold builds.
+  // Weakly-typed FP16 by default (bit 0 clear). Quantized QDQ ONNX needs a
+  // strongly-typed network instead (bit 0 = kSTRONGLY_TYPED): TRT then reads
+  // precision from the graph and kFP16 must NOT be set (it's rejected).
+  const uint32_t net_flags =
+      strongly_typed
+          ? (1U << static_cast<uint32_t>(
+                 nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED))
+          : 0U;
   auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(
-      builder->createNetworkV2(0U));
+      builder->createNetworkV2(net_flags));
   if (!network) return false;
 
   auto parser = std::unique_ptr<nvonnxparser::IParser>(
       nvonnxparser::createParser(*network, s_logger));
-  if (!parser || !parser->parseFromFile(onnx_path.c_str(),
-      static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
+  if (!parser) return false;
+  if (!parser->parseFromFile(onnx_path.c_str(),
+      static_cast<int>(nvinfer1::ILogger::Severity::kWARNING))) {
+    // v6 introduces RepLKFPN/LightSVTR ops; the parser builds clean today, but
+    // surface every error so a future op regression is diagnosable rather than
+    // a bare "Failed to build engine".
+    for (int i = 0; i < parser->getNbErrors(); ++i)
+      std::cerr << "[TRT] ONNX parse error in " << onnx_path << ": "
+                << parser->getError(i)->desc() << '\n';
     return false;
+  }
 
   auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(
       builder->createBuilderConfig());
@@ -166,21 +243,35 @@ static bool build_engine(const std::string &onnx_path,
   // card alongside rec/cls/layout.
   size_t workspace_bytes;
   if (type == "layout") {
-    workspace_bytes = 4ULL << 30;          // 4 GiB
+    workspace_bytes = 4ULL << 30;          // 4 GiB (PP-DocLayoutV3 DETR attention)
+  } else if (type == "slanext_encoder") {
+    workspace_bytes = 2ULL << 30;          // 2 GiB (PP-LCNet CNN encoder, 488²)
   } else if (type == "det") {
-    // (det_max/960)² × 1 GiB, capped at 4 GiB. At default 960 → 1 GiB
-    // (unchanged). At 2048 → ~4 GiB. At 4096 → 4 GiB (cap).
-    int det_max = read_det_max_side();
+    // (det_max/960)² × 1 GiB, capped at 4 GiB. 960 is the historical baseline
+    // for the scale ratio: at 2048 → ~4 GiB, at 4096 → 4 GiB (cap). det_max is
+    // the effective profile MAX, so workspace scales with the same value the
+    // profile MAX uses below.
+    int det_max = read_det_effective_max_side();
     double scale = (static_cast<double>(det_max) / 960.0) *
                    (static_cast<double>(det_max) / 960.0);
     size_t scaled = static_cast<size_t>((1ULL << 30) * scale);
     workspace_bytes = std::min(scaled, size_t(4ULL << 30));
     if (workspace_bytes < (1ULL << 30)) workspace_bytes = 1ULL << 30;
+  } else if (type == "slanext_wired" || type == "slanext_wireless" ||
+             type == "formula") {
+    workspace_bytes = 2ULL << 30;          // 2 GiB (plan 07 §5)
+  } else if (type == "rec") {
+    // v6 rec (EncoderWithLightSVTR) fuses the whole graph into one large
+    // attention ForeignNode; 1 GiB starves the tactic search on the medium
+    // tier ("could not find any implementation"). 4 GiB matches layout.
+    workspace_bytes = 4ULL << 30;          // 4 GiB
   } else {
-    workspace_bytes = 1ULL << 30;          // rec, cls
+    workspace_bytes = 1ULL << 30;          // cls, table_cls, table_cell_*
   }
   config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, workspace_bytes);
-  config->setFlag(nvinfer1::BuilderFlag::kFP16);
+  // Strongly-typed networks reject kFP16 — precision is fixed by the graph.
+  if (!strongly_typed)
+    config->setFlag(nvinfer1::BuilderFlag::kFP16);
   // TRT_OPT_LEVEL: 0..5, default 5. Lower trades runtime perf for build time.
   const int opt_level = read_trt_opt_level();
   config->setBuilderOptimizationLevel(opt_level);
@@ -188,26 +279,53 @@ static bool build_engine(const std::string &onnx_path,
 
   auto profile = builder->createOptimizationProfile();
   auto input = network->getInput(0);
+  bool profile_added_in_branch = false;
 
   if (type == "det") {
-    // MAX tracks DET_MAX_SIDE (default 960). MIN is the floor (32, after
-    // round-down-to-32). OPT is the sweet-spot for typical inputs, capped
-    // by MAX so a small DET_MAX_SIDE doesn't violate MIN<=OPT<=MAX.
-    int det_max = read_det_max_side();
+    // MAX is the effective det max-side (per-model max_side_limit, default
+    // 1280, overridden by DET_MAX_SIDE) — it must be >= the largest resize
+    // output the detector can feed in, else TRT rejects native-resolution
+    // inputs at execute time. MIN is the floor (32). OPT is the sweet-spot for
+    // typical inputs, capped by MAX so a small effective max doesn't violate
+    // MIN<=OPT<=MAX.
+    int det_max = read_det_effective_max_side();
     int det_opt = std::min(640, det_max);
+    // Batch range 1..8: OPT stays at batch 1 so single-image latency (the common
+    // /ocr/raw case) keeps its tuned tactics, while MAX=8 lets the dynamic-batch
+    // path (PaddleDet::run_batch, dynamic-batching coalescer) submit batch>1 for
+    // throughput — det at batch 8 is ~40% cheaper per image (measured).
+    const int det_opt_batch = read_det_opt_batch();  // DET_OPT_BATCH, default 4
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
         nvinfer1::Dims4{1, 3, kDetMaxSideMin, kDetMaxSideMin});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
-        nvinfer1::Dims4{1, 3, det_opt, det_opt});
+        nvinfer1::Dims4{det_opt_batch, 3, det_opt, det_opt});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
-        nvinfer1::Dims4{1, 3, det_max, det_max});
+        nvinfer1::Dims4{8, 3, det_max, det_max});
   } else if (type == "rec") {
+    // Profile 0: dynamic profile, covers all shapes (the default serving path).
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
         nvinfer1::Dims4{1, 3, 48, 48});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
         nvinfer1::Dims4{32, 3, 48, 320});
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
         nvinfer1::Dims4{32, 3, 48, 4000});
+    // Static (batch,width) profiles + maxAuxStreams=0 only when CUDA graphs
+    // are opted into — they exist solely to give the baked-graph path frozen,
+    // shape-specialized contexts. Keeping them out of the default build means
+    // the default rec engine (and its cache key) is unchanged from baseline.
+    if (TrtEngine::graphs_enabled()) {
+      config->addOptimizationProfile(profile);
+      for (const auto &gp : kRecGraphProfiles) {
+        auto *p = builder->createOptimizationProfile();
+        const nvinfer1::Dims4 d{gp.batch, 3, 48, gp.width};
+        p->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN, d);
+        p->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT, d);
+        p->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX, d);
+        config->addOptimizationProfile(p);
+      }
+      config->setMaxAuxStreams(0);
+      profile_added_in_branch = true;
+    }
   } else if (type == "layout") {
     // PP-DocLayoutV3 has 3 inputs: image [B,3,800,800], im_shape [B,2],
     // scale_factor [B,2]. paddle2onnx does not guarantee input ordering, so
@@ -235,6 +353,87 @@ static bool build_engine(const std::string &onnx_path,
         return false;
       }
     }
+  } else if (type == "table_cls") {
+    // PP-LCNet_x1_0_table_cls (224×224, 2 classes wired/wireless). Shape
+    // profile from turbostruct-rs/crates/turbostruct-engine/src/builder/
+    // profiles.rs::populate_table_cls (lines 166-183).
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{1, 3, 224, 224});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{1, 3, 224, 224});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{8, 3, 224, 224});
+  } else if (type == "table_cell_wired" || type == "table_cell_wireless") {
+    // RT-DETR-L_{wired,wireless}_table_cell_det — same triple-input contract
+    // as PP-DocLayoutV3 but at 640×640. Profile from profiles.rs::
+    // populate_table_cell (lines 185-222).
+    for (int i = 0; i < network->getNbInputs(); ++i) {
+      auto *in = network->getInput(i);
+      std::string name = in->getName();
+      if (name == "image") {
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kMIN,
+            nvinfer1::Dims4{1, 3, 640, 640});
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kOPT,
+            nvinfer1::Dims4{1, 3, 640, 640});
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kMAX,
+            nvinfer1::Dims4{4, 3, 640, 640});
+      } else if (name == "im_shape" || name == "scale_factor") {
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kMIN,
+            nvinfer1::Dims2{1, 2});
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kOPT,
+            nvinfer1::Dims2{1, 2});
+        profile->setDimensions(name.c_str(), nvinfer1::OptProfileSelector::kMAX,
+            nvinfer1::Dims2{4, 2});
+      } else {
+        std::cerr << "[TRT] Unexpected input for " << type << ": " << name
+                  << '\n';
+        return false;
+      }
+    }
+  } else if (type == "slanext_wired" || type == "slanext_wireless") {
+    // SLANeXt {wired,wireless} encoder, 488×488. Decoder Loop body is part
+    // of the same engine — internal dynamic dim handled by TRT. Profile from
+    // profiles.rs::populate_slanext (lines 224-243).
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{1, 3, 488, 488});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{1, 3, 488, 488});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{4, 3, 488, 488});
+  } else if (type == "formula") {
+    // PP-FormulaNet-S — single grayscale 384×384 input, MTP-K=3 decoder
+    // Loop op. Profile from profiles.rs::populate_formula (lines 245-276).
+    // HGNetV2-B4 encoder carries Q/DQ ops baked into the ONNX; TRT honors
+    // those under FP16 weakly-typed networks. Do NOT setFlag(kINT8) with a
+    // fresh calibrator here — the decoder Loop body must stay FP16 (plan
+    // 07 §5).
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{1, 1, 384, 384});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{1, 1, 384, 384});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{8, 1, 384, 384});
+  } else if (type == "doc_ori") {
+    // PP-LCNet_x1_0_doc_ori document-orientation classifier, 224x224. Opt at
+    // batch 1 (one page per autorotate detect); max 8 to match the model's
+    // own dynamic profile. Must match kDocOriSize in
+    // classification/doc_orientation_common.h.
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{1, 3, 224, 224});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{1, 3, 224, 224});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{8, 3, 224, 224});
+  } else if (type == "slanext_encoder") {
+    // SLANeXt CNN encoder (PP-LCNet), fixed 488×488 letterbox (ResizeByLong488 +
+    // pad). Batch pinned to 1 (one table region per encode). Output feature
+    // transpose_0.tmp_0.0 = [1, T_enc=256, C=96] feeds the host GRU decoder.
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4{1, 3, 488, 488});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4{1, 3, 488, 488});
+    profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4{1, 3, 488, 488});
   } else {
     // cls: PP-OCRv5 textline orientation classifier (PP-LCNet_x0_25), input
     // 80x160. Must match kClsImageH/kClsImageW in classification/paddle_cls.h.
@@ -245,7 +444,8 @@ static bool build_engine(const std::string &onnx_path,
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
         nvinfer1::Dims4{128, 3, 80, 160});
   }
-  config->addOptimizationProfile(profile);
+  if (!profile_added_in_branch)
+    config->addOptimizationProfile(profile);
 
   auto plan = std::unique_ptr<nvinfer1::IHostMemory>(
       builder->buildSerializedNetwork(*network, *config));
@@ -335,7 +535,7 @@ std::string ensure_trt_engine(const std::string &onnx_path,
 
   if (fs::exists(trt_path)) {
     std::cout << "Using cached engine: " << trt_path;
-    if (type == "det") std::cout << " (DET_MAX_SIDE=" << read_det_max_side() << ")";
+    if (type == "det") std::cout << " (det_max_side=" << read_det_effective_max_side() << ")";
     std::cout << '\n';
     return trt_path;
   }

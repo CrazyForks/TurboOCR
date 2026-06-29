@@ -1,11 +1,27 @@
 #include "turbo_ocr/pipeline/ocr_pipeline.h"
+#include <unordered_map>
+#include "infer_one.h"
+#include "ocr_pipeline_detail.h"
+#include "recognizer_registry.h"
+#include "turbo_ocr/common/backend_error.h"
 #include "turbo_ocr/common/cuda_check.h"
+#include "turbo_ocr/common/errors.h"
 #include "turbo_ocr/common/timing.h"
 #include "turbo_ocr/decode/gpu_image.h"
 #include "turbo_ocr/common/serialization.h"
+#include "turbo_ocr/formula/formula_recognizer.h"
 #include "turbo_ocr/layout/reading_order.h"
+#include "turbo_ocr/router/cua_router.h"
+#include "turbo_ocr/routing/routing_config.h"
+#include "turbo_ocr/table/table_recognizer.h"
+#include "turbo_ocr/table/cell_matcher.h"
+#include "turbo_ocr/table/html_reconstruct.h"
+#include "turbo_ocr/table/slanext_enc_split.h"
+#include "turbo_ocr/table/table_types.h"
+#include "turbo_ocr/engine/onnx_to_trt.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 
@@ -16,13 +32,15 @@ using turbo_ocr::Box;
 using turbo_ocr::OCRResultItem;
 using turbo_ocr::GpuImage;
 using turbo_ocr::PipelineTimer;
-using turbo_ocr::is_vertical_box;
-using turbo_ocr::sorted_boxes;
+// is_vertical_box / sorted_boxes are called unqualified below; ADL resolves them
+// to turbo_ocr:: from their Box / vector<Box> arguments, so no using-decl needed.
 using turbo_ocr::detection::PaddleDet;
 using turbo_ocr::classification::PaddleCls;
 using turbo_ocr::recognition::PaddleRec;
 using turbo_ocr::layout::PaddleLayout;
 using turbo_ocr::pipeline::OcrPipelineResult;
+
+using turbo_ocr::pipeline::detail::adjust_table_region;
 
 OcrPipeline::OcrPipeline() {
   det_ = std::make_unique<PaddleDet>();
@@ -34,12 +52,20 @@ OcrPipeline::~OcrPipeline() noexcept {
     cudaStreamDestroy(rec_stream_);
   if (layout_stream_)
     cudaStreamDestroy(layout_stream_);
+  if (table_stream_)
+    cudaStreamDestroy(table_stream_);
+  if (formula_stream_)
+    cudaStreamDestroy(formula_stream_);
   if (rec_event_)
     cudaEventDestroy(rec_event_);
   if (det_event_)
     cudaEventDestroy(det_event_);
   if (det_only_event_)
     cudaEventDestroy(det_only_event_);
+  if (table_done_event_)
+    cudaEventDestroy(table_done_event_);
+  if (formula_done_event_)
+    cudaEventDestroy(formula_done_event_);
   for (auto &buf : img_bufs_) {
     if (buf.d_buf)
       cudaFree(buf.d_buf);
@@ -54,8 +80,9 @@ OcrPipeline::~OcrPipeline() noexcept {
 bool OcrPipeline::init(const std::string &det_model,
                        const std::string &rec_model,
                        const std::string &rec_dict,
-                       const std::string &cls_model) {
-  if (!det_->load_model(det_model))
+                       const std::string &cls_model,
+                       const DetInferConfig &det_cfg) {
+  if (!det_->load_model(det_model, det_cfg.resize, det_cfg.db))
     return false;
   if (!rec_->load_model(rec_model))
     return false;
@@ -99,6 +126,56 @@ bool OcrPipeline::init(const std::string &det_model,
   return true;
 }
 
+bool OcrPipeline::load_router_models(
+    const std::string &table_cls_trt,
+    const std::string &cell_wired_trt,
+    const std::string &cell_wireless_trt,
+    const std::string &slanext_wired_trt,
+    const std::string &slanext_wireless_trt,
+    const std::string &formula_onnx,
+    const std::string &formula_tokenizer_json) {
+  // Router itself is CPU-only and cheap; build it unconditionally so the
+  // classify path is available even when no downstream engines load.
+  router_ = std::make_unique<router::CuaRouter>();
+
+  // The live table path is the SlanextTableRecognizer registry built in
+  // load_table_backend(); the table-engine arguments above are retained for
+  // ABI stability but no longer drive a separate cell-det stage here.
+  (void)table_cls_trt;
+  (void)cell_wired_trt;
+  (void)cell_wireless_trt;
+  (void)slanext_wired_trt;
+  (void)slanext_wireless_trt;
+
+  // Formula half — backend selected via FORMULA_BACKEND
+  // (formulanet | ppformulanet_s | vlm). The file-based backends are guarded
+  // against missing files so the server starts cleanly while upstream
+  // re-exports the split-ONNX bundle (see internal engineering notes);
+  // the "vlm" backend talks to a remote endpoint and needs no local files.
+  // Formula backend from the routing table (TURBO_ROUTING_CONFIG, or
+  // env-synthesized from FORMULA_BACKEND/VLLM_* = today's behavior). kind:openai
+  // -> generic OpenAIEndpoint; kind:local -> engine factory. load_model_dir/
+  // load_tokenizer are health-check/no-op for the remote backend, so the load
+  // flow below stays uniform. Construction + registry insertion lives in
+  // recognizer_registry; this pipeline only owns the CUDA stream lifetime,
+  // passed in as the ensure-callback below.
+  const routing::RoutingTable formula_routing = routing::load_routing_config();
+  const bool formula_ok =
+      load_formula_into_registry(formula_registry_, formula_, formula_routing,
+                                 formula_onnx, formula_tokenizer_json,
+                                 [this] { ensure_formula_stream_(); });
+
+  // Prewarm every kind:openai formula-routable backend that ISN'T the default
+  // (cheap HTTP clients) so a per-request override can target them with no
+  // first-request build latency. Local heavy engines are NOT prewarmed (would
+  // cost extra VRAM); they're only built when they're the route default above.
+  prewarm_openai_registry_("formula", formula_routing);
+
+  // false only when a CONFIGURED local formula backend failed to load; the
+  // caller turns that into a fatal boot rather than a silently formula-less server.
+  return formula_ok;
+}
+
 bool OcrPipeline::load_layout_model(const std::string &layout_trt_path) {
   if (layout_trt_path.empty()) return false;
   auto layout = std::make_unique<PaddleLayout>();
@@ -119,14 +196,57 @@ bool OcrPipeline::load_layout_model(const std::string &layout_trt_path) {
   return true;
 }
 
+bool OcrPipeline::load_table_backend() {
+  // Pluggable table backend: TABLE_BACKEND selects slanext|vlm; each
+  // backend reads its own env (TABLE_SLANEXT_*, VLLM_TABLE_*)
+  // in load() and returns false when unconfigured (so this no-ops cleanly).
+  // Table backend from the routing table (TURBO_ROUTING_CONFIG, or env-synth
+  // from TABLE_BACKEND/VLLM_TABLE_* = today). kind:openai -> OpenAIEndpoint;
+  // kind:local -> slanext|vlm. Construction + registry insertion lives in
+  // recognizer_registry; the pipeline owns the CUDA stream (ensure-callback).
+  const routing::RoutingTable table_routing = routing::load_routing_config();
+  if (!load_table_into_registry(table_registry_, table_recognizer_, table_routing,
+                                [this] { ensure_table_stream_(); }))
+    return false;
+  // Prewarm kind:openai table-routable overrides (cheap HTTP clients).
+  prewarm_openai_registry_("table", table_routing);
+  return true;
+}
+
+bool OcrPipeline::load_doc_ori_model(const std::string &doc_ori_trt_path) {
+  if (doc_ori_trt_path.empty()) return false;
+  auto doc_ori = std::make_unique<classification::DocOrientation>();
+  if (!doc_ori->load_model(doc_ori_trt_path)) {
+    std::cerr << std::format("[Pipeline] Failed to load doc-orientation model: {}",
+                             doc_ori_trt_path)
+              << '\n';
+    return false;
+  }
+  doc_ori->allocate_buffers();
+  doc_ori_ = std::move(doc_ori);
+  use_doc_ori_ = true;
+  std::cout << "[Pipeline] Document-orientation (autorotate) enabled" << '\n';
+  return true;
+}
+
+int OcrPipeline::detect_orientation(const cv::Mat &bgr, cudaStream_t stream) {
+  if (!use_doc_ori_) return 0;
+  return doc_ori_->detect(bgr, stream);
+}
+
 void OcrPipeline::warmup_gpu(cudaStream_t stream) {
-  // Run full pipeline with a dummy image to trigger TRT JIT and lazy GPU allocations.
-  // If layout is enabled, the first run(...) call below will already hit the
-  // layout TRT engine via the run() body — no separate layout warmup needed.
-  cv::Mat dummy(100, 100, CV_8UC3, cv::Scalar(255, 255, 255));
-  cv::rectangle(dummy, cv::Point(10, 30), cv::Point(90, 70), cv::Scalar(0, 0, 0), 2);
-  (void)run(dummy, stream);
-  cudaStreamSynchronize(stream);
+  // Run full pipeline with a dummy image to trigger TRT JIT and lazy GPU
+  // allocations. If layout is enabled, the run(...) body hits layout too.
+  {
+    cv::Mat dummy(100, 100, CV_8UC3, cv::Scalar(255, 255, 255));
+    cv::rectangle(dummy, cv::Point(10, 30), cv::Point(90, 70), cv::Scalar(0, 0, 0), 2);
+    (void)run(dummy, stream);
+    cudaStreamSynchronize(stream);
+  }
+
+  // Record the per-(batch,width)-profile CUDA graphs before the bucket warm
+  // loop below, so the loop exercises the graph-replay path end to end.
+  rec_->bake_graphs(stream);
 
   // Warm all 5 rec width buckets to eliminate TRT JIT latency on first use.
   // The initial run() above only hits one bucket; each unseen bucket pays ~5-50ms
@@ -187,6 +307,12 @@ GpuImage OcrPipeline::upload_image(const cv::Mat &img, cudaStream_t stream,
   if (img.rows > buf.cap_rows || img.cols > buf.cap_cols) [[unlikely]] {
     cudaFree(buf.d_buf);
     buf.d_buf = nullptr;
+    // Zero the cap BEFORE the alloc: if cudaMallocPitch throws (OOM), the
+    // slot must stay {nullptr, cap 0} so the NEXT request re-enters this
+    // realloc branch instead of skipping it and writing to a null buffer
+    // with a stale (larger) cap.
+    buf.cap_rows = 0;
+    buf.cap_cols = 0;
     CUDA_CHECK(cudaMallocPitch(&buf.d_buf, &buf.pitch, img.cols * 3, img.rows));
     buf.cap_rows = img.rows;
     buf.cap_cols = img.cols;
@@ -197,6 +323,7 @@ GpuImage OcrPipeline::upload_image(const cv::Mat &img, cudaStream_t stream,
   if (needed > h_pinned_size_) [[unlikely]] {
     cudaFreeHost(h_pinned_buf_);
     h_pinned_buf_ = nullptr;
+    h_pinned_size_ = 0;  // zero before alloc — see d_buf cap reset above
     // Upload-only pinned buffer: CPU writes (memcpy) once and the GPU DMAs
     // it. Write-combined uncached memory is ~10-15% faster for this access
     // pattern (no read-back from CPU).
@@ -212,180 +339,69 @@ GpuImage OcrPipeline::upload_image(const cv::Mat &img, cudaStream_t stream,
   return GpuImage{buf.d_buf, buf.pitch, img.rows, img.cols};
 }
 
-std::vector<OCRResultItem> OcrPipeline::run(const cv::Mat &img,
-                                            cudaStream_t stream) {
-  return run_with_layout(img, stream).results;
+void OcrPipeline::ensure_table_stream_() {
+  if (!table_stream_) {
+    CUDA_CHECK(cudaStreamCreateWithFlags(&table_stream_, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&table_done_event_, cudaEventDisableTiming));
+  }
 }
 
-OcrPipelineResult OcrPipeline::run_with_layout(const cv::Mat &img,
-                                               cudaStream_t stream,
-                                               bool want_layout,
-                                               bool want_reading_order) {
-  const bool layout_active = use_layout_ && want_layout;
-  if (img.empty()) [[unlikely]] return OcrPipelineResult{};
+void OcrPipeline::ensure_formula_stream_() {
+  if (!formula_stream_) {
+    CUDA_CHECK(cudaStreamCreateWithFlags(&formula_stream_, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&formula_done_event_, cudaEventDisableTiming));
+  }
+}
 
+void OcrPipeline::prewarm_openai_registry_(const std::string &modality,
+                                           const routing::RoutingTable &tbl) {
+  prewarm_openai_into_registry(modality, tbl, table_registry_, formula_registry_,
+                               [this] { ensure_table_stream_(); },
+                               [this] { ensure_formula_stream_(); });
+}
+
+turbo_ocr::table::ITableRecognizer *
+OcrPipeline::pick_table_recognizer_(const std::string &name) const {
+  if (!name.empty()) {
+    auto it = table_registry_.find(name);
+    if (it != table_registry_.end()) return it->second.get();
+  }
+  return table_recognizer_;  // route default (may be nullptr if tables disabled)
+}
+
+turbo_ocr::formula::IFormulaRecognizer *
+OcrPipeline::pick_formula_recognizer_(const std::string &name) const {
+  if (!name.empty()) {
+    auto it = formula_registry_.find(name);
+    if (it != formula_registry_.end()) return it->second.get();
+  }
+  return formula_;  // route default (may be nullptr if formulas disabled)
+}
+
+std::string OcrPipeline::infer_one(const cv::Mat &img, cudaStream_t stream,
+                                   const std::string &modality,
+                                   const std::string &backend_name,
+                                   const routing::BackendSpec *inline_spec) {
+  if (img.empty()) return "";
+  // Upload the crop once; the whole image is the single region.
   PipelineTimer timer;
   timer.init(stream);
   timer.reset();
-
-  // Upload + detection wrapped: degenerate inputs (e.g. 1×1, corrupt-
-  // decoded Mats with zero-aligned pitch) trip CUDA "invalid pitch" in
-  // cudaMemcpy2DAsync or in the resize kernel. Reset the stream and
-  // return an empty result instead of bubbling up a 500 — there is no
-  // text to detect and the request shouldn't poison subsequent ones.
   GpuImage gpu_img;
-  std::vector<Box> boxes;
   try {
     gpu_img = upload_image(img, stream, timer);
-    timer.gpu_start("detection_inference");
-    boxes = det_->run(gpu_img, img.rows, img.cols, stream);
-    timer.gpu_stop();
-  } catch (const turbo_ocr::CudaError &e) {
-    std::cerr << "[Pipeline] degenerate input "
-              << img.cols << "x" << img.rows
-              << " — returning empty result: " << e.what() << '\n';
-    cudaStreamSynchronize(stream);
-    cudaGetLastError(); // clear sticky error so next request works
-    return OcrPipelineResult{};
+  } catch (const std::exception &e) {
+    // Degenerate crop (e.g. zero-aligned pitch tripping cudaMemcpy2DAsync): no
+    // pixels to recognize. Surface the cause instead of silently dropping it.
+    std::cerr << "[Pipeline] infer_one upload failed for "
+              << img.cols << "x" << img.rows << " — returning empty: "
+              << e.what() << '\n';
+    return "";
   }
-
-  // Sort boxes top-to-bottom, left-to-right (in-place)
-  timer.cpu_start("box_postprocessing");
-  sorted_boxes(boxes);
-  timer.cpu_stop();
-
-  // Optional layout detection — dispatched on a dedicated layout_stream_
-  // that waits only on det (via det_only_event_), so layout TRT execute
-  // overlaps with cls on `stream` AND with rec on `rec_stream_`. The
-  // host-side decode happens in collect() at the very end of run().
-  if (layout_active) {
-    CUDA_CHECK(cudaEventRecord(det_only_event_, stream));
-    CUDA_CHECK(cudaStreamWaitEvent(layout_stream_, det_only_event_, 0));
-    timer.gpu_start("layout_enqueue");
-    (void)layout_->enqueue(gpu_img, img.rows, img.cols, layout_stream_);
-    timer.gpu_stop();
-  }
-
-  // Optional angle classification — only classify boxes that look vertical.
-  // Saves time by not classifying horizontal text (majority of boxes).
-  if (use_cls_) {
-    // Collect indices of vertical-looking boxes (h >= w*1.5)
-    vertical_box_indices_.clear();
-    for (int i = 0; i < static_cast<int>(boxes.size()); ++i) {
-      if (is_vertical_box(boxes[i]))
-        vertical_box_indices_.push_back(i);
-    }
-    if (!vertical_box_indices_.empty()) {
-      // Build subset of vertical boxes for classification
-      vertical_boxes_buf_.clear();
-      vertical_boxes_buf_.reserve(vertical_box_indices_.size());
-      for (int idx : vertical_box_indices_)
-        vertical_boxes_buf_.push_back(boxes[idx]);
-
-      timer.gpu_start("angle_classification");
-      cls_->run(gpu_img, vertical_boxes_buf_, stream);
-      timer.gpu_stop();
-
-      // Write classified boxes back
-      for (size_t j = 0; j < vertical_box_indices_.size(); ++j)
-        boxes[vertical_box_indices_[j]] = vertical_boxes_buf_[j];
-    }
-  }
-
-  // Recognition — launch on dedicated rec_stream_ so the caller's stream is
-  // free for the next image's upload+detection (pipeline parallelism).
-  // Record det_event_ on the caller's stream after det+cls, then make
-  // rec_stream_ wait on it before launching recognition.
-  CUDA_CHECK(cudaEventRecord(det_event_, stream));
-  CUDA_CHECK(cudaStreamWaitEvent(rec_stream_, det_event_, 0));
-
-  timer.gpu_start("recognition_inference");
-  auto rec_results = rec_->run(gpu_img, boxes, rec_stream_);
-  timer.gpu_stop();
-
-  // Record rec_event_ so the NEXT run() can wait for this recognition to
-  // finish before reusing the image buffer. Note: rec_->run() syncs
-  // rec_stream_ internally (for D2H + CTC decode), so by the time we get
-  // here rec_stream_ is idle and this event is immediately "done". The event
-  // is still useful as a correctness guard and for future async recognition.
-  CUDA_CHECK(cudaEventRecord(rec_event_, rec_stream_));
-
-  // Combine (filter by drop_score, matching Python's behavior)
-  constexpr float kDropScore = turbo_ocr::kDropScore;
-  OcrPipelineResult out;
-  out.results.reserve(boxes.size());
-  for (size_t i = 0; i < boxes.size(); ++i) {
-    if (i < rec_results.size()) {
-      if (rec_results[i].second < kDropScore)
-        continue;
-      if (rec_results[i].first.empty())
-        continue;
-      out.results.push_back({
-        .text = std::move(rec_results[i].first),
-        .confidence = rec_results[i].second,
-        .box = boxes[i],
-      });
-    }
-  }
-
-  // Layout collect waits on d2h_event_ recorded on layout_stream_. Because
-  // layout and rec run on separate streams, total wall-clock is bounded by
-  // max(layout, cls+rec); on typical pages rec dominates so the wait is a
-  // no-op.
-  if (layout_active) {
-    out.layout = layout_->collect();
-  }
-
-  // Reading-order over layout regions, with synthetic XY-cut entries
-  // for orphan results so unmatched detections (page numbers, headers
-  // the layout model missed) land in their natural position instead of
-  // trailing the entire document. Helper is shared with cpu_ocr_pipeline.
-  if (want_reading_order && !out.layout.empty()) {
-    turbo_ocr::assign_layout_ids(out.results, out.layout);
-    out.reading_order =
-        turbo_ocr::layout::assign_reading_order_for_results(out.results, out.layout);
-  }
-
-  timer.print_total();
-
-  return out;
-}
-
-OcrPipelineResult OcrPipeline::run_layout_only(const cv::Mat &img,
-                                                cudaStream_t stream) {
-  OcrPipelineResult out;
-  // Fast no-op if layout isn't loaded: skip the upload entirely. Callers
-  // in /ocr/pdf geometric/auto modes never need OCR text here — they fill
-  // results from the PDFium text layer — so returning empty is correct.
-  if (!use_layout_ || !layout_) return out;
-
-  PipelineTimer timer;
-  timer.init(stream);
-  timer.reset();
-
-  auto gpu_img = upload_image(img, stream, timer);
-
-  // Layout runs on layout_stream_ for the same reason run_with_layout
-  // does: overlap with whatever else the caller has in flight. We still
-  // record det_only_event_ on `stream` so layout_stream_ waits for the
-  // upload before reading the image buffer.
-  CUDA_CHECK(cudaEventRecord(det_only_event_, stream));
-  CUDA_CHECK(cudaStreamWaitEvent(layout_stream_, det_only_event_, 0));
-
-  timer.gpu_start("layout_only");
-  (void)layout_->enqueue(gpu_img, img.rows, img.cols, layout_stream_);
-  out.layout = layout_->collect();
-  timer.gpu_stop();
-
-  // Mirror the event bookkeeping of run_with_layout so the next
-  // run_with_layout()/run_layout_only() call can sync correctly on its
-  // turn. rec_event_ is recorded on rec_stream_ — we didn't touch
-  // rec_stream_ at all, so record an already-completed event by pushing
-  // a no-op into rec_stream_ after layout_stream_ is known to be done.
-  CUDA_CHECK(cudaEventRecord(rec_event_, rec_stream_));
-
-  timer.print_total();
-  return out;
+  return infer_one_region(
+      gpu_img, img.cols, img.rows, stream, modality, backend_name, inline_spec,
+      [this](const std::string &n) { return pick_table_recognizer_(n); },
+      [this](const std::string &n) { return pick_formula_recognizer_(n); });
 }
 
 std::pair<void *, size_t> OcrPipeline::ensure_gpu_buf(int rows, int cols) {
@@ -393,267 +409,14 @@ std::pair<void *, size_t> OcrPipeline::ensure_gpu_buf(int rows, int cols) {
   if (rows > buf.cap_rows || cols > buf.cap_cols) {
     cudaFree(buf.d_buf);
     buf.d_buf = nullptr;
+    // Zero the cap BEFORE the alloc so an OOM throw leaves {nullptr, cap 0}:
+    // otherwise a later smaller request would skip the realloc and hand a
+    // null device buffer to nvjpeg decode → sticky illegal-address → abort.
+    buf.cap_rows = 0;
+    buf.cap_cols = 0;
     CUDA_CHECK(cudaMallocPitch(&buf.d_buf, &buf.pitch, cols * 3, rows));
     buf.cap_rows = rows;
     buf.cap_cols = cols;
   }
   return {buf.d_buf, buf.pitch};
-}
-
-std::vector<OCRResultItem> OcrPipeline::run(GpuImage gpu_img,
-                                            cudaStream_t stream) {
-  return run_with_layout(gpu_img, stream).results;
-}
-
-OcrPipelineResult OcrPipeline::run_with_layout(GpuImage gpu_img,
-                                               cudaStream_t stream,
-                                               bool want_layout,
-                                               bool want_reading_order) {
-  const bool layout_active = use_layout_ && want_layout;
-  PipelineTimer timer;
-  timer.init(stream);
-  timer.reset();
-
-  // No image_upload stage — the image is already on the GPU.
-  // Wait for any previous recognition that might still be reading its source
-  // image. For caller-owned GpuImage this is a correctness guard only.
-  CUDA_CHECK(cudaEventSynchronize(rec_event_));
-
-  // Detection
-  timer.gpu_start("detection_inference");
-  std::vector<Box> boxes = det_->run(gpu_img, gpu_img.rows, gpu_img.cols, stream);
-  timer.gpu_stop();
-
-  // Sort boxes top-to-bottom, left-to-right (in-place)
-  timer.cpu_start("box_postprocessing");
-  sorted_boxes(boxes);
-  timer.cpu_stop();
-
-  // Optional layout detection (see run(cv::Mat, stream) for rationale).
-  if (layout_active) {
-    CUDA_CHECK(cudaEventRecord(det_only_event_, stream));
-    CUDA_CHECK(cudaStreamWaitEvent(layout_stream_, det_only_event_, 0));
-    timer.gpu_start("layout_enqueue");
-    (void)layout_->enqueue(gpu_img, gpu_img.rows, gpu_img.cols, layout_stream_);
-    timer.gpu_stop();
-  }
-
-  // Optional angle classification — only classify boxes that look vertical.
-  if (use_cls_) {
-    vertical_box_indices_.clear();
-    for (int i = 0; i < static_cast<int>(boxes.size()); ++i) {
-      if (is_vertical_box(boxes[i]))
-        vertical_box_indices_.push_back(i);
-    }
-    if (!vertical_box_indices_.empty()) {
-      vertical_boxes_buf_.clear();
-      vertical_boxes_buf_.reserve(vertical_box_indices_.size());
-      for (int idx : vertical_box_indices_)
-        vertical_boxes_buf_.push_back(boxes[idx]);
-
-      timer.gpu_start("angle_classification");
-      cls_->run(gpu_img, vertical_boxes_buf_, stream);
-      timer.gpu_stop();
-
-      for (size_t j = 0; j < vertical_box_indices_.size(); ++j)
-        boxes[vertical_box_indices_[j]] = vertical_boxes_buf_[j];
-    }
-  }
-
-  // Recognition — use det_event_ for det→rec stream handoff.
-  CUDA_CHECK(cudaEventRecord(det_event_, stream));
-  CUDA_CHECK(cudaStreamWaitEvent(rec_stream_, det_event_, 0));
-
-  timer.gpu_start("recognition_inference");
-  auto rec_results = rec_->run(gpu_img, boxes, rec_stream_);
-  timer.gpu_stop();
-
-  // Record rec_event_ for the next run() to wait on.
-  CUDA_CHECK(cudaEventRecord(rec_event_, rec_stream_));
-
-  // Combine (filter by drop_score)
-  constexpr float kDropScore = turbo_ocr::kDropScore;
-  OcrPipelineResult out;
-  out.results.reserve(boxes.size());
-  for (size_t i = 0; i < boxes.size(); ++i) {
-    if (i < rec_results.size()) {
-      if (rec_results[i].second < kDropScore)
-        continue;
-      if (rec_results[i].first.empty())
-        continue;
-      out.results.push_back({
-        .text = std::move(rec_results[i].first),
-        .confidence = rec_results[i].second,
-        .box = boxes[i],
-      });
-    }
-  }
-
-  // Layout collect — see run(cv::Mat, stream) above.
-  if (layout_active) {
-    out.layout = layout_->collect();
-  }
-
-  // Reading-order — see run(...) above for the contract; helper handles
-  // orphan results (missing layout match) via synthetic XY-cut entries.
-  if (want_reading_order && !out.layout.empty()) {
-    turbo_ocr::assign_layout_ids(out.results, out.layout);
-    out.reading_order =
-        turbo_ocr::layout::assign_reading_order_for_results(out.results, out.layout);
-  }
-
-  timer.print_total();
-
-  return out;
-}
-
-std::vector<std::vector<OCRResultItem>> OcrPipeline::run_batch(
-    const std::vector<cv::Mat> &imgs, cudaStream_t stream) {
-  // Layout is not supported on the batch path in v1.
-  if (imgs.empty())
-    return {};
-
-  // If only one image, just use single-image path
-  if (imgs.size() == 1)
-    return {run(imgs[0], stream)};
-
-  const int n = static_cast<int>(imgs.size());
-
-  // Guard against exceeding pre-allocated batch buffer capacity.
-  // Callers should chunk at kMaxBatchImages before calling this method.
-  if (n > kMaxBatchImages) [[unlikely]] {
-    std::cerr << std::format("[Pipeline] run_batch called with {} images, max is {}. "
-                             "Processing first {} only.\n", n, kMaxBatchImages, kMaxBatchImages);
-  }
-  const int batch_n = std::min(n, kMaxBatchImages);
-
-  // --- Phase 1: Upload all images to GPU, run batched detection + cls ---
-  // We need all images alive on GPU simultaneously for batched recognition.
-  struct PerImage {
-    void *d_buf = nullptr;
-    size_t pitch = 0;
-    int rows = 0, cols = 0;
-    std::vector<Box> boxes;
-  };
-  std::vector<PerImage> per_img(batch_n);
-
-  // Upload all images to GPU first
-  for (int i = 0; i < batch_n; i++) {
-    const auto &img = imgs[i];
-    auto &pi = per_img[i];
-    pi.rows = img.rows;
-    pi.cols = img.cols;
-
-    // Use pre-allocated GPU buffer (grow-only, avoids cudaMalloc per batch)
-    auto &bbuf = batch_img_bufs_[i];
-    if (img.rows > bbuf.cap_rows || img.cols > bbuf.cap_cols) [[unlikely]] {
-      if (bbuf.d_buf) cudaFree(bbuf.d_buf);
-      CUDA_CHECK(cudaMallocPitch(&bbuf.d_buf, &bbuf.pitch, img.cols * 3, img.rows));
-      bbuf.cap_rows = img.rows;
-      bbuf.cap_cols = img.cols;
-    }
-    pi.d_buf = bbuf.d_buf;
-    pi.pitch = bbuf.pitch;
-
-    // Upload via the shared pinned staging buffer
-    auto needed = static_cast<size_t>(img.rows) * img.step;
-    if (needed > h_pinned_size_) [[unlikely]] {
-      if (h_pinned_buf_) {
-        cudaFreeHost(h_pinned_buf_);
-        h_pinned_buf_ = nullptr;
-      }
-      // Upload-only pinned buffer: CPU writes (memcpy) once and the GPU DMAs
-      // it. Write-combined uncached memory is ~10-15% faster for this access
-      // pattern (no read-back from CPU).
-      CUDA_CHECK(cudaHostAlloc(&h_pinned_buf_, needed, cudaHostAllocWriteCombined));
-      h_pinned_size_ = needed;
-    }
-    std::memcpy(h_pinned_buf_, img.data, needed);
-    CUDA_CHECK(cudaMemcpy2DAsync(pi.d_buf, pi.pitch, h_pinned_buf_, img.step,
-                                  img.cols * 3, img.rows,
-                                  cudaMemcpyHostToDevice, stream));
-    // Sync before next iteration: h_pinned_buf_ is shared and will be
-    // overwritten, so the async copy must complete first.
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-  }
-
-  // Per-image detection (det engine uses batch=1 for optimal single-image speed)
-  std::vector<std::vector<Box>> all_det_boxes(batch_n);
-  for (int i = 0; i < batch_n; i++) {
-    GpuImage gi{per_img[i].d_buf, per_img[i].pitch,
-                per_img[i].rows, per_img[i].cols};
-    all_det_boxes[i] = det_->run(gi, per_img[i].rows, per_img[i].cols, stream);
-  }
-
-  // Assign detection results and run angle classification per-image
-  for (int i = 0; i < batch_n; i++) {
-    per_img[i].boxes = std::move(all_det_boxes[i]);
-    sorted_boxes(per_img[i].boxes);
-
-    // Optional angle classification -- only classify vertical-looking boxes
-    if (use_cls_) {
-      vertical_box_indices_.clear();
-      for (int vi = 0; vi < static_cast<int>(per_img[i].boxes.size()); ++vi) {
-        if (is_vertical_box(per_img[i].boxes[vi]))
-          vertical_box_indices_.push_back(vi);
-      }
-      if (!vertical_box_indices_.empty()) {
-        vertical_boxes_buf_.clear();
-        vertical_boxes_buf_.reserve(vertical_box_indices_.size());
-        for (int idx : vertical_box_indices_)
-          vertical_boxes_buf_.push_back(per_img[i].boxes[idx]);
-
-        GpuImage gpu_img{per_img[i].d_buf, per_img[i].pitch,
-                          per_img[i].rows, per_img[i].cols};
-        cls_->run(gpu_img, vertical_boxes_buf_, stream);
-
-        for (size_t j = 0; j < vertical_box_indices_.size(); ++j)
-          per_img[i].boxes[vertical_box_indices_[j]] = vertical_boxes_buf_[j];
-      }
-    }
-  }
-
-  // --- Phase 2: Batched recognition across ALL images ---
-  std::vector<PaddleRec::ImageCrops> image_crops(batch_n);
-  for (int i = 0; i < batch_n; i++) {
-    image_crops[i].img = GpuImage{per_img[i].d_buf, per_img[i].pitch,
-                                  per_img[i].rows, per_img[i].cols};
-    image_crops[i].boxes = std::move(per_img[i].boxes);
-  }
-
-  // Launch batched recognition on rec_stream_ (pipeline parallelism)
-  CUDA_CHECK(cudaEventRecord(det_event_, stream));
-  CUDA_CHECK(cudaStreamWaitEvent(rec_stream_, det_event_, 0));
-  auto all_rec_results = rec_->run_multi(image_crops, rec_stream_);
-  // Note: rec_->run_multi() syncs rec_stream_ internally for D2H + CTC decode,
-  // so no additional cudaStreamSynchronize needed here.
-
-  // --- Phase 3: Combine results and filter by drop_score ---
-  constexpr float kDropScore = turbo_ocr::kDropScore;
-  std::vector<std::vector<OCRResultItem>> all_results(batch_n);
-
-  for (int i = 0; i < batch_n; i++) {
-    const auto &boxes = image_crops[i].boxes;
-    auto &rec_results = all_rec_results[i];
-    auto &final_results = all_results[i];
-    final_results.reserve(boxes.size());
-
-    for (size_t j = 0; j < boxes.size(); ++j) {
-      if (j < rec_results.size()) {
-        if (rec_results[j].second < kDropScore)
-          continue;
-        if (rec_results[j].first.empty())
-          continue;
-        final_results.push_back({
-          .text = std::move(rec_results[j].first),
-          .confidence = rec_results[j].second,
-          .box = boxes[j],
-        });
-      }
-    }
-  }
-
-  // No cleanup needed — batch_img_bufs_ are pre-allocated and reused
-
-  return all_results;
 }

@@ -1,0 +1,131 @@
+site_name: TurboOCR
+site_description: "Multi-stream OCR pipeline — det, cls, layout, router, rec, table, formula"
+site_author: ""
+site_url: "https://aiptimizer.github.io/TurboOCR/"
+
+docs_dir: docs
+site_dir: site
+
+repo_url: https://github.com/aiptimizer/TurboOCR
+repo_name: aiptimizer/TurboOCR
+edit_uri: ""
+
+copyright: ""
+
+theme:
+  name: material
+  font:
+    text: Inter
+    code: JetBrains Mono
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.indexes
+    - navigation.footer
+    - navigation.path
+    - toc.integrate
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - header.autohide
+    - search.highlight
+    - search.share
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: pink
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: pink
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+extra_css:
+  - stylesheets/extra.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/aiptimizer/TurboOCR
+      name: Source on GitHub
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - footnotes
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:mermaid2.fence_mermaid_custom
+
+plugins:
+  - search
+  - mermaid2:
+      arguments:
+        theme: base
+        themeVariables:
+          primaryColor: "#1e293b"
+          primaryTextColor: "#f1f5f9"
+          primaryBorderColor: "#475569"
+          lineColor: "#64748b"
+          secondaryColor: "#334155"
+          tertiaryColor: "#0f172a"
+          fontSize: "14px"
+          fontFamily: "Inter, system-ui, sans-serif"
+
+nav:
+  - Home: index.md
+  - Architecture:
+      - Overview: architecture/overview.md
+      - Pipeline: architecture/pipeline.md
+      - CUDA Streams: architecture/cuda-streams.md
+      - Router: architecture/router.md
+  - Models:
+      - Selection: models/selection.md
+      - Detection: models/detection.md
+      - Classification: models/classification.md
+      - Layout: models/layout.md
+      - Recognition: models/recognition.md
+      - Table: models/table.md
+      - Formula: models/formula.md
+      - Interactions: models/interactions.md
+  - Benchmarks:
+      - Engine comparison: benchmarks/comparison.md
+      - OmniDocBench: benchmarks/omnidocbench.md
+      - Latency: benchmarks/latency.md
+  - API:
+      - HTTP: api/http.md
+      - gRPC: api/grpc.md
+      - Monitoring: api/monitoring.md
+  - Build:
+      - Native: build/native.md
+      - Docker: build/docker.md
+      - Configuration: build/config.md
+      - Models: build/models.md
+  - Dev:
+      - Testing: dev/testing.md
+      - Plan history: dev/plan-history.md

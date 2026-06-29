@@ -7,6 +7,8 @@
 #include <onnxruntime_cxx_api.h>
 #include <opencv2/imgproc.hpp>
 
+#include "turbo_ocr/layout/layout_postfilter.h"
+
 namespace turbo_ocr::layout {
 
 struct CpuPaddleLayout::Impl {
@@ -51,16 +53,15 @@ std::vector<LayoutBox> CpuPaddleLayout::run(const cv::Mat &img,
   cv::resize(img, resized, cv::Size(kInputSize, kInputSize));
 
   std::vector<float> input_chw(3 * kInputSize * kInputSize);
-  for (int y = 0; y < kInputSize; ++y) {
-    for (int x = 0; x < kInputSize; ++x) {
-      auto pixel = resized.at<cv::Vec3b>(y, x);
-      int idx = y * kInputSize + x;
-      int plane = kInputSize * kInputSize;
-      input_chw[0 * plane + idx] = pixel[0] / 255.0f; // B
-      input_chw[1 * plane + idx] = pixel[1] / 255.0f; // G
-      input_chw[2 * plane + idx] = pixel[2] / 255.0f; // R
-    }
-  }
+  constexpr int plane = kInputSize * kInputSize;
+  cv::Mat bgr[3];
+  cv::split(resized, bgr);
+  cv::Mat p_b(kInputSize, kInputSize, CV_32F, input_chw.data());
+  cv::Mat p_g(kInputSize, kInputSize, CV_32F, input_chw.data() + plane);
+  cv::Mat p_r(kInputSize, kInputSize, CV_32F, input_chw.data() + 2 * plane);
+  bgr[0].convertTo(p_b, CV_32F, 1.0 / 255.0); // B
+  bgr[1].convertTo(p_g, CV_32F, 1.0 / 255.0); // G
+  bgr[2].convertTo(p_r, CV_32F, 1.0 / 255.0); // R
 
   // 2. Build inputs: im_shape=[800,800], scale_factor=[800/h, 800/w]
   std::array<float, 2> im_shape = {
@@ -166,6 +167,7 @@ std::vector<LayoutBox> CpuPaddleLayout::run(const cv::Mat &img,
     LayoutBox lb;
     lb.class_id = cls;
     lb.score = score;
+    lb.read_order = static_cast<int>(row[6]);
     lb.box[0] = {x0, y0};
     lb.box[1] = {x1, y0};
     lb.box[2] = {x1, y1};
@@ -173,82 +175,8 @@ std::vector<LayoutBox> CpuPaddleLayout::run(const cv::Mat &img,
     out.push_back(lb);
   }
 
-  // 9. Layout NMS (same as GPU path)
-  std::sort(out.begin(), out.end(),
-            [](const LayoutBox &a, const LayoutBox &b) {
-              return a.score > b.score;
-            });
-
-  auto compute_iou = [](const LayoutBox &a, const LayoutBox &b) -> float {
-    int ax0 = a.box[0][0], ay0 = a.box[0][1], ax1 = a.box[2][0], ay1 = a.box[2][1];
-    int bx0 = b.box[0][0], by0 = b.box[0][1], bx1 = b.box[2][0], by1 = b.box[2][1];
-    int ix0 = std::max(ax0, bx0), iy0 = std::max(ay0, by0);
-    int ix1 = std::min(ax1, bx1), iy1 = std::min(ay1, by1);
-    float inter = std::max(0, ix1 - ix0) * std::max(0, iy1 - iy0);
-    float area_a = (ax1 - ax0) * (ay1 - ay0);
-    float area_b = (bx1 - bx0) * (by1 - by0);
-    float u = area_a + area_b - inter;
-    return u > 0 ? inter / u : 0.0f;
-  };
-
-  auto is_contained = [](const LayoutBox &a, const LayoutBox &b) -> bool {
-    int ax0 = a.box[0][0], ay0 = a.box[0][1], ax1 = a.box[2][0], ay1 = a.box[2][1];
-    int bx0 = b.box[0][0], by0 = b.box[0][1], bx1 = b.box[2][0], by1 = b.box[2][1];
-    int ix0 = std::max(ax0, bx0), iy0 = std::max(ay0, by0);
-    int ix1 = std::min(ax1, bx1), iy1 = std::min(ay1, by1);
-    float inter = std::max(0, ix1 - ix0) * std::max(0, iy1 - iy0);
-    float area_b = (bx1 - bx0) * (by1 - by0);
-    return area_b > 0 && (inter / area_b) >= 0.8f;
-  };
-
-  constexpr float kIoUSame = 0.6f, kIoUDiff = 0.98f;
-
-  std::vector<bool> suppressed(out.size(), false);
-  std::vector<LayoutBox> nms_out;
-  nms_out.reserve(out.size());
-  for (size_t i = 0; i < out.size(); ++i) {
-    if (suppressed[i]) continue;
-    nms_out.push_back(out[i]);
-    for (size_t j = i + 1; j < out.size(); ++j) {
-      if (suppressed[j]) continue;
-      float iou = compute_iou(out[i], out[j]);
-      float thresh = (out[i].class_id == out[j].class_id) ? kIoUSame : kIoUDiff;
-      if (iou >= thresh) { suppressed[j] = true; continue; }
-      if (out[i].class_id == out[j].class_id && is_contained(out[i], out[j]))
-        suppressed[j] = true;
-    }
-  }
-
-  // Containment cleanup (both directions)
-  {
-    std::vector<bool> drop(nms_out.size(), false);
-    for (size_t i = 0; i < nms_out.size(); ++i) {
-      if (drop[i]) continue;
-      for (size_t j = i + 1; j < nms_out.size(); ++j) {
-        if (drop[j]) continue;
-        if (is_contained(nms_out[j], nms_out[i])) { drop[i] = true; break; }
-        if (is_contained(nms_out[i], nms_out[j])) { drop[j] = true; }
-      }
-    }
-    std::vector<LayoutBox> cleaned;
-    cleaned.reserve(nms_out.size());
-    for (size_t i = 0; i < nms_out.size(); ++i)
-      if (!drop[i]) cleaned.push_back(std::move(nms_out[i]));
-    nms_out = std::move(cleaned);
-  }
-
-  // Filter large "image" detections
-  const float img_area = static_cast<float>(orig_w) * orig_h;
-  const float area_thresh = (orig_h > orig_w) ? 0.82f : 0.93f;
-  constexpr int kImageClassId = 14;
-  std::erase_if(nms_out, [&](const LayoutBox &lb) {
-    if (lb.class_id != kImageClassId) return false;
-    float box_area = static_cast<float>(lb.box[2][0] - lb.box[0][0]) *
-                     (lb.box[2][1] - lb.box[0][1]);
-    return box_area > area_thresh * img_area;
-  });
-
-  return nms_out;
+  // 9. Shared NMS + oversized-image drop + LAYOUT_MERGE_MODE reconciliation.
+  return postfilter_layout_boxes(std::move(out), orig_h, orig_w);
 }
 
 } // namespace turbo_ocr::layout

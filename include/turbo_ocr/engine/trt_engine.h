@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <NvInfer.h>
+#include <cuda_runtime.h>
 
 namespace turbo_ocr::engine {
 
@@ -23,7 +24,7 @@ class TrtEngine {
 public:
   /// Construct with path to a serialized TensorRT engine file (.trt).
   explicit TrtEngine(const std::string &model_path);
-  ~TrtEngine() noexcept = default;
+  ~TrtEngine() noexcept;
 
   /// Deserialize and load the engine. Must be called before any inference.
   [[nodiscard]] bool load();
@@ -78,11 +79,48 @@ public:
   // Query a tensor's current shape (reflects last set_input_shape() calls).
   [[nodiscard]] nvinfer1::Dims tensor_shape(const std::string &name) const;
 
+  // ── Baked CUDA graphs ───────────────────────────────────────────────────
+  //
+  // A graph is recorded ONCE at warmup on a dedicated execution context that
+  // is frozen forever after: fixed profile, fixed shape, fixed I/O addresses,
+  // private exactly-sized activation arena. Serving traffic then replays the
+  // graph with one cudaGraphLaunch instead of ~100-300 kernel launches.
+  // Never capture during traffic: a capture interleaved with other enqueues
+  // of the same engine corrupts Myelin state (observed empirically), and
+  // lazily allocated arenas make VRAM unbounded.
+
+  // Opt-in via TURBO_OCR_CUDA_GRAPHS=1 (default off).
+  [[nodiscard]] static bool graphs_enabled();
+
+  // Record a graph for `dims` on optimization profile `profile_idx` with the
+  // given I/O addresses. Returns a slot id for launch_baked(), or -1 (engine
+  // falls back to plain enqueue). Runs two real executions before capture.
+  [[nodiscard]] int bake_graph(int profile_idx, const nvinfer1::Dims &dims,
+                               void *input, void *output, cudaStream_t stream);
+
+  [[nodiscard]] bool launch_baked(int slot, cudaStream_t stream);
+
+  [[nodiscard]] const nvinfer1::Dims &baked_output_dims(int slot) const {
+    return baked_[static_cast<size_t>(slot)].out_dims;
+  }
+
 private:
+  struct BakedGraph {
+    cudaGraphExec_t exec = nullptr;
+    std::unique_ptr<nvinfer1::IExecutionContext> ctx;
+    void *arena = nullptr;
+    nvinfer1::Dims out_dims{};
+  };
+  void destroy_graphs() noexcept;
+
   std::string model_path_;
-  Logger logger_;
-  std::unique_ptr<nvinfer1::IRuntime> runtime_;
-  std::unique_ptr<nvinfer1::ICudaEngine> engine_;
+  // Private engine, deserialized for this instance (see engine_cache.cpp — never
+  // shared across pool workers). The shared_ptr keeps the engine (and the TRT
+  // runtime captured in its deleter) alive for as long as this instance — and its
+  // per-instance contexts/baked graphs — exist.
+  std::shared_ptr<nvinfer1::ICudaEngine> engine_;
+
+  std::vector<BakedGraph> baked_;
 
   // Single-IO legacy (points at input_names_[0] / output_names_[0] when those
   // vectors are non-empty — kept for backward compat with det/rec/cls).

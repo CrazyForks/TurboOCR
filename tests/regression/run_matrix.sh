@@ -62,7 +62,7 @@ trap teardown EXIT INT TERM
 if server_already_up; then
   log "server already responding at ${HEALTH_URL}, reusing it"
 else
-  NATIVE_BIN="${REPO_ROOT}/build/paddle_highspeed_cpp"
+  NATIVE_BIN="${REPO_ROOT}/build/turboocr-server"
   if [[ -x "${NATIVE_BIN}" ]]; then
     log "launching native server: ${NATIVE_BIN}"
     PORT="${HTTP_PORT}" GRPC_PORT="${GRPC_PORT}" \

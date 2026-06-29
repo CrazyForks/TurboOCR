@@ -37,6 +37,44 @@ void cuda_fused_resize_normalize_layout(const GpuImage &src, float *dst_chw,
                                          int dst_w, int dst_h,
                                          cudaStream_t stream = 0);
 
+// Sub-rect overload for cell-det. Resizes the sub-rect (rect_x, rect_y,
+// rect_w, rect_h) of `src` to dst_w × dst_h with `pixel / 255` normalization
+// (mean=0, std=1), BGR CHW. Implementation lives in src/table/kernels/.
+void cuda_fused_resize_normalize_layout(const GpuImage &src,
+                                        int rect_x, int rect_y,
+                                        int rect_w, int rect_h,
+                                        float *dst_chw,
+                                        int dst_w, int dst_h,
+                                        cudaStream_t stream = 0);
+
+// TableCls preprocess: from sub-rect of src GpuImage, resize-short(256) →
+// center-crop(224) → ImageNet normalize → BGR CHW into dst_chw[3*224*224].
+// Implementation in src/table/kernels/table_kernels.cu.
+void cuda_fused_table_cls_pre(const GpuImage &src,
+                              int rect_x, int rect_y,
+                              int rect_w, int rect_h,
+                              float *dst_chw,
+                              cudaStream_t stream = 0);
+
+// SLANeXt preprocess: from sub-rect, ResizeByLong(488) preserve AR →
+// ImageNet normalize → bottom-right pad with PAD_VALUE=(0-mean)/std →
+// BGR CHW into dst_chw[3*488*488].
+// Implementation in src/table/kernels/table_kernels.cu.
+void cuda_fused_slanext_pre(const GpuImage &src,
+                            int rect_x, int rect_y,
+                            int rect_w, int rect_h,
+                            float *dst_chw,
+                            cudaStream_t stream = 0);
+
+// SLANeXt encoder-split preprocess: 488 letterbox, RGB channel order + ImageNet
+// norm + pad 0 in normalized space (matches PaddleOCR DecodeImage img_mode=RGB
+// + PaddingTableImage). For the encoder-split table backend.
+void cuda_fused_slanext_pre_rgb(const GpuImage &src,
+                                int rect_x, int rect_y,
+                                int rect_w, int rect_h,
+                                float *dst_chw,
+                                cudaStream_t stream = 0);
+
 // Batched fused resize + normalize + CHW for detection
 // Processes N images (each with different src dimensions) into a single
 // batched CHW tensor [N, 3, dst_h, dst_w].
@@ -75,8 +113,9 @@ struct GpuDetBox {
   int pixel_count;            // number of foreground pixels in component
 };
 
-// Maximum number of components we track on GPU
-static constexpr int kMaxGpuComponents = 2048;
+// Maximum number of components we track on GPU. Sized to the PP-OCRv6 DB
+// candidate budget (3000) so dense multi-column pages are not truncated.
+static constexpr int kMaxGpuComponents = 3000;
 
 // Run full GPU CCL pipeline: label components, extract bboxes, compute scores.
 // Returns number of valid boxes written to h_boxes (host memory).
@@ -112,12 +151,17 @@ int cuda_gpu_ccl_detect(
 //   d_compact_ids       = CCL compact label map (int32_t, -1=bg, 0..N-1)
 //   d_expand_per_comp   = float[kMaxGpuComponents], per-component expand (px)
 //   d_expanded_labels   = uint32_t output (1..N, 0=bg)
+// d_seeds / d_seeds_alt are packed uint32 seeds (x<<16 | (y&0xFFFF), 0xFFFFFFFF
+// = empty). max_expand is the GLOBAL expand clamp (max over all components);
+// the JFA jump range is bounded to it (bounded JFA), so far passes that would
+// only resolve pixels beyond max_expand — which expand discards anyway — are
+// skipped. Requires w,h <= 65535 (guaranteed by the det resize cap).
 void cuda_jfa_expand_labels(const uint8_t *d_bitmap,
                             const int32_t *d_compact_ids,
                             const float *d_expand_per_comp,
                             uint32_t *d_expanded_labels,
-                            int w, int h,
-                            int2 *d_seeds, int2 *d_seeds_alt,
+                            int w, int h, float max_expand,
+                            uint32_t *d_seeds, uint32_t *d_seeds_alt,
                             cudaStream_t stream);
 
 // Compute per-component expand distance from PRE-filter CCL bboxes.

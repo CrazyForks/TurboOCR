@@ -32,6 +32,15 @@ http {
         proxy_request_buffering off;
         proxy_next_upstream off;
 
+        # Slow-loris mitigation: reap clients that open a connection and then
+        # trickle (or never send) the request header/body or stall reading the
+        # response, instead of pinning an nginx worker for proxy_*_timeout.
+        # 60s matches nginx's own default (so this only adds an explicit floor,
+        # never shrinks a window an existing slow-upload client relied on).
+        client_header_timeout 60s;
+        client_body_timeout 60s;
+        send_timeout 60s;
+
         # JSON error pages for all nginx-generated errors
         error_page 413 =413 @error_413;
         error_page 502 =502 @error_502;
@@ -46,6 +55,11 @@ http {
         location @error_504 {
             return 504 '{"error":"Backend timeout"}';
         }
+
+        # NOTE: /metrics exposes VRAM/topology. Restricting it is the fronting
+        # gateway's job (this server is meant to sit behind one); the bundled
+        # proxy intentionally does not add an allow/deny here so it stays a
+        # drop-in for existing scrapers.
 
         location / {
             proxy_pass http://ocr_backend;

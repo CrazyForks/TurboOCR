@@ -58,6 +58,8 @@ public:
   // PP-DocLayoutV3's decoder emits up to 300 queries per image. Most FUNSD
   // pages produce 10-30 detections after score filtering.
   static constexpr int kMaxDetections = 300;
+  // Batched profile MAX from onnx_to_trt.cpp: {1-4-8, 3, 800, 800}.
+  static constexpr int kMaxBatch = 8;
 
 private:
   std::unique_ptr<engine::TrtEngine> engine_;
@@ -72,9 +74,7 @@ private:
   int pending_orig_w_ = 0;
   cudaStream_t pending_stream_ = nullptr;
 
-  // Device buffers sized for batch=1 inference. If we later want to use the
-  // batch=4/8 profile for /ocr/batch, these get re-allocated to the max
-  // expected batch size (not implemented in v1).
+  // Device buffers sized for batch=1 inference.
   CudaPtr<float>   d_image_;          // [1, 3, 800, 800]
   CudaPtr<float>   d_im_shape_;       // [1, 2]
   CudaPtr<float>   d_scale_factor_;   // [1, 2]

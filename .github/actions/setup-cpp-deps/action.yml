@@ -1,0 +1,79 @@
+name: "Set up C++ build deps"
+description: >-
+  Install the native CPU build dependencies on an Ubuntu runner: apt packages,
+  Drogon (built from source — not packaged) and the ONNX Runtime C++ SDK into a
+  dedicated, cacheable prefix, plus vendored PDFium. Mirrors docker/Dockerfile.cpu
+  so CI and the image agree.
+
+runs:
+  using: "composite"
+  steps:
+    - name: APT packages
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential cmake ninja-build pkg-config \
+          libopencv-dev libwebp-dev libturbojpeg0-dev \
+          libgrpc++-dev libc-ares-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
+          libjsoncpp-dev uuid-dev zlib1g-dev libssl-dev \
+          git wget curl ca-certificates
+
+    # Cache ONLY the dedicated prefix that holds Drogon + ONNX Runtime — never
+    # all of /usr/local (huge, system-polluted, slow to tar). A cache hit
+    # restores the whole prefix intact, so the build steps below can be skipped
+    # safely. Cold build is ~10 min once; subsequent runs restore in seconds.
+    - name: Cache Drogon + ONNX Runtime prefix
+      id: deps-cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/.cpp-deps
+        key: cppdeps-drogon1.9.12-ort1.22.0-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Build + install Drogon v1.9.12 (into prefix)
+      if: steps.deps-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        PREFIX="${{ github.workspace }}/.cpp-deps"
+        cd /tmp
+        git clone --depth 1 --branch v1.9.12 https://github.com/drogonframework/drogon.git
+        cd drogon && git submodule update --init
+        mkdir build && cd build
+        cmake .. -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+                 -DBUILD_EXAMPLES=OFF -DBUILD_CTL=OFF -DBUILD_ORM=OFF \
+                 -DBUILD_POSTGRESQL=OFF -DBUILD_MYSQL=OFF -DBUILD_SQLITE=OFF \
+                 -DBUILD_REDIS=OFF -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release
+        make -j"$(nproc)"
+        make install
+
+    - name: Install ONNX Runtime 1.22.0 x64 (into prefix)
+      if: steps.deps-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        PREFIX="${{ github.workspace }}/.cpp-deps"
+        mkdir -p "$PREFIX/include" "$PREFIX/lib"
+        cd /tmp
+        wget -q "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz" -O ort.tgz
+        echo "8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3  ort.tgz" | sha256sum -c -
+        tar xzf ort.tgz
+        cp -r onnxruntime-linux-x64-1.22.0/include/* "$PREFIX/include/"
+        cp onnxruntime-linux-x64-1.22.0/lib/libonnxruntime.so* "$PREFIX/lib/"
+
+    # Publish the prefix so every later step in the job (and cmake) finds it.
+    - name: Export prefix to environment
+      shell: bash
+      run: |
+        PREFIX="${{ github.workspace }}/.cpp-deps"
+        echo "CMAKE_PREFIX_PATH=$PREFIX${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}" >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+    # PDFium (vendored in third_party/) + fastpdf2png for the pdf_renderer TU.
+    # Vendored copy on amd64 — no network, fast — so run every time (not cached).
+    - name: Install PDFium + fastpdf2png
+      shell: bash
+      run: |
+        TARGETARCH=amd64 bash scripts/install_pdfium.sh
+        sudo cp third_party/pdfium/lib/libpdfium.so /usr/lib/
+        TARGETARCH=amd64 bash scripts/install_fastpdf2png.sh || true
+        sudo cp bin/libpdfium.so /usr/lib/ 2>/dev/null || true
+        sudo ldconfig

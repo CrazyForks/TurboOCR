@@ -19,7 +19,9 @@ using CpuPipelinePool = PipelinePool<CpuOcrPipeline>;
 /// Factory: create, init, warmup CPU pipelines and return a pool.
 [[nodiscard]] inline std::unique_ptr<CpuPipelinePool> make_cpu_pipeline_pool(
     int pool_size, const std::string &det_model, const std::string &rec_model,
-    const std::string &rec_dict, const std::string &cls_model = "") {
+    const std::string &rec_dict, const std::string &cls_model = "",
+    const DetInferConfig &det_cfg = {turbo_ocr::detection::kDetResizeDefault,
+                                     turbo_ocr::detection::kDbDefaults}) {
 
   if (pool_size <= 0) [[unlikely]]
     throw std::invalid_argument(
@@ -28,7 +30,7 @@ using CpuPipelinePool = PipelinePool<CpuOcrPipeline>;
   std::vector<std::unique_ptr<CpuOcrPipeline>> pipelines;
   for (int i = 0; i < pool_size; ++i) {
     auto pipeline = std::make_unique<CpuOcrPipeline>();
-    if (pipeline->init(det_model, rec_model, rec_dict, cls_model)) {
+    if (pipeline->init(det_model, rec_model, rec_dict, cls_model, det_cfg)) {
       pipelines.push_back(std::move(pipeline));
     } else {
       std::cerr << std::format("[Pool] Failed to init CPU pipeline {} of {}", i, pool_size)

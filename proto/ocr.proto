@@ -14,7 +14,8 @@ package ocr;
 //   IMAGE_DECODE_FAILED, DIMENSIONS_TOO_LARGE, EMPTY_BATCH, MISSING_IMAGE,
 //   MISSING_PDF, INVALID_DPI, INVALID_DIMENSIONS, BODY_SIZE_MISMATCH,
 //   PDF_RENDER_FAILED, PDF_NOT_AVAILABLE, EMPTY_PDF, SERVER_BUSY,
-//   INFERENCE_ERROR, NOT_READY.
+//   INFERENCE_ERROR, NOT_READY, TABLE_BACKEND_DISABLED,
+//   FORMULA_BACKEND_DISABLED, STRUCTURED_MODE_NO_STRUCTURE.
 //
 // The legacy grpc::StatusCode + status message remain primary for older
 // clients; "x-error-code" is purely additive. Read it via
@@ -37,6 +38,12 @@ message OCRRequest {
   bool as_blocks = 11;       // emit `blocks` paragraph-level aggregate in json_response
                              // (mirrors PaddleX PP-StructureV3 parsing_res_list).
                              // Auto-enables layout + reading_order.
+  bool tables = 12;          // run table recognition on layout-detected table
+                             // regions (strict opt-in; requires a table backend
+                             // configured at startup). Auto-enables layout.
+  bool formulas = 13;        // run formula recognition on layout-detected formula
+                             // regions (strict opt-in; requires a formula backend).
+                             // Auto-enables layout.
 }
 
 message OCRBatchRequest {
@@ -45,6 +52,8 @@ message OCRBatchRequest {
   bool layout = 3;           // enable layout analysis for all images in batch
   bool reading_order = 4;    // emit reading_order permutation per image (auto-enables layout)
   bool as_blocks = 5;        // emit `blocks` aggregate per image (auto-enables layout + reading_order)
+  bool tables = 6;           // run table recognition (strict opt-in; auto-enables layout)
+  bool formulas = 7;         // run formula recognition (strict opt-in; auto-enables layout)
 }
 
 message BoundingBox {
@@ -59,6 +68,13 @@ message OCRResult {
 }
 
 message OCRResponse {
+  // NOTE: under the default server response mode "json_bytes" the structured
+  // `results` repeated field is intentionally LEFT EMPTY — the full result
+  // (text/confidence/boxes + layout/reading_order/blocks) is carried in
+  // `json_response` instead, byte-identical to the HTTP JSON body. Under
+  // response mode "structured", `results` is populated and `json_response` is
+  // empty. Query the active mode from HealthResponse.response_mode so a client
+  // knows which field to read without inferring it from emptiness.
   repeated OCRResult results = 1;
   int32 num_detections = 2;
   // Fast path: pre-serialized JSON (same as HTTP response).
@@ -71,6 +87,11 @@ message OCRResponse {
   // contents as response.json_response.reading_order — duplicated here
   // for clients that don't parse the JSON fast-path.
   repeated int32 reading_order = 4;
+  // Per-slot failure reason for RecognizeBatch: the error code of a slot that
+  // failed to decode or infer (e.g. "IMAGE_DECODE_FAILED", "IMAGE_TOO_LARGE",
+  // "INFERENCE_TIMEOUT", "INFERENCE_ERROR"); empty on a successful slot.
+  // Mirrors the per-image error the HTTP /ocr/batch route returns.
+  string error = 5;
 }
 
 message OCRBatchResponse {
@@ -84,6 +105,8 @@ message OCRPDFRequest {
   int32 dpi = 3;          // render DPI (default 100)
   bool layout = 4;
   bool as_blocks = 5;     // emit `blocks` aggregate per page (auto-enables layout)
+  bool tables = 6;        // run table recognition (strict opt-in; auto-enables layout)
+  bool formulas = 7;      // run formula recognition (strict opt-in; auto-enables layout)
 }
 
 message OCRPDFResponse {
@@ -105,4 +128,11 @@ message HealthRequest {}
 
 message HealthResponse {
   string status = 1;
+  // Active server response mode for OCRResponse / OCRPageResult, so a client
+  // can discover at runtime which field carries the result. One of:
+  //   "json_bytes"  — read `json_response` (default); `results` is empty.
+  //   "structured"  — read the repeated `results`; `json_response` is empty.
+  // Additive (field 2): older clients that ignore it are unaffected, and the
+  // value is purely informational — it does not change any other output.
+  string response_mode = 2;
 }

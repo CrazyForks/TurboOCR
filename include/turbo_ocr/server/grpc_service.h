@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstring>
 #include <format>
 #include <future>
@@ -10,6 +11,7 @@
 
 #include <grpcpp/grpcpp.h>
 #include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 
 #include "turbo_ocr/common/box.h"
@@ -20,6 +22,7 @@
 #include "turbo_ocr/decode/image_config.h"
 #include "turbo_ocr/decode/image_dims.h"
 #include "turbo_ocr/server/env_utils.h"
+#include "turbo_ocr/server/error_codes.h"
 #include "turbo_ocr/server/grpc_response_mode.h"
 #include "turbo_ocr/server/server_config.h"
 #include "turbo_ocr/decode/fast_png_decoder.h"
@@ -27,8 +30,10 @@
 #include "turbo_ocr/decode/nvjpeg_decoder.h"
 #include "turbo_ocr/pipeline/pipeline_dispatcher.h"
 #endif
+#include "turbo_ocr/pipeline/pdf_job.h"
 #include "turbo_ocr/pipeline/pipeline_result.h"
 #include "turbo_ocr/layout/layout_types.h"
+#include "turbo_ocr/layout/reading_order.h"
 #include "turbo_ocr/pdf/pdf_extraction_mode.h"
 #include "turbo_ocr/pdf/pdf_text_layer.h"
 #include "turbo_ocr/render/pdf_renderer.h"
@@ -49,28 +54,73 @@ grpc_error(grpc::ServerContext *ctx, grpc::StatusCode code,
   return grpc::Status(code, std::move(message));
 }
 
+// Same as grpc_error but sources the wire string + gRPC status from the shared
+// error_codes.h table, so the code/status pairing can't drift from HTTP. Used
+// for codes that have no hand-written literal at the call site (e.g. the C4
+// inference-timeout -> DEADLINE_EXCEEDED mapping).
+[[nodiscard]] inline grpc::Status
+grpc_error(grpc::ServerContext *ctx, ErrorCode code, std::string message) {
+  std::string_view name = error_code_str(code);
+  if (ctx) ctx->AddTrailingMetadata("x-error-code", std::string(name));
+  return grpc::Status(error_grpc_status(code), std::move(message));
+}
+
 // Mirror parse_query_options() in server_types.h: when the client asks for
 // layout-derived output but the server was started without the layout
-// model, HTTP rejects the request with INVALID_PARAMETER (`?layout=1`) or
-// LAYOUT_DISABLED (`?reading_order=1`). gRPC used to silently zero those
-// flags, leaving callers wondering why they got a y/x fallback they did
-// not ask for. Returns nullopt on success.
+// model, HTTP rejects the request with LAYOUT_DISABLED (the one stable
+// code for the condition, whichever flag triggered it). gRPC used to
+// silently zero those flags, leaving callers wondering why they got a
+// y/x fallback they did not ask for. Returns nullopt on success.
 [[nodiscard]] inline std::optional<grpc::Status>
 grpc_check_layout_request(grpc::ServerContext *ctx, bool req_layout,
                            bool req_reading_order, bool layout_available) {
   if (req_layout && !layout_available) {
+    // LAYOUT_DISABLED for every "layout feature unavailable" rejection —
+    // one stable code per condition, matching the HTTP routes and the
+    // reading_order case below.
     return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
-                      "INVALID_PARAMETER",
+                      "LAYOUT_DISABLED",
                       "Layout requested but the layout model is not loaded. "
                       "Either models/layout/layout.onnx is missing from the "
                       "image, or the server was started with DISABLE_LAYOUT=1.");
   }
   if (req_reading_order && !layout_available) {
+    // `req_reading_order` here folds in reading_order/as_blocks/tables/formulas
+    // — every layout-derived feature — so keep the message generic.
     return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
                       "LAYOUT_DISABLED",
-                      "reading_order=1 requires the layout model: start the "
-                      "server without DISABLE_LAYOUT=1 (layout is on by default)");
+                      "reading_order/as_blocks/tables/formulas require the "
+                      "layout model: start the server without DISABLE_LAYOUT=1 "
+                      "(layout is on by default)");
   }
+  return std::nullopt;
+}
+
+// Fail loud over gRPC when the client opts into a structure stage the server
+// can't do (parity with the HTTP check_structure_backends).
+[[nodiscard]] inline std::optional<grpc::Status>
+grpc_check_structure_backends(grpc::ServerContext *ctx, bool want_tables,
+                              bool want_formulas, bool table_available,
+                              bool formula_available,
+                              bool json_bytes_mode) {
+  // Structured response mode carries only `results` (the proto has no
+  // table/formula message). Running the stage then dropping it is a silent
+  // failure — reject loudly so a structured-mode client knows to use json_bytes.
+  if ((want_tables || want_formulas) && !json_bytes_mode)
+    return grpc_error(ctx, grpc::StatusCode::UNIMPLEMENTED,
+                      "STRUCTURED_MODE_NO_STRUCTURE",
+                      "tables/formulas require the json_bytes gRPC response mode "
+                      "(structured mode returns only text results)");
+  if (want_tables && !table_available)
+    return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+                      "TABLE_BACKEND_DISABLED",
+                      "tables=1 requested but no table backend is configured "
+                      "(start the server with TABLE_BACKEND=...)");
+  if (want_formulas && !formula_available)
+    return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+                      "FORMULA_BACKEND_DISABLED",
+                      "formulas=1 requested but no formula backend is configured "
+                      "(start the server with FORMULA_BACKEND=...)");
   return std::nullopt;
 }
 
@@ -89,6 +139,12 @@ grpc_pre_decode_dim_check(grpc::ServerContext *ctx,
           "DIMENSIONS_TOO_LARGE",
           std::format("Image dimensions {}x{} exceed maximum of {}x{}",
                       d->width, d->height, cap, cap));
+    }
+    if (decode::exceeds_pixel_cap(d->width, d->height)) {
+      return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+          "PIXELS_TOO_LARGE",
+          std::format("Image area {}x{} exceeds maximum of {} pixels",
+                      d->width, d->height, decode::max_image_pixels()));
     }
   }
   return std::nullopt;
@@ -115,17 +171,30 @@ inline cv::Mat grpc_decode_image(std::string_view image_data) {
 inline std::future<pipeline::OcrPipelineResult>
 grpc_jpeg_decode_and_infer(pipeline::PipelineDispatcher &dispatcher,
                            std::string_view image_bytes,
-                           bool want_layout, bool want_reading_order) {
+                           bool want_layout, bool want_reading_order,
+                           bool want_tables = false, bool want_formulas = false) {
   std::string owned(image_bytes);
   return dispatcher.submit(
-      [owned = std::move(owned), want_layout, want_reading_order](
+      [owned = std::move(owned), want_layout, want_reading_order,
+       want_tables, want_formulas](
           auto &e) -> pipeline::OcrPipelineResult {
         const auto *d =
             reinterpret_cast<const unsigned char *>(owned.data());
         size_t n = owned.size();
+        const int cap = decode::max_image_dim();
         auto &nvjpeg = e.get_nvjpeg();
         if (nvjpeg.available()) {
           auto [w, h] = nvjpeg.get_dimensions(d, n);
+          // Bomb guard for JPEGs the caller's pre-decode sniff couldn't
+          // parse: reject (per-side AND total area) before allocating GPU
+          // memory for them.
+          if (w > cap || h > cap)
+            throw turbo_ocr::ImageTooLargeError(std::format(
+                "Image dimensions {}x{} exceed maximum of {}x{}", w, h, cap, cap));
+          if (decode::exceeds_pixel_cap(w, h))
+            throw turbo_ocr::ImageTooLargeError(std::format(
+                "Image area {}x{} exceeds maximum of {} pixels", w, h,
+                decode::max_image_pixels()));
           if (w > 0 && h > 0) {
             auto [d_buf, pitch] = e.pipeline->ensure_gpu_buf(h, w);
             if (nvjpeg.decode_to_gpu(d, n, d_buf, pitch, w, h, e.stream)) {
@@ -133,8 +202,14 @@ grpc_jpeg_decode_and_infer(pipeline::PipelineDispatcher &dispatcher,
                   .data = d_buf, .step = pitch, .rows = h, .cols = w};
               try {
                 return e.pipeline->run_with_layout(
-                    gi, e.stream, want_layout, want_reading_order);
-              } catch (const std::exception &) {}
+                    gi, e.stream, want_layout, want_reading_order, /*routing=*/{},
+                    /*defer_external=*/false, want_tables, want_formulas);
+              } catch (const std::exception &) {
+                // Best-effort GPU zero-copy fast path: if inference on the
+                // nvJPEG-decoded GPU buffer fails, fall through to the CPU
+                // decode + retry below (which re-runs run_with_layout and
+                // surfaces a genuine error there) rather than failing here.
+              }
             }
           }
         }
@@ -147,8 +222,20 @@ grpc_jpeg_decode_and_infer(pipeline::PipelineDispatcher &dispatcher,
         }
         if (img.empty())
           throw turbo_ocr::ImageDecodeError("Failed to decode JPEG");
+        // CPU-fallback / nvjpeg-unavailable bomb guard: re-check the decoded
+        // size, since get_dimensions={0,0} and the 64KB sniff can both miss.
+        if (img.cols > cap || img.rows > cap)
+          throw turbo_ocr::ImageTooLargeError(std::format(
+              "Image dimensions {}x{} exceed maximum of {}x{}",
+              img.cols, img.rows, cap, cap));
+        if (decode::exceeds_pixel_cap(img.cols, img.rows))
+          throw turbo_ocr::ImageTooLargeError(std::format(
+              "Image area {}x{} exceeds maximum of {} pixels",
+              img.cols, img.rows, decode::max_image_pixels()));
         return e.pipeline->run_with_layout(img, e.stream, want_layout,
-                                           want_reading_order);
+                                           want_reading_order, /*routing=*/{},
+                                           /*defer_external=*/false,
+                                           want_tables, want_formulas);
       });
 }
 #endif
@@ -166,7 +253,10 @@ public:
         default_pdf_mode_(cfg.default_pdf_mode),
         layout_available_(layout_available),
         grpc_batch_workers_(cfg.grpc_batch_workers),
-        max_pdf_pages_(cfg.max_pdf_pages) {}
+        max_pdf_pages_(cfg.max_pdf_pages),
+        max_batch_images_(cfg.max_batch_images),
+        default_pdf_dpi_(100),
+        request_timeout_ms_(cfg.request_timeout_ms) {}
 #endif
 
   /// CPU-friendly constructor: takes an InferFunc instead of a dispatcher.
@@ -180,23 +270,43 @@ public:
         default_pdf_mode_(cfg.default_pdf_mode),
         layout_available_(layout_available),
         grpc_batch_workers_(cfg.grpc_batch_workers),
-        max_pdf_pages_(cfg.max_pdf_pages) {}
+        max_pdf_pages_(cfg.max_pdf_pages),
+        max_batch_images_(cfg.max_batch_images),
+        default_pdf_dpi_(100),
+        request_timeout_ms_(cfg.request_timeout_ms) {}
 
-  /// Set the readiness probe used by Health(). Same signature as the
-  /// HTTP /health/ready check; called once per Health RPC. nullptr
-  /// (default) means "always ready".
+  /// Set the readiness probe used by Health(). Called once per Health RPC on
+  /// the gRPC CQ poller thread, so it MUST be cheap and non-blocking — the GPU
+  /// server passes a CACHE-ONLY view of the HTTP /health/ready verdict (it
+  /// never runs a fresh GPU pass here). nullptr (default) means "always ready".
   void set_readiness_check(std::function<bool()> check) {
     readiness_check_ = std::move(check);
+  }
+
+  /// Advertise which structure backends are configured so the RPCs can fail
+  /// loud (TABLE_BACKEND_DISABLED / FORMULA_BACKEND_DISABLED) when a client
+  /// asks for tables/formulas this server can't produce. Default: both false.
+  void set_structure_availability(bool table_available, bool formula_available) {
+    table_available_ = table_available;
+    formula_available_ = formula_available;
   }
 
   // ---- Health ----
   grpc::Status Health(grpc::ServerContext *ctx,
                       const ocr::HealthRequest *,
                       ocr::HealthResponse *response) override {
-    // Mirror HTTP /health/ready: probe the underlying pipeline so k8s
-    // gRPC liveness/readiness probes can actually fail when the
-    // dispatcher is wedged. Without the check, Health() always
-    // succeeded — a pod with a corrupt engine would stay in service.
+    // Readiness view of the pipeline, so a wedged/corrupt-engine pod fails its
+    // k8s gRPC readiness probe. readiness_check_ MUST be cache-only on the GPU
+    // path (set in main.cpp): running the GPU probe inline here would stall the
+    // CQ poller thread and every RPC queued behind it (H2). Liveness stays
+    // GPU-free — a process that answers this RPC at all is live, and a busy GPU
+    // cannot block this call to flap the process out of service (M2).
+    // H7: surface the active response mode so a client can discover whether to
+    // read OCRResponse.json_response (json_bytes) or .results (structured)
+    // without inferring it from an empty field. Additive; default unchanged.
+    response->set_response_mode(mode_ == GrpcResponseMode::json_bytes
+                                    ? "json_bytes"
+                                    : "structured");
     if (readiness_check_ && !readiness_check_()) {
       response->set_status("not_ready");
       return grpc_error(ctx, grpc::StatusCode::UNAVAILABLE,
@@ -211,17 +321,24 @@ public:
                          const ocr::OCRRequest *request,
                          ocr::OCRResponse *response) override {
     if (auto err = grpc_check_layout_request(ctx, request->layout(),
-            request->reading_order() || request->as_blocks(),
+            request->reading_order() || request->as_blocks() ||
+            request->tables() || request->formulas(),
             layout_available_); err)
       return *err;
     bool want_layout = request->layout();
     bool want_reading_order = request->reading_order();
     const bool want_blocks = request->as_blocks();
+    const bool want_tables = request->tables();
+    const bool want_formulas = request->formulas();
     if (want_blocks) {
       want_reading_order = true;
       want_layout = true;
     }
-    if (want_reading_order) want_layout = true;
+    if (want_reading_order || want_tables || want_formulas) want_layout = true;
+    if (auto err = grpc_check_structure_backends(ctx, want_tables, want_formulas,
+            table_available_, formula_available_,
+            mode_ == GrpcResponseMode::json_bytes); err)
+      return *err;
 
     // Pixels path: raw BGR pixel data
     if (!request->pixels().empty()) {
@@ -241,6 +358,11 @@ public:
             "DIMENSIONS_TOO_LARGE",
             std::format("Dimensions {}x{} exceed maximum of {}x{}",
                         width, height, cap, cap));
+      if (decode::exceeds_pixel_cap(width, height))
+        return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+            "PIXELS_TOO_LARGE",
+            std::format("Image area {}x{} exceeds maximum of {} pixels",
+                        width, height, decode::max_image_pixels()));
 
       size_t expected = static_cast<size_t>(width) * height * channels;
       if (request->pixels().size() != expected)
@@ -257,14 +379,27 @@ public:
       cv::Mat img = cv::Mat(height, width, channels == 3 ? CV_8UC3 : CV_8UC1,
                             const_cast<char *>(request->pixels().data()))
                         .clone();
+      // The pipeline is BGR-only; a 1-channel Mat trips the degenerate-input
+      // guard and returns empty. Expand grayscale up front, matching the
+      // HTTP /ocr/pixels handler.
+      if (channels == 1)
+        cv::cvtColor(img, img, cv::COLOR_GRAY2BGR);
 
       try {
-        auto out = run_infer(img, want_layout, want_reading_order);
-        fill_response(response, out.results, out.layout, out.reading_order, want_blocks);
+        auto out = run_infer(img, want_layout, want_reading_order,
+                             want_tables, want_formulas);
+        fill_response(response, out, want_blocks);
         return grpc::Status::OK;
       } catch (const turbo_ocr::PoolExhaustedError &e) {
         return grpc_error(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED,
                           "SERVER_BUSY", e.what());
+#ifndef USE_CPU_ONLY
+        // TimeoutError only exists on the GPU dispatcher path; the CPU
+        // InferFunc is synchronous and never throws it (and the type isn't
+        // even declared in that build), so the catch is GPU-only.
+      } catch (const turbo_ocr::TimeoutError &e) {
+        return grpc_error(ctx, ErrorCode::kInferenceTimeout, e.what());
+#endif
       } catch (const std::exception &e) {
         std::cerr << std::format("[gRPC] Pixels inference error: {}\n", e.what());
         return grpc_error(ctx, grpc::StatusCode::INTERNAL,
@@ -288,18 +423,26 @@ public:
       if (dispatcher_ &&
           decode::NvJpegDecoder::is_jpeg(bytes, blen)) {
         try {
-          auto out = grpc_jpeg_decode_and_infer(*dispatcher_, request->image(),
+          // grpc_jpeg_decode_and_infer's lambda owns its bytes by value, so a
+          // timed-out future is safe to abandon (C4).
+          auto fut = grpc_jpeg_decode_and_infer(*dispatcher_, request->image(),
                                                  want_layout,
-                                                 want_reading_order).get();
-          fill_response(response, out.results, out.layout, out.reading_order,
-                        want_blocks);
+                                                 want_reading_order,
+                                                 want_tables, want_formulas);
+          auto out = pipeline::get_with_timeout(fut, request_timeout_ms_);
+          fill_response(response, out, want_blocks);
           return grpc::Status::OK;
+        } catch (const turbo_ocr::ImageTooLargeError &e) {
+          return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+                            "DIMENSIONS_TOO_LARGE", e.what());
         } catch (const turbo_ocr::ImageDecodeError &) {
           return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
                             "IMAGE_DECODE_FAILED", "Decode failed");
         } catch (const turbo_ocr::PoolExhaustedError &e) {
           return grpc_error(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED,
                             "SERVER_BUSY", e.what());
+        } catch (const turbo_ocr::TimeoutError &e) {
+          return grpc_error(ctx, ErrorCode::kInferenceTimeout, e.what());
         } catch (const std::exception &e) {
           std::cerr << std::format("[gRPC] JPEG infer error: {}\n", e.what());
           return grpc_error(ctx, grpc::StatusCode::INTERNAL,
@@ -323,15 +466,25 @@ public:
             "DIMENSIONS_TOO_LARGE",
             std::format("Image dimensions {}x{} exceed maximum of {}x{}",
                         img.cols, img.rows, cap, cap));
+      if (decode::exceeds_pixel_cap(img.cols, img.rows))
+        return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+            "PIXELS_TOO_LARGE",
+            std::format("Image area {}x{} exceeds maximum of {} pixels",
+                        img.cols, img.rows, decode::max_image_pixels()));
     }
 
     try {
-      auto out = run_infer(img, want_layout, want_reading_order);
-      fill_response(response, out.results, out.layout, out.reading_order, want_blocks);
+      auto out = run_infer(img, want_layout, want_reading_order,
+                           want_tables, want_formulas);
+      fill_response(response, out, want_blocks);
       return grpc::Status::OK;
     } catch (const turbo_ocr::PoolExhaustedError &e) {
       return grpc_error(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED,
                         "SERVER_BUSY", e.what());
+#ifndef USE_CPU_ONLY
+    } catch (const turbo_ocr::TimeoutError &e) {  // GPU-only type (see above)
+      return grpc_error(ctx, ErrorCode::kInferenceTimeout, e.what());
+#endif
     } catch (const std::exception &e) {
       std::cerr << std::format("[gRPC] Inference error: {}\n", e.what());
       return grpc_error(ctx, grpc::StatusCode::INTERNAL,
@@ -351,24 +504,63 @@ public:
     if (n == 0)
       return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
                         "EMPTY_BATCH", "Empty images array");
+    // Cap before the O(n) per-slot vectors + n response sub-messages below —
+    // an unbounded repeated images field is a memory-amplification OOM lever.
+    if (n > max_batch_images_)
+      return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT, "BATCH_TOO_LARGE",
+          std::format("images has {} entries, max is {}", n, max_batch_images_));
 
     if (auto err = grpc_check_layout_request(ctx, request->layout(),
-            request->reading_order() || request->as_blocks(),
+            request->reading_order() || request->as_blocks() ||
+            request->tables() || request->formulas(),
             layout_available_); err)
       return *err;
     bool want_layout = request->layout();
     bool want_reading_order = request->reading_order();
     const bool want_blocks = request->as_blocks();
+    const bool want_tables = request->tables();
+    const bool want_formulas = request->formulas();
     if (want_blocks) {
       want_reading_order = true;
       want_layout = true;
     }
-    if (want_reading_order) want_layout = true;
+    if (want_reading_order || want_tables || want_formulas) want_layout = true;
+    if (auto err = grpc_check_structure_backends(ctx, want_tables, want_formulas,
+            table_available_, formula_available_,
+            mode_ == GrpcResponseMode::json_bytes); err)
+      return *err;
 
-    // Pre-decode dim sniff on every item — refuses bombs before any decode.
+    // Per-slot oversize handling: an oversized image is dropped to an empty
+    // slot (0 detections), NOT a whole-RPC abort — one decompression-bomb in
+    // a batch must not deny service to every co-batched valid image. Mirrors
+    // the per-slot contract of HTTP /ocr/batch and of this handler's own
+    // decode-failure path. Pre-decode header sniff refuses bombs before any
+    // decode cost.
+    const int dim_cap = decode::max_image_dim();
+    // Aggregate decoded-pixel budget: the per-image caps below bound a single
+    // slot, but every non-JPEG slot is decoded up front and held alive at once,
+    // so a batch of highly-compressible bomb PNGs can still OOM the host. Tag
+    // sniffable slots once the running sum would exceed the budget so they are
+    // never decoded. Mirrors batch_check_dims_pre on the HTTP /ocr/batch routes
+    // (image_routes.cpp / cpu_main.cpp), keeping all three batch surfaces in
+    // lockstep.
+    int64_t cumulative_pixels = 0;
+    const int64_t batch_pixel_budget = decode::max_batch_pixels();
+    std::vector<bool> too_large(n, false);
     for (int i = 0; i < n; ++i) {
-      if (auto err = grpc_pre_decode_dim_check(ctx, request->images(i)); err)
-        return *err;
+      auto *p = reinterpret_cast<const unsigned char *>(request->images(i).data());
+      if (auto d = decode::peek_image_dimensions(p, request->images(i).size())) {
+        if (d->width > dim_cap || d->height > dim_cap ||
+            decode::exceeds_pixel_cap(d->width, d->height)) {
+          too_large[i] = true;
+        } else {
+          const int64_t pix = static_cast<int64_t>(d->width) * d->height;
+          if (cumulative_pixels + pix > batch_pixel_budget)
+            too_large[i] = true;
+          else
+            cumulative_pixels += pix;
+        }
+      }
     }
 
     // JPEGs decode inside the dispatcher lambda (see grpc_jpeg_decode_and_infer);
@@ -376,6 +568,7 @@ public:
     std::vector<cv::Mat> imgs(n);
     std::vector<bool> is_jpeg(n, false);
     for (int i = 0; i < n; ++i) {
+      if (too_large[i]) continue;
       const auto &bytes = request->images(i);
       const auto *p = reinterpret_cast<const unsigned char *>(bytes.data());
 #ifndef USE_CPU_ONLY
@@ -387,29 +580,35 @@ public:
       imgs[i] = grpc_decode_image(bytes);
     }
 
-    // Post-decode safety net for formats we didn't sniff (BMP/TIFF/WebP).
-    {
-      const int cap = decode::max_image_dim();
-      for (int i = 0; i < n; ++i) {
-        if (imgs[i].empty()) continue;
-        if (imgs[i].cols > cap || imgs[i].rows > cap)
-          return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
-              "DIMENSIONS_TOO_LARGE",
-              std::format("Image {} dimensions {}x{} exceed maximum of {}x{}",
-                          i, imgs[i].cols, imgs[i].rows, cap, cap));
+    // Post-decode safety net for residual formats we don't sniff (BMP/PNM).
+    for (int i = 0; i < n; ++i) {
+      if (imgs[i].empty()) continue;
+      if (imgs[i].cols > dim_cap || imgs[i].rows > dim_cap ||
+          decode::exceeds_pixel_cap(imgs[i].cols, imgs[i].rows)) {
+        too_large[i] = true;
+        imgs[i].release();  // drop to empty slot
       }
     }
 
     // Check we have at least one valid candidate. JPEGs are still encoded
     // bytes at this point — we trust the pre-decode dim sniff and decode
-    // failures will surface per-slot below.
-    bool any_valid = false;
+    // failures will surface per-slot below. A mixed batch proceeds (oversized
+    // slots emit empty results via mark_empty_slot). Only an all-invalid
+    // batch aborts — and then the code reflects WHY: if any slot was
+    // oversized, report DIMENSIONS_TOO_LARGE (matching single Recognize)
+    // rather than the misleading IMAGE_DECODE_FAILED.
+    bool any_valid = false, any_too_large = false;
     for (int i = 0; i < n; ++i) {
       if (is_jpeg[i] || !imgs[i].empty()) { any_valid = true; break; }
+      if (too_large[i]) any_too_large = true;
     }
     if (!any_valid)
-      return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
-                        "IMAGE_DECODE_FAILED", "No valid images");
+      return any_too_large
+          ? grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+                       "DIMENSIONS_TOO_LARGE",
+                       "All images exceed the maximum dimension")
+          : grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+                       "IMAGE_DECODE_FAILED", "No valid images");
 
     // RepeatedPtrField is not thread-safe for concurrent add_*, so pre-allocate.
     response->set_total_images(n);
@@ -417,7 +616,8 @@ public:
     entries.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
       auto *e = response->add_batch_results();
-      if (!is_jpeg[i] && imgs[i].empty()) e->set_num_detections(0);
+      if (!is_jpeg[i] && imgs[i].empty())
+        mark_empty_slot(e, too_large[i] ? "IMAGE_TOO_LARGE" : "IMAGE_DECODE_FAILED");
       entries.push_back(e);
     }
 
@@ -429,14 +629,16 @@ public:
           if (is_jpeg[i]) {
             futs[i] = grpc_jpeg_decode_and_infer(
                 *dispatcher_, request->images(i), want_layout,
-                want_reading_order);
+                want_reading_order, want_tables, want_formulas);
           } else if (!imgs[i].empty()) {
             cv::Mat img_owned = std::move(imgs[i]);
             futs[i] = dispatcher_->submit(
                 [img_owned = std::move(img_owned), want_layout,
-                 want_reading_order](auto &e) {
+                 want_reading_order, want_tables, want_formulas](auto &e) {
                   return e.pipeline->run_with_layout(
-                      img_owned, e.stream, want_layout, want_reading_order);
+                      img_owned, e.stream, want_layout, want_reading_order,
+                      /*routing=*/{}, /*defer_external=*/false,
+                      want_tables, want_formulas);
                 });
           }
         } catch (const turbo_ocr::PoolExhaustedError &e) {
@@ -444,18 +646,48 @@ public:
                             "SERVER_BUSY", e.what());
         }
       }
+      // Single overall deadline for the whole batch (C4): the slots run
+      // concurrently on the dispatcher, so the per-request window applies to
+      // the batch as a whole, not to each slot in turn (otherwise a wedged GPU
+      // could block up to n * request_timeout_ms). Each .get() waits only the
+      // time remaining until that one deadline. timeout<=0 means disabled, so
+      // block (matches submit_for_default's disabled path).
+      const bool batch_deadline_on = request_timeout_ms_ > 0;
+      const auto batch_deadline =
+          std::chrono::steady_clock::now() +
+          std::chrono::milliseconds(batch_deadline_on ? request_timeout_ms_ : 0);
       for (int i = 0; i < n; ++i) {
         if (!futs[i].valid()) continue;
         try {
-          auto out = futs[i].get();
-          fill_response(entries[i], out.results, out.layout,
-                        out.reading_order, want_blocks);
+          // A wedged slot is abandoned and tagged empty rather than hanging the
+          // whole batch RPC. The submit lambdas above own their inputs by
+          // value, so an abandoned future is safe. TimeoutError derives from
+          // std::exception, so the per-slot catch below marks it empty.
+          pipeline::OcrPipelineResult out;
+          if (batch_deadline_on) {
+            long remaining_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    batch_deadline - std::chrono::steady_clock::now())
+                    .count();
+            if (remaining_ms <= 0) {
+              // Batch deadline already elapsed (an earlier slot consumed the
+              // window): abandon this slot empty. Must NOT call
+              // get_with_timeout(fut, 0) — 0 means "disabled" there and would
+              // block on future.get() forever, hanging the whole RPC.
+              mark_empty_slot(entries[i], "INFERENCE_TIMEOUT");
+              continue;
+            }
+            out = pipeline::get_with_timeout(futs[i], remaining_ms);
+          } else {
+            out = futs[i].get();
+          }
+          fill_response(entries[i], out, want_blocks);
         } catch (const std::exception &e) {
           std::cerr << std::format("[gRPC Batch] Image {} error: {}\n",
                                    i, e.what());
-          entries[i]->set_num_detections(0);
+          mark_empty_slot(entries[i], "INFERENCE_ERROR");
         } catch (...) {
-          entries[i]->set_num_detections(0);
+          mark_empty_slot(entries[i], "INFERENCE_ERROR");
         }
       }
       return grpc::Status::OK;
@@ -476,15 +708,15 @@ public:
             if (i >= n) break;
             if (imgs[i].empty()) continue;
             try {
-              auto out = run_infer(imgs[i], want_layout, want_reading_order);
-              fill_response(entries[i], out.results, out.layout,
-                            out.reading_order, want_blocks);
+              auto out = run_infer(imgs[i], want_layout, want_reading_order,
+                                   want_tables, want_formulas);
+              fill_response(entries[i], out, want_blocks);
             } catch (const std::exception &e) {
               std::cerr << std::format("[gRPC Batch] Image {} error: {}\n",
                                        i, e.what());
-              entries[i]->set_num_detections(0);
+              mark_empty_slot(entries[i], "INFERENCE_ERROR");
             } catch (...) {
-              entries[i]->set_num_detections(0);
+              mark_empty_slot(entries[i], "INFERENCE_ERROR");
             }
           }
         });
@@ -507,7 +739,8 @@ public:
                         "MISSING_PDF", "Empty PDF data");
 
     if (auto err = grpc_check_layout_request(ctx, request->layout(),
-            /*reading_order=*/request->as_blocks(),
+            /*reading_order=*/request->as_blocks() ||
+            request->tables() || request->formulas(),
             layout_available_); err)
       return *err;
 
@@ -517,293 +750,128 @@ public:
     bool want_layout = request->layout();
     const bool want_blocks = request->as_blocks();
     const bool want_reading_order = want_blocks;
-    if (want_blocks) want_layout = true;
+    const bool want_tables = request->tables();
+    const bool want_formulas = request->formulas();
+    if (want_blocks || want_tables || want_formulas) want_layout = true;
+    if (auto err = grpc_check_structure_backends(ctx, want_tables, want_formulas,
+            table_available_, formula_available_,
+            mode_ == GrpcResponseMode::json_bytes); err)
+      return *err;
 
     int dpi = request->dpi();
-    if (dpi == 0) dpi = 100;
-    if (dpi < 50 || dpi > 600)
-      return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
-                        "INVALID_DPI", "DPI must be between 50 and 600");
+    if (dpi == 0) dpi = default_pdf_dpi_;
+    if (dpi < pipeline::kMinPdfDpi || dpi > pipeline::kMaxPdfDpi)
+      return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT, "INVALID_DPI",
+                        std::format("DPI must be between {} and {}",
+                                    pipeline::kMinPdfDpi, pipeline::kMaxPdfDpi));
 
     pdf::PdfMode req_mode = default_pdf_mode_;
     if (!request->mode().empty())
       req_mode = pdf::parse_pdf_mode(request->mode(), default_pdf_mode_);
 
     // MAX_PDF_PAGES guard — same env var and limit as HTTP /ocr/pdf
-    // (default 2000). Open the doc once for the page count, then reuse
-    // it for the text-layer pre-pass when the mode requires it.
-    auto probe = std::make_unique<pdf::PdfDocument>(pdf_data, pdf_len);
-    if (probe->ok()) {
-      const int np_check = probe->page_count();
-      const int limit = max_pdf_pages_;
-      if (np_check > limit) {
+    // (default 2000). Mirror the route's reject_if_too_many_pages: open the
+    // doc once just for the page count.
+    {
+      pdf::PdfDocument probe(pdf_data, pdf_len);
+      if (probe.ok() && probe.page_count() > max_pdf_pages_)
         return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
             "PDF_TOO_LARGE",
             std::format("PDF has {} pages, maximum is {} "
                         "(set MAX_PDF_PAGES to increase)",
-                        np_check, limit));
-      }
+                        probe.page_count(), max_pdf_pages_));
     }
 
-    // Open PDF for text-layer modes
-    std::unique_ptr<pdf::PdfDocument> pdf_doc;
-    std::vector<pdf::PdfPageText> page_text_cache;
-    if (req_mode != pdf::PdfMode::Ocr) {
-      pdf_doc = std::make_unique<pdf::PdfDocument>(pdf_data, pdf_len);
-      if (!pdf_doc->ok()) {
-        std::cerr << "[gRPC PDF] failed to open PDF for text-layer lookup; "
-                     "falling back to mode=ocr\n";
-        req_mode = pdf::PdfMode::Ocr;
-        pdf_doc.reset();
-      } else {
-        int np = pdf_doc->page_count();
-        page_text_cache.reserve(static_cast<size_t>(std::max(0, np)));
-        for (int p = 0; p < np; ++p)
-          page_text_cache.push_back(pdf_doc->extract_page(p));
+    // Transport-agnostic orchestrator (H9 + H3): the shared run_pdf_job runs
+    // the exact same per-page pipeline the HTTP /ocr/pdf route runs, submitting
+    // page work DIRECTLY onto the bounded dispatcher (no per-page std::async /
+    // counting_semaphore). gRPC's PDF surface is text-only: it never requests
+    // autorotate or inline page images, so those options stay default-off and
+    // the serialised output matches today's byte-for-byte.
+    pipeline::PdfJobOptions job_opts;
+    job_opts.dpi = dpi;
+    job_opts.mode = req_mode;
+    job_opts.want_layout = want_layout;
+    job_opts.want_reading_order = want_reading_order;
+    job_opts.want_blocks = want_blocks;
+    job_opts.want_tables = want_tables;
+    job_opts.want_formulas = want_formulas;
+    // Bound the GPU per-page future join with the configured request deadline so
+    // a wedged page can't hang the RPC (no-op on the sequential CPU overload).
+    job_opts.request_timeout_ms = request_timeout_ms_;
+
+    pipeline::PdfJobResult job;
+    try {
+#ifndef USE_CPU_ONLY
+      if (dispatcher_) {
+        job = pipeline::run_pdf_job(*dispatcher_, *pdf_renderer_, pdf_data,
+                                    pdf_len, job_opts);
+      } else
+#endif
+      {
+        // CPU build: AutoVerified is GPU-only, alias to Auto (parity with the
+        // CPU HTTP route). No orientation backend here (gRPC has no autorotate).
+        if (job_opts.mode == pdf::PdfMode::AutoVerified)
+          job_opts.mode = pdf::PdfMode::Auto;
+        job = pipeline::run_pdf_job(
+            [this](const cv::Mat &img, const InferOptions &o) {
+              auto r = run_infer(img, o.want_layout, o.want_reading_order,
+                                 o.want_tables, o.want_formulas);
+              return InferResult{
+                  .results          = std::move(r.results),
+                  .layout           = std::move(r.layout),
+                  .reading_order    = std::move(r.reading_order),
+                  .tables           = std::move(r.tables),
+                  .formulas         = std::move(r.formulas),
+                  .formula_degraded = r.formula_degraded,
+                  .formula_warning  = std::move(r.formula_warning),
+                  .table_degraded   = r.table_degraded,
+                  .table_warning    = std::move(r.table_warning),
+                  .text_degraded    = r.text_degraded,
+                  .text_warning     = std::move(r.text_warning),
+              };
+            },
+            *pdf_renderer_, pdf_data, pdf_len, job_opts,
+            server::OrientFunc{});
       }
+    } catch (const turbo_ocr::PoolExhaustedError &e) {
+      return grpc_error(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED,
+                        "SERVER_BUSY", e.what());
+    } catch (const std::exception &e) {
+      std::cerr << std::format("[gRPC PDF] error: {}\n", e.what());
+      return grpc_error(ctx, grpc::StatusCode::INTERNAL, "INFERENCE_ERROR",
+                        "Inference error");
     }
 
-    // Per-page result accumulator
-    std::mutex results_mutex;
-    struct PdfPageResult {
-      std::vector<OCRResultItem> results;
-      std::vector<layout::LayoutBox> layout;
-      std::vector<int> reading_order;
-      int width = 0, height = 0, effective_dpi = 0;
-      pdf::PdfMode resolved_mode = pdf::PdfMode::Ocr;
-      std::string_view text_layer_quality = "absent";
-    };
-    std::vector<PdfPageResult> page_results;
-
-    // Fill results from text layer (PDF points)
-    auto fill_from_text_layer_pt =
-        [](PdfPageResult &pg, const pdf::PdfPageText &text) {
-      pg.width  = static_cast<int>(std::round(text.page_width_pt));
-      pg.height = static_cast<int>(std::round(text.page_height_pt));
-      pg.effective_dpi = 72;
-      pg.results.reserve(text.lines.size());
-      for (const auto &line : text.lines) {
-        OCRResultItem item;
-        item.source = "pdf";
-        item.confidence = 1.0f;
-        item.text = line.text;
-        int ix0 = static_cast<int>(std::round(line.x0_pt));
-        int iy0 = static_cast<int>(std::round(line.y0_pt));
-        int ix1 = static_cast<int>(std::round(line.x1_pt));
-        int iy1 = static_cast<int>(std::round(line.y1_pt));
-        item.box[0] = {ix0, iy0};
-        item.box[1] = {ix1, iy0};
-        item.box[2] = {ix1, iy1};
-        item.box[3] = {ix0, iy1};
-        pg.results.push_back(std::move(item));
-      }
-    };
-
-    auto text_layer_quality_for =
-        [](const pdf::PdfPageText &text) -> std::string_view {
-      if (text.char_count == 0)         return "absent";
-      if (text.rotation_deg != 0)       return "rejected";
-      if (text.char_count < 10)         return "absent";
-      if (text.fffd_count * 20 > text.char_count)     return "rejected";
-      if (text.nonprint_count * 10 > text.char_count) return "rejected";
-      if (text.lines.empty())           return "absent";
-      return "trusted";
-    };
-
-    // Pre-populate pages that don't need rendering
-    std::vector<uint8_t> need_render;
-    bool any_need_render = (req_mode == pdf::PdfMode::Ocr);
-
-    if (req_mode != pdf::PdfMode::Ocr) {
-      int np = pdf_doc ? pdf_doc->page_count() : 0;
-      page_results.resize(static_cast<size_t>(np));
-      need_render.assign(static_cast<size_t>(np), 0);
-
-      for (int p = 0; p < np; ++p) {
-        const auto &text = page_text_cache[static_cast<size_t>(p)];
-        auto &pg = page_results[static_cast<size_t>(p)];
-        pg.text_layer_quality = text_layer_quality_for(text);
-        bool has_good_layer = (pg.text_layer_quality == "trusted");
-
-        switch (req_mode) {
-          case pdf::PdfMode::Geometric:
-            pg.resolved_mode = pdf::PdfMode::Geometric;
-            if (has_good_layer) fill_from_text_layer_pt(pg, text);
-            else {
-              pg.width = static_cast<int>(std::round(text.page_width_pt));
-              pg.height = static_cast<int>(std::round(text.page_height_pt));
-              pg.effective_dpi = 72;
-            }
-            if (want_layout) {
-              need_render[static_cast<size_t>(p)] = 1;
-              any_need_render = true;
-            }
-            break;
-          case pdf::PdfMode::Auto:
-            if (has_good_layer) {
-              pg.resolved_mode = pdf::PdfMode::Geometric;
-              fill_from_text_layer_pt(pg, text);
-              if (want_layout) {
-                need_render[static_cast<size_t>(p)] = 1;
-                any_need_render = true;
-              }
-            } else {
-              pg.resolved_mode = pdf::PdfMode::Ocr;
-              need_render[static_cast<size_t>(p)] = 1;
-              any_need_render = true;
-            }
-            break;
-          case pdf::PdfMode::AutoVerified:
-            pg.resolved_mode = pdf::PdfMode::AutoVerified;
-            need_render[static_cast<size_t>(p)] = 1;
-            any_need_render = true;
-            break;
-          default: break;
-        }
-      }
-    }
-
-    // Streamed render + OCR
-    std::mutex futures_mutex;
-    std::vector<std::future<void>> page_futures;
-    render::PdfRenderer::StreamHandle stream_handle;
-    int num_pages = 0;
-
-    if (any_need_render) {
-      try {
-        stream_handle = pdf_renderer_->render_streamed(pdf_data, pdf_len, dpi,
-            [&](int page_idx, std::string ppm_path) {
-              {
-                std::lock_guard<std::mutex> rlock(results_mutex);
-                if (page_idx >= static_cast<int>(page_results.size())) {
-                  page_results.resize(page_idx + 1);
-                  if (req_mode != pdf::PdfMode::Ocr &&
-                      page_idx >= static_cast<int>(need_render.size()))
-                    need_render.resize(page_idx + 1, 1);
-                }
-                if (req_mode != pdf::PdfMode::Ocr &&
-                    page_idx < static_cast<int>(need_render.size()) &&
-                    !need_render[page_idx])
-                  return;
-              }
-
-              // Explicit captures so it's obvious which references the
-              // async task uses; render_streamed is fully synchronous and
-              // page_futures are joined before this function returns, so
-              // every captured reference outlives the task.
-              auto fut = std::async(std::launch::async,
-                  [this, &results_mutex, &page_results, &page_text_cache,
-                   &pdf_doc, want_layout, want_reading_order, dpi, page_idx,
-                   path = std::move(ppm_path)]() {
-                cv::Mat img = render::PdfRenderer::decode_ppm(path);
-                if (img.empty()) {
-                  std::cerr << std::format("[gRPC PDF] Failed to decode PPM for page {}\n", page_idx);
-                  return;
-                }
-                int pw = img.cols, ph = img.rows;
-
-                pdf::PdfMode page_mode;
-                {
-                  std::lock_guard<std::mutex> rlock(results_mutex);
-                  page_mode = (page_idx < static_cast<int>(page_results.size()))
-                      ? page_results[page_idx].resolved_mode
-                      : pdf::PdfMode::Ocr;
-                }
-
-                std::vector<OCRResultItem> rec_results;
-                std::vector<layout::LayoutBox> layout_snapshot;
-                std::vector<int> reading_order_snapshot;
-
-                // Geometric mode with layout: run full inference to get layout
-                // (CPU has no run_layout_only; GPU path also benefits from unified code)
-                if (page_mode == pdf::PdfMode::Geometric && want_layout) {
-                  auto infer_out = run_infer(img, true, want_reading_order);
-                  layout_snapshot = std::move(infer_out.layout);
-                } else if (page_mode != pdf::PdfMode::Geometric) {
-                  auto infer_out = run_infer(img, want_layout, want_reading_order);
-                  rec_results = std::move(infer_out.results);
-                  layout_snapshot = std::move(infer_out.layout);
-                  reading_order_snapshot = std::move(infer_out.reading_order);
-                  for (auto &it : rec_results) it.source = "ocr";
-                }
-
-                if (page_mode == pdf::PdfMode::AutoVerified &&
-                    page_idx < static_cast<int>(page_text_cache.size()) && pdf_doc) {
-                  for (auto &item : rec_results) {
-                    const float px_to_pt = 72.0f / static_cast<float>(dpi);
-                    auto [ix0, iy0, ix1, iy1] = turbo_ocr::aabb(item.box);
-                    float x0 = ix0 * px_to_pt, y0 = iy0 * px_to_pt;
-                    float x1 = ix1 * px_to_pt, y1 = iy1 * px_to_pt;
-                    std::string native =
-                        pdf_doc->text_in_rect_pt(page_idx, x0, y0, x1, y1);
-                    auto verdict = pdf::passes_sanity_check(
-                        native, x1 - x0, y1 - y0);
-                    if (verdict.accept) {
-                      item.text = std::move(native);
-                      item.source = "pdf";
-                      item.confidence = 1.0f;
-                    }
-                  }
-                }
-
-                std::lock_guard<std::mutex> rlock(results_mutex);
-                auto &slot = page_results[page_idx];
-                if (page_mode == pdf::PdfMode::Geometric) {
-                  const float pt_to_px = static_cast<float>(dpi) / 72.0f;
-                  for (auto &item : slot.results) {
-                    for (int k = 0; k < 4; ++k) {
-                      item.box[k][0] = static_cast<int>(
-                          std::round(item.box[k][0] * pt_to_px));
-                      item.box[k][1] = static_cast<int>(
-                          std::round(item.box[k][1] * pt_to_px));
-                    }
-                  }
-                } else {
-                  slot.results = std::move(rec_results);
-                }
-                slot.layout        = std::move(layout_snapshot);
-                slot.reading_order = std::move(reading_order_snapshot);
-                slot.width         = pw;
-                slot.height        = ph;
-                slot.effective_dpi = dpi;
-                if (page_mode == pdf::PdfMode::Ocr)
-                  slot.resolved_mode = pdf::PdfMode::Ocr;
-              });
-
-              std::lock_guard lock(futures_mutex);
-              page_futures.push_back(std::move(fut));
-            });
-        num_pages = stream_handle.num_pages;
-      } catch (const std::exception &e) {
-        for (auto &f : page_futures) { try { f.get(); } catch (...) {} }
-        std::cerr << std::format("[gRPC PDF] PDF render failed: {}\n", e.what());
+    switch (job.status) {
+      case pipeline::PdfJobStatus::Ok: break;
+      case pipeline::PdfJobStatus::RenderFailed:
         return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
                           "PDF_RENDER_FAILED", "PDF render failed");
-      }
-    } else {
-      num_pages = pdf_doc ? pdf_doc->page_count() : 0;
+      case pipeline::PdfJobStatus::EmptyPdf:
+        return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+                          "EMPTY_PDF", "PDF contains no pages");
+      case pipeline::PdfJobStatus::Dropped:
+        return grpc_error(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED, "SERVER_BUSY",
+            std::format("GPU queue full: {} of {} pages could not be processed. "
+                        "Retry with backoff.", job.dropped_pages, job.num_pages));
+      case pipeline::PdfJobStatus::DecodeFailed:
+        return grpc_error(ctx, grpc::StatusCode::INTERNAL, "PAGE_DECODE_FAILED",
+            std::format("{} of {} rendered pages could not be decoded; retry",
+                        job.decode_failures, job.num_pages));
+      case pipeline::PdfJobStatus::PageFailed:
+        return grpc_error(ctx, grpc::StatusCode::INTERNAL, "PAGE_FAILED",
+            std::format("{} of {} pages failed during OCR; retry",
+                        job.page_failures, job.num_pages));
+      case pipeline::PdfJobStatus::TimedOut:
+        return grpc_error(ctx, grpc::StatusCode::DEADLINE_EXCEEDED,
+            "INFERENCE_TIMEOUT", "PDF job exceeded the request deadline");
     }
-
-    {
-      std::lock_guard<std::mutex> rlock(results_mutex);
-      if (static_cast<int>(page_results.size()) < num_pages)
-        page_results.resize(num_pages);
-    }
-
-    for (auto &f : page_futures) {
-      try { f.get(); } catch (const std::exception &e) {
-        std::cerr << std::format("[gRPC PDF] page error: {}\n", e.what());
-      }
-    }
-
-    if (num_pages == 0)
-      return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
-                        "EMPTY_PDF", "PDF contains no pages");
 
     // Build response
-    for (int i = 0; i < num_pages; ++i) {
+    for (int i = 0; i < job.num_pages; ++i) {
       auto *page = response->add_pages();
-      auto &pg = page_results[static_cast<size_t>(i)];
+      auto &pg = job.pages[static_cast<size_t>(i)];
       page->set_page_number(i + 1);
       page->set_width(pg.width);
       page->set_height(pg.height);
@@ -812,12 +880,10 @@ public:
       page->set_text_layer_quality(std::string(pg.text_layer_quality));
 
       if (mode_ == GrpcResponseMode::json_bytes) {
-        if (!pg.reading_order.empty()) {
-          page->set_json_response(emit_results_json(
-              pg.results, pg.layout, pg.reading_order, want_blocks));
-        } else {
-          page->set_json_response(results_to_json(pg.results, pg.layout));
-        }
+        // Shared per-page serializer (H7) — identical body to HTTP's per-page
+        // JSON, so the two transports can't drift on result/layout shape.
+        page->set_json_response(
+            pipeline::serialize_page_results(pg, want_blocks));
       } else {
         fill_page_results(page, pg.results);
       }
@@ -827,24 +893,34 @@ public:
   }
 
 private:
-  void fill_response(ocr::OCRResponse *response,
-                     std::vector<OCRResultItem> &results,
-                     std::vector<layout::LayoutBox> &layout_boxes,
-                     const std::vector<int> &reading_order = {},
-                     bool want_blocks = false) {
-    response->set_num_detections(static_cast<int>(results.size()));
+  // Mark a batch slot as having no detections. In json_bytes mode this also
+  // sets json_response to a valid empty document ('{"results":[]}') so a
+  // client uniformly parsing json_response per slot doesn't choke on an
+  // empty bytes field for a failed/undecodable image (a successful blank
+  // page already produces valid empty JSON via fill_response).
+  void mark_empty_slot(ocr::OCRResponse *entry, const char *err = nullptr) {
+    entry->set_num_detections(0);
+    if (err) entry->set_error(err);
     if (mode_ == GrpcResponseMode::json_bytes) {
-      if (!reading_order.empty()) {
-        response->set_json_response(emit_results_json(
-            results, layout_boxes, reading_order, want_blocks));
-      } else if (layout_boxes.empty()) {
-        response->set_json_response(results_to_json(results));
-      } else {
-        response->set_json_response(results_to_json(results, layout_boxes));
-      }
+      std::vector<OCRResultItem> empty;
+      entry->set_json_response(results_to_json(empty));
+    }
+  }
+
+  // Takes the full pipeline result so json_bytes mode emits the SAME body as the
+  // HTTP routes — including `tables`/`formulas` (+ degradation flags) when the
+  // request opted in (?tables=1 / ?formulas=1). Structured mode carries only
+  // `results` (the proto has no table/formula message), same as before.
+  void fill_response(ocr::OCRResponse *response,
+                     pipeline::OcrPipelineResult &out,
+                     bool want_blocks = false) {
+    response->set_num_detections(static_cast<int>(out.results.size()));
+    if (mode_ == GrpcResponseMode::json_bytes) {
+      response->set_json_response(
+          turbo_ocr::emit_pipeline_result_json(out, want_blocks));
     } else {
-      response->mutable_results()->Reserve(static_cast<int>(results.size()));
-      for (const auto &item : results) {
+      response->mutable_results()->Reserve(static_cast<int>(out.results.size()));
+      for (const auto &item : out.results) {
         auto *result = response->add_results();
         result->set_text(item.text);
         result->set_confidence(item.confidence);
@@ -860,10 +936,10 @@ private:
     }
     // Always populate the dedicated reading_order field so non-JSON
     // clients can read it without parsing json_response.
-    if (!reading_order.empty()) {
+    if (!out.reading_order.empty()) {
       response->mutable_reading_order()->Reserve(
-          static_cast<int>(reading_order.size()));
-      for (int idx : reading_order) response->add_reading_order(idx);
+          static_cast<int>(out.reading_order.size()));
+      for (int idx : out.reading_order) response->add_reading_order(idx);
     }
   }
 
@@ -890,23 +966,44 @@ private:
   /// is computed over layout regions — the contract matches the HTTP
   /// `?reading_order=1` query handler.
   pipeline::OcrPipelineResult run_infer(const cv::Mat &img, bool want_layout,
-                                         bool want_reading_order = false) {
-    if (want_reading_order) want_layout = want_layout || layout_available_;
+                                         bool want_reading_order = false,
+                                         bool want_tables = false,
+                                         bool want_formulas = false) {
+    if (want_reading_order || want_tables || want_formulas)
+      want_layout = want_layout || layout_available_;
     if (infer_fn_) {
       InferOptions opts;
       opts.want_layout = want_layout;
       opts.want_reading_order = want_reading_order;
+      opts.want_tables = want_tables;
+      opts.want_formulas = want_formulas;
       auto r = infer_fn_(img, opts);
-      return pipeline::OcrPipelineResult{
-          .results       = std::move(r.results),
-          .layout        = std::move(r.layout),
-          .reading_order = std::move(r.reading_order),
-      };
+      pipeline::OcrPipelineResult res;
+      res.results          = std::move(r.results);
+      res.layout           = std::move(r.layout);
+      res.reading_order    = std::move(r.reading_order);
+      res.tables           = std::move(r.tables);
+      res.formulas         = std::move(r.formulas);
+      // Carry the no-silent-failure degradation signals too — without these a
+      // failed table/formula/text stage would return a clean 200 over gRPC.
+      res.formula_degraded = r.formula_degraded;
+      res.formula_warning  = std::move(r.formula_warning);
+      res.table_degraded   = r.table_degraded;
+      res.table_warning    = std::move(r.table_warning);
+      res.text_degraded    = r.text_degraded;
+      res.text_warning     = std::move(r.text_warning);
+      return res;
     }
 #ifndef USE_CPU_ONLY
-    return dispatcher_->submit([&img, want_layout, want_reading_order](auto &e) {
-      return e.pipeline->run_with_layout(img, e.stream, want_layout, want_reading_order);
-    }).get();
+    // BY-VALUE capture of img (cheap cv::Mat refcount bump): submit_for_default
+    // may abandon the task on timeout, so it must not reference caller stack.
+    return dispatcher_->submit_for_default(
+        [img, want_layout, want_reading_order, want_tables, want_formulas](auto &e) {
+          return e.pipeline->run_with_layout(img, e.stream, want_layout,
+                                             want_reading_order, /*routing=*/{},
+                                             /*defer_external=*/false,
+                                             want_tables, want_formulas);
+        });
 #else
     throw std::logic_error("No inference backend configured");
 #endif
@@ -921,8 +1018,18 @@ private:
   render::PdfRenderer *pdf_renderer_ = nullptr;
   pdf::PdfMode default_pdf_mode_ = pdf::PdfMode::Ocr;
   bool layout_available_ = false;
+  bool table_available_ = false;
+  bool formula_available_ = false;
   int grpc_batch_workers_ = 8;
   int max_pdf_pages_ = 2000;
+  int max_batch_images_ = 1024;
+  // Default render DPI when the request doesn't specify one.
+  int default_pdf_dpi_ = 100;
+  // Per-request inference deadline (C4) from cfg.request_timeout_ms; 0 = wait
+  // unbounded (legacy). Applied to every GPU future .get() so a wedged worker
+  // surfaces as DEADLINE_EXCEEDED instead of hanging an RPC. CPU path leaves
+  // it unused (InferFunc is synchronous, no dispatcher/wedge risk).
+  long request_timeout_ms_ = 30000;
 };
 
 /// Start gRPC server on a background thread. Returns the server and thread.
@@ -982,10 +1089,13 @@ inline GrpcHandle start_grpc_server(pipeline::PipelineDispatcher &dispatcher,
                                      const ServerConfig &cfg,
                                      render::PdfRenderer *pdf_renderer = nullptr,
                                      bool layout_available = false,
-                                     std::function<bool()> readiness_check = {}) {
+                                     std::function<bool()> readiness_check = {},
+                                     bool table_available = false,
+                                     bool formula_available = false) {
   auto service = std::make_shared<OCRServiceImpl>(
       dispatcher, cfg, pdf_renderer, layout_available);
   service->set_readiness_check(std::move(readiness_check));
+  service->set_structure_availability(table_available, formula_available);
   return detail::launch_grpc_server(std::move(service), cfg.grpc_port, cfg);
 }
 #endif
@@ -995,10 +1105,13 @@ inline GrpcHandle start_grpc_server(InferFunc infer_fn,
                                      const ServerConfig &cfg,
                                      render::PdfRenderer *pdf_renderer = nullptr,
                                      bool layout_available = false,
-                                     std::function<bool()> readiness_check = {}) {
+                                     std::function<bool()> readiness_check = {},
+                                     bool table_available = false,
+                                     bool formula_available = false) {
   auto service = std::make_shared<OCRServiceImpl>(
       std::move(infer_fn), cfg, pdf_renderer, layout_available);
   service->set_readiness_check(std::move(readiness_check));
+  service->set_structure_availability(table_available, formula_available);
   return detail::launch_grpc_server(std::move(service), cfg.grpc_port, cfg);
 }
 

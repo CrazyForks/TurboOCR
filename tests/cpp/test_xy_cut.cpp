@@ -18,7 +18,6 @@ using turbo_ocr::layout::assign_reading_order;
 using turbo_ocr::layout::assign_reading_order_for_results;
 using turbo_ocr::layout::LayoutBox;
 using turbo_ocr::layout::projection_by_bboxes;
-using turbo_ocr::layout::ProjectionSegment;
 using turbo_ocr::layout::recursive_xy_cut;
 using turbo_ocr::layout::split_projection_profile;
 

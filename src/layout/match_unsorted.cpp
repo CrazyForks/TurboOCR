@@ -112,7 +112,7 @@ constexpr float kLeftEdgeWeight = 1e-4f;
 // `block` (sorted_block.bbox[3] <= block.bbox[1]) and insert AFTER it.
 // Used for cross-references / footnotes that should appear at the END
 // of whatever section they textually belong to.
-void reference_insert(UnsortedBlock block,
+void reference_insert(const UnsortedBlock &block,
                       std::vector<UnsortedBlock> &sorted_blocks) {
   if (sorted_blocks.empty()) {
     sorted_blocks.push_back(block);
@@ -134,7 +134,7 @@ void reference_insert(UnsortedBlock block,
 
 // manhattan_insert: nearest by Manhattan-distance between top-left
 // corners. Used for `unordered` (aside_text, page numbers, seals).
-void manhattan_insert(UnsortedBlock block,
+void manhattan_insert(const UnsortedBlock &block,
                       std::vector<UnsortedBlock> &sorted_blocks) {
   if (sorted_blocks.empty()) {
     sorted_blocks.push_back(block);
@@ -154,7 +154,7 @@ void manhattan_insert(UnsortedBlock block,
 
 // euclidean_insert: place by ascending centroid distance from origin.
 // Used for whole-region blocks where simple radial ordering is enough.
-void euclidean_insert(UnsortedBlock block,
+void euclidean_insert(const UnsortedBlock &block,
                       std::vector<UnsortedBlock> &sorted_blocks) {
   const double block_d = centroid_l2_sq(block.aabb);
   size_t pos = sorted_blocks.size();
@@ -190,7 +190,7 @@ void euclidean_insert(UnsortedBlock block,
 // branch — when an adjacent neighbour's last line continues into the
 // current vision block (paragraph wrap), step back so the figure
 // doesn't split the paragraph.
-void weighted_distance_insert(UnsortedBlock block,
+void weighted_distance_insert(const UnsortedBlock &block,
                               std::vector<UnsortedBlock> &sorted_blocks,
                               int text_line_width,
                               Direction direction,

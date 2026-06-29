@@ -3,8 +3,6 @@
 #include "turbo_ocr/common/perspective.h"
 
 using turbo_ocr::Box;
-using turbo_ocr::CropTransform;
-using turbo_ocr::CropGeometry;
 using turbo_ocr::compute_crop_transform;
 using turbo_ocr::compute_crop_geometry;
 using turbo_ocr::compute_perspective_inv;

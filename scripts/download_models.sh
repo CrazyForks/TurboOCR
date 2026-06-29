@@ -1,31 +1,29 @@
 #!/bin/bash
-# Fetch a PP-OCRv5 language bundle from the TurboOCR GitHub Release
-# (https://github.com/aiptimizer/TurboOCR/releases/tag/models-v2.1.0) and
-# verify the bytes against SHA256SUMS before use.
+# Fetch a retained PP-OCRv5 script bundle from the TurboOCR GitHub Release
+# (https://github.com/aiptimizer/TurboOCR/releases/tag/models-v3.0.0-ppocrv6)
+# and verify the bytes against SHA256SUMS before use. PP-OCRv6 covers the
+# Latin/CJK default; these are the scripts it does NOT cover (arabic, eslav,
+# greek, korean, thai). Chinese is dropped — PP-OCRv6 covers it natively.
 #
 # The release is authored by us from PaddlePaddle's official Baidu mirror
 # (paddle-model-ecology.bj.bcebos.com) via `paddle2onnx`; dicts are verbatim
-# from PaddleOCR/main:ppocr/utils/dict/ppocrv5_*.txt. Re-running the process
-# end-to-end is reproducible with scripts/fetch_and_convert.sh.
+# from PaddleOCR/main:ppocr/utils/dict/ppocrv5_*.txt.
 #
 # Usage:
 #   ./scripts/download_models.sh --lang greek
-#   ./scripts/download_models.sh --lang chinese
-#   ./scripts/download_models.sh --lang chinese --server   # 84 MB server rec
+#   ./scripts/download_models.sh --lang arabic
 #
 # Env:
 #   MODELS_RELEASE_URL — override the base URL (default: aiptimizer/TurboOCR
-#                        release models-v2.1.0). Lets downstream forks pin
-#                        their own release.
+#                        release models-v3.0.0-ppocrv6). Lets downstream forks
+#                        pin their own release.
 
 set -euo pipefail
 
-SERVER=false
 LANG_BUNDLE=""
 OUT="models"
 while (($#)); do
   case "$1" in
-    --server) SERVER=true; shift ;;
     --lang)   LANG_BUNDLE="$2"; shift 2 ;;
     --lang=*) LANG_BUNDLE="${1#--lang=}"; shift ;;
     *)        OUT="$1"; shift ;;
@@ -33,11 +31,11 @@ while (($#)); do
 done
 
 if [[ -z "${LANG_BUNDLE}" ]]; then
-  echo "Usage: $0 --lang <name> [--server] [out-dir]" >&2
+  echo "Usage: $0 --lang <name> [out-dir]" >&2
   exit 2
 fi
 
-MODELS_RELEASE_URL="${MODELS_RELEASE_URL:-https://github.com/aiptimizer/TurboOCR/releases/download/models-v2.1.0}"
+MODELS_RELEASE_URL="${MODELS_RELEASE_URL:-https://github.com/aiptimizer/TurboOCR/releases/download/models-v3.0.0-ppocrv6}"
 
 REC_DIR="${OUT}/rec/${LANG_BUNDLE}"
 mkdir -p "${REC_DIR}"
@@ -77,25 +75,10 @@ fetch_verified() {
   mv "${target}.part" "$target"
 }
 
-# Chinese: rec asset name depends on mobile vs server; dict is the same file.
-if [[ "${LANG_BUNDLE}" == "chinese" ]]; then
-  if [[ "${SERVER}" == true ]]; then
-    echo "PP-OCRv5 chinese SERVER rec (84 MB) -> ${REC_DIR}/"
-    fetch_verified "rec-chinese-server.onnx" "${REC_DIR}/rec.onnx"
-  else
-    echo "PP-OCRv5 chinese MOBILE rec (16 MB) -> ${REC_DIR}/"
-    fetch_verified "rec-chinese.onnx" "${REC_DIR}/rec.onnx"
-  fi
-  fetch_verified "dict-chinese.txt" "${REC_DIR}/dict.txt"
-else
-  if [[ "${SERVER}" == true ]]; then
-    echo "  NOTE: --server ignored (only chinese has a server variant)"
-  fi
-  echo "PP-OCRv5 ${LANG_BUNDLE} rec -> ${REC_DIR}/"
-  fetch_verified "rec-${LANG_BUNDLE}.onnx" "${REC_DIR}/rec.onnx"
-  fetch_verified "dict-${LANG_BUNDLE}.txt" "${REC_DIR}/dict.txt"
-fi
+echo "PP-OCRv5 ${LANG_BUNDLE} rec -> ${REC_DIR}/"
+fetch_verified "rec-${LANG_BUNDLE}.onnx" "${REC_DIR}/rec.onnx"
+fetch_verified "dict-${LANG_BUNDLE}.txt" "${REC_DIR}/dict.txt"
 
 echo ""
-echo "Done. Run the server with:  OCR_LANG=${LANG_BUNDLE}"
+echo "Done. Run the server with:  OCR_MODEL=${LANG_BUNDLE}"
 ls -lh "${REC_DIR}"/{rec.onnx,dict.txt}

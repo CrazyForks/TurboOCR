@@ -17,17 +17,20 @@ using turbo_ocr::engine::TrtEngine;
 
 namespace turbo_ocr::detection {
 
-bool PaddleDet::load_model(const std::string &model_path) {
+bool PaddleDet::load_model(const std::string& model_path, const DetResizeParams& resize,
+                           const DbParams& db) {
   engine_ = std::make_unique<TrtEngine>(model_path);
   if (!engine_->load())
     return false;
-  return init_buffers();
+  return init_buffers(resize, db);
 }
 
-bool PaddleDet::init_buffers() {
-  // Single source of truth for DET_MAX_SIDE: detection/det_config.h. The
-  // engine builder reads the same value so the TRT profile MAX matches.
-  kMaxSideLen_ = turbo_ocr::detection::read_det_max_side();
+bool PaddleDet::init_buffers(const DetResizeParams& resize, const DbParams& db) {
+  // Per-model resize policy with env overrides layered on (env wins). The
+  // engine builder must size its TRT profile MAX off the same effective
+  // max-side or the runtime and engine silently disagree.
+  resize_ = read_det_resize(resize);
+  kMaxSideLen_ = effective_det_max_side(resize_);
 
   size_t max_pixels = static_cast<size_t>(kMaxSideLen_) * kMaxSideLen_;
   input_size_ = max_pixels * 3 * sizeof(float);
@@ -64,6 +67,14 @@ bool PaddleDet::init_buffers() {
   // Bind I/O pointers once for single-image path (never change)
   engine_->bind_io(d_input_.get(), d_output_.get());
 
+  // DB params: this model's base + env overrides (read_db_params), same
+  // det_config.h source as the CPU detector. GPU_BOX_THRESH / GPU_UNCLIP_SCALE
+  // remain as overrides layered on top.
+  const DbParams eff_db = read_db_params(db);
+  db_thresh_ = eff_db.thresh;
+  box_thresh_ = eff_db.box_thresh;
+  unclip_ratio_ = eff_db.unclip_ratio;
+
   // GPU CCL mode: 0=CPU contours, 1=GPU CCL+per-ROI findContours (default),
   // 2=all-GPU JFA per-component Euclidean unclip
   if (const char *env = std::getenv("GPU_CCL"))
@@ -87,11 +98,13 @@ bool PaddleDet::init_buffers() {
     // Pinned host memory for result transfer
     h_ccl_boxes_ = CudaHostPtr<turbo_ocr::kernels::GpuDetBox>(
         turbo_ocr::kernels::kMaxGpuComponents);
+    h_bitmap_ = CudaHostPtr<uint8_t>(max_pixels);
+    h_bitmap_pixels_ = max_pixels;
 
     // JFA (Jump Flooding) per-component label expansion
     d_jfa_labels_ = CudaPtr<uint32_t>(max_pixels);
-    d_jfa_seeds_ = CudaPtr<int2>(max_pixels);
-    d_jfa_seeds_alt_ = CudaPtr<int2>(max_pixels);
+    d_jfa_seeds_ = CudaPtr<uint32_t>(max_pixels);
+    d_jfa_seeds_alt_ = CudaPtr<uint32_t>(max_pixels);
     d_expand_per_comp_ = CudaPtr<float>(turbo_ocr::kernels::kMaxGpuComponents);
     h_exp_boxes_ = CudaHostPtr<turbo_ocr::kernels::GpuDetBox>(
         turbo_ocr::kernels::kMaxGpuComponents);
@@ -123,7 +136,12 @@ PaddleDet::run_gpu_ccl(int resize_h, int resize_w,
 
   // Download ONLY the bitmap (not pred_map -- GPU CCL already computed scores).
   // We need the bitmap for per-ROI findContours to get accurate polygon contours.
-  cv::Mat bitmap(resize_h, resize_w, CV_8UC1);
+  const size_t bitmap_pixels = static_cast<size_t>(resize_h) * resize_w;
+  if (bitmap_pixels > h_bitmap_pixels_) [[unlikely]] {
+    h_bitmap_ = CudaHostPtr<uint8_t>(bitmap_pixels);
+    h_bitmap_pixels_ = bitmap_pixels;
+  }
+  cv::Mat bitmap(resize_h, resize_w, CV_8UC1, h_bitmap_.get());
   CUDA_CHECK(cudaMemcpyAsync(bitmap.data, cur_bitmap_, resize_w * resize_h,
                               cudaMemcpyDeviceToHost, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -185,7 +203,7 @@ PaddleDet::run_gpu_ccl(int resize_h, int resize_w,
     if (ssid < kMinBoxSide)
       continue;
 
-    auto unclipped = unclip(ccl_contour_buf_, kDetDbUnclipRatio * unclip_scale_);
+    auto unclipped = unclip(ccl_contour_buf_, unclip_ratio_ * unclip_scale_);
     if (unclipped.size() < 3)
       continue;
 
@@ -249,16 +267,18 @@ PaddleDet::run_gpu_ccl_fast(int resize_h, int resize_w,
   if (num_slots == 0) return boxes;
 
   // Step 2: Per-component expand distance from CCL bboxes (Clipper-equivalent
-  // area*ratio/perim). Indexed by PRE-filter compact_id.
+  // area*ratio/perim). Indexed by PRE-filter compact_id. kMaxExpand is the
+  // global cutoff; it also bounds the JFA jump range below — keep them equal.
+  constexpr float kMaxExpand = 24.0f;
   turbo_ocr::kernels::cuda_compute_expand_per_comp(
-      d_ccl_bboxes_.get(), num_slots,
-      kDetDbUnclipRatio * unclip_scale_, /*min*/ 2.0f, /*max*/ 24.0f,
+      d_ccl_bboxes_.get(), num_slots, unclip_ratio_ * unclip_scale_, /*min*/ 2.0f, kMaxExpand,
       box_thresh_, d_expand_per_comp_.get(), stream);
 
-  // Step 3: JFA + per-component label expansion (variable cutoff per component)
+  // Step 3: JFA + per-component label expansion (variable cutoff per component).
+  // Pass kMaxExpand so JFA bounds its jump range to it (no pixel beyond it survives).
   turbo_ocr::kernels::cuda_jfa_expand_labels(
       cur_bitmap_, d_ccl_compact_ids_.get(), d_expand_per_comp_.get(),
-      d_jfa_labels_.get(), resize_w, resize_h,
+      d_jfa_labels_.get(), resize_w, resize_h, kMaxExpand,
       d_jfa_seeds_.get(), d_jfa_seeds_alt_.get(), stream);
 
   // Step 4: GPU bbox extraction over expanded region. Launcher inits sentinels
@@ -313,25 +333,16 @@ PaddleDet::run_cpu_contours(int resize_h, int resize_w,
 
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  return extract_boxes_from_bitmap(
-      pred_map, bitmap, orig_h, orig_w, resize_h, resize_w,
-      box_thresh_, kDetDbUnclipRatio * unclip_scale_,
-      kMinBoxSide, kMinUnclippedSide,
-      shifted_buf_, mask_buf_, contours_buf_, hierarchy_buf_);
+  return extract_boxes_from_bitmap(pred_map, bitmap, orig_h, orig_w, resize_h, resize_w,
+                                   box_thresh_, unclip_ratio_ * unclip_scale_, kMinBoxSide,
+                                   kMinUnclippedSide, shifted_buf_, mask_buf_, contours_buf_,
+                                   hierarchy_buf_);
 }
 
 std::vector<Box>
 PaddleDet::run(const GpuImage &gpu_img, int orig_h, int orig_w,
                cudaStream_t stream) {
-  int h = orig_h;
-  int w = orig_w;
-  float ratio = 1.0f;
-  if (std::max(h, w) > kMaxSideLen_) {
-    ratio = (h > w) ? static_cast<float>(kMaxSideLen_) / h
-                    : static_cast<float>(kMaxSideLen_) / w;
-  }
-  int resize_h = std::max(static_cast<int>(round(h * ratio / 32.0) * 32), 32);
-  int resize_w = std::max(static_cast<int>(round(w * ratio / 32.0) * 32), 32);
+  auto [resize_h, resize_w] = compute_det_resize(orig_h, orig_w, resize_);
 
   // Reset working pointers to single-image buffers (in case batch mode changed them)
   cur_output_ = d_output_.get();
@@ -348,8 +359,8 @@ PaddleDet::run(const GpuImage &gpu_img, int orig_h, int orig_w,
   }
 
   // 4. Threshold on GPU for bitmap
-  turbo_ocr::kernels::cuda_threshold_to_u8(cur_output_, cur_bitmap_, resize_w,
-                                    resize_h, kDetDbThresh, stream);
+  turbo_ocr::kernels::cuda_threshold_to_u8(cur_output_, cur_bitmap_, resize_w, resize_h, db_thresh_,
+                                           stream);
 
   // 5. Choose contour extraction path
   if (gpu_ccl_mode_ == 2) {
@@ -373,51 +384,57 @@ PaddleDet::run_batch(const std::vector<GpuImage> &gpu_imgs,
   if (n == 0)
     return {};
 
-  // Fallback: single image → use optimized single path
+  // Single image → use the optimized single-image path.
   if (n == 1) {
     auto boxes = run(gpu_imgs[0], orig_dims[0].first, orig_dims[0].second, stream);
     return {std::move(boxes)};
   }
 
-  // Clamp to max batch size
-  const int batch_size = std::min(n, kMaxBatchSize);
-
-  // --- Compute unified resize dimensions (max across batch, rounded to 32) ---
-  int max_resize_h = 0, max_resize_w = 0;
+  int batch_size;
+  int resize_h, resize_w;
   struct PerImgInfo {
     int orig_h, orig_w;
     float ratio;
     int resize_h, resize_w;
   };
-  std::vector<PerImgInfo> infos(batch_size);
+  std::vector<PerImgInfo> infos;
+
+  // Clamp to max batch size
+  batch_size = std::min(n, kMaxBatchSize);
+
+  // --- Compute unified resize dimensions (max across batch, rounded to 32) ---
+  int max_resize_h = 0, max_resize_w = 0;
+  infos.resize(batch_size);
 
   for (int i = 0; i < batch_size; i++) {
     int h = orig_dims[i].first;
     int w = orig_dims[i].second;
-    float ratio = 1.0f;
-    if (std::max(h, w) > kMaxSideLen_) {
-      ratio = (h > w) ? static_cast<float>(kMaxSideLen_) / h
-                      : static_cast<float>(kMaxSideLen_) / w;
-    }
-    int rh = std::max(static_cast<int>(round(h * ratio / 32.0) * 32), 32);
-    int rw = std::max(static_cast<int>(round(w * ratio / 32.0) * 32), 32);
+    auto [rh, rw] = compute_det_resize(h, w, resize_);
+    float ratio = std::min(static_cast<float>(rh) / h, static_cast<float>(rw) / w);
     infos[i] = {h, w, ratio, rh, rw};
     max_resize_h = std::max(max_resize_h, rh);
     max_resize_w = std::max(max_resize_w, rw);
   }
 
   // Use the unified (max) dimensions for all images in the batch
-  const int resize_h = max_resize_h;
-  const int resize_w = max_resize_w;
+  resize_h = max_resize_h;
+  resize_w = max_resize_w;
   const int pixels_per_image = resize_h * resize_w;
 
   // --- 1. Upload per-image metadata to device ---
-  // Use pre-allocated pinned buffers for truly async transfers
+  // Use pre-allocated pinned buffers for truly async transfers.
   for (int i = 0; i < batch_size; i++) {
-    h_batch_src_ptrs_.get()[i] = gpu_imgs[i].data;
-    h_batch_src_steps_.get()[i] = static_cast<int>(gpu_imgs[i].step);
-    h_batch_src_heights_.get()[i] = gpu_imgs[i].rows;
-    h_batch_src_widths_.get()[i] = gpu_imgs[i].cols;
+    // batch_size == min(n, kMaxBatchSize) <= n, so i is always in [0, n);
+    // gpu_imgs has size n == orig_dims.size() (caller builds both in lockstep).
+    int src = (i < n) ? i : 0;
+    // cppcheck-suppress negativeContainerIndex // src in [0,n), see above
+    h_batch_src_ptrs_.get()[i]    = gpu_imgs[src].data;
+    // cppcheck-suppress negativeContainerIndex // src in [0,n), see above
+    h_batch_src_steps_.get()[i]   = static_cast<int>(gpu_imgs[src].step);
+    // cppcheck-suppress negativeContainerIndex // src in [0,n), see above
+    h_batch_src_heights_.get()[i] = gpu_imgs[src].rows;
+    // cppcheck-suppress negativeContainerIndex // src in [0,n), see above
+    h_batch_src_widths_.get()[i]  = gpu_imgs[src].cols;
   }
 
   CUDA_CHECK(cudaMemcpyAsync(d_batch_src_ptrs_.get(), h_batch_src_ptrs_.get(),
@@ -454,17 +471,18 @@ PaddleDet::run_batch(const std::vector<GpuImage> &gpu_imgs,
   engine_->bind_io(d_input_.get(), d_output_.get());
 
   // --- 4. Batched threshold (all images at once) ---
-  turbo_ocr::kernels::cuda_batch_threshold_to_u8(
-      d_batch_output_.get(), d_batch_bitmap_.get(), resize_w, resize_h,
-      batch_size, kDetDbThresh, stream);
+  turbo_ocr::kernels::cuda_batch_threshold_to_u8(d_batch_output_.get(), d_batch_bitmap_.get(),
+                                                 resize_w, resize_h, batch_size, db_thresh_,
+                                                 stream);
 
   // --- 5. Per-image post-processing (GPU CCL fast / CPU contours) ---
   // For each image slice in the batch output, run the appropriate path.
   // We temporarily alias cur_output_ / cur_bitmap_ to point at each image's
   // slice. Scope guard ensures they are restored even if an exception is thrown.
-  std::vector<std::vector<Box>> all_boxes(batch_size);
+  const int real_n = batch_size;
+  std::vector<std::vector<Box>> all_boxes(real_n);
 
-  for (int i = 0; i < batch_size; i++) {
+  for (int i = 0; i < real_n; i++) {
     const int orig_h = infos[i].orig_h;
     const int orig_w = infos[i].orig_w;
 

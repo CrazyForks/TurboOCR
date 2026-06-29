@@ -95,9 +95,9 @@ clean build.
 
 ```bash
 export LD_LIBRARY_PATH=/usr/local/tensorrt/lib:$LD_LIBRARY_PATH
-./build/turboocr-server &
-curl -fsS http://localhost:8000/health/ready
-curl -X POST http://localhost:8000/ocr/raw \
+./build/turboocr-server &      # native build binds port 8080 (the 8000→8080 nginx hop is Docker-only)
+curl -fsS http://localhost:8080/health/ready
+curl -X POST http://localhost:8080/ocr/raw \
      --data-binary @tests/test_data/png/receipt.png \
      -H 'Content-Type: image/png'
 ```
@@ -106,7 +106,8 @@ curl -X POST http://localhost:8000/ocr/raw \
     First start spends ~90 s building TensorRT engines from the bundled
     ONNX files; engines are cached under `~/.cache/turbo-ocr/` so
     subsequent runs are instant. `/health/ready` returns `503 NOT_READY`
-    during the build — the curl above will block until it returns 200.
+    during the build — the `curl -fsS` above fails fast on that 503, so retry
+    it (or poll in a loop) until it returns 200.
 
 ## Build output
 

@@ -88,6 +88,27 @@ build the variables are `*_ONNX`; on the CPU build they are `*_MODEL`.
     is on by default — to disable it set `DISABLE_LAYOUT=1`, or simply
     remove the variable.
 
+## Tables & formulas
+
+Both are **opt-in**: a stage loads only when its backend env var is set at
+startup, and runs only when the request passes `?tables=1` / `?formulas=1`.
+Weights are baked into the image, so setting the backend var is enough — the
+model paths auto-resolve to `models/table/...` / `models/formula/<engine>/` and
+the `*_ONNX` overrides below are only needed for a non-default location.
+
+| Variable | Default | Description |
+|---|---|---|
+| `TABLE_BACKEND` | *(unset)* | `slanext` enables SLANet-Plus table → HTML; auto-resolves the baked encoder. (`vlm` routes to a VL endpoint.) |
+| `TABLE_SLANEXT_ENCODER_ONNX` | `models/table/slanext_encoder/SLANeXt_wired_encoder.onnx` | Override the table encoder path; decoder `.bin` + dict are derived next to it. |
+| `FORMULA_BACKEND` | *(unset)* | `ppformulanet_s` (English/Latin, default engine) or `ppformulanet_plus_m` (Chinese-capable, GPU only) enables formula → LaTeX; auto-resolves the baked weights. |
+| `FORMULA_ONNX` | `models/formula/<engine>` | Override the formula model dir/file. Only needed for a non-baked location. |
+| `FORMULA_TOKENIZER` | `models/formula/<engine>/tokenizer.json` | Override the formula tokenizer path. |
+
+!!! note "CPU build"
+    On the CPU build, `FORMULA_BACKEND` selects only `ppformulanet_s` (plus-M is
+    GPU only). `TABLE_BACKEND=slanext` / `FORMULA_BACKEND=ppformulanet_s` both
+    auto-resolve the same baked paths as the GPU build.
+
 ## PDF
 
 | Variable | Default | Description |

@@ -156,8 +156,25 @@ int main(int argc, char **argv) try {
   // stage this server didn't load.
   bool table_available = false, formula_available = false;
   {
-    const std::string formula_onnx = turbo_ocr::server::env_or("FORMULA_ONNX", "");
-    const std::string formula_tok = turbo_ocr::server::env_or("FORMULA_TOKENIZER", "");
+    std::string formula_onnx = turbo_ocr::server::env_or("FORMULA_ONNX", "");
+    std::string formula_tok = turbo_ocr::server::env_or("FORMULA_TOKENIZER", "");
+    // Auto-resolve baked formula weights when only FORMULA_BACKEND is set
+    // (parity with the GPU build): default to models/formula/ppformulanet_s
+    // (CPU uses the fused inference_trt.onnx inside it via CpuFormulaRecognizer).
+    if (const char *fb = std::getenv("FORMULA_BACKEND");
+        fb && std::string(fb) == "ppformulanet_s" && formula_onnx.empty()) {
+      formula_onnx = "models/formula/ppformulanet_s";
+      if (formula_tok.empty())
+        formula_tok = "models/formula/ppformulanet_s/tokenizer.json";
+    }
+    // Auto-resolve the baked SLANeXt encoder when only TABLE_BACKEND=slanext is
+    // set; load_table_backend() reads TABLE_SLANEXT_ENCODER_ONNX from the env.
+    if (const char *tb = std::getenv("TABLE_BACKEND");
+        tb && std::string(tb) == "slanext" &&
+        turbo_ocr::server::env_or("TABLE_SLANEXT_ENCODER_ONNX", "").empty()) {
+      setenv("TABLE_SLANEXT_ENCODER_ONNX",
+             "models/table/slanext_encoder/SLANeXt_wired_encoder.onnx", 1);
+    }
     const bool want_formula = !formula_onnx.empty() && !formula_tok.empty();
     const bool want_table = !turbo_ocr::server::env_or("TABLE_SLANEXT_ENCODER_ONNX", "").empty();
     if (want_formula || want_table) {

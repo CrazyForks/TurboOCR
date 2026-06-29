@@ -86,7 +86,11 @@ nginx, then execs the CMD.
 
 | Arg | Default | Effect |
 |---|---|---|
-| `OCR_INCLUDE_SERVER` | `1` | Bake the larger `chinese-server` recognition bundle into the image. Set to `0` to skip it. |
+| `TARGETARCH` | host arch | Set automatically by `docker buildx` (`amd64` / `arm64`); selects the matching ONNX Runtime + PDFium binaries. |
+| `ORT_VERSION` | `1.22.0` | ONNX Runtime C++ SDK version baked in. |
+
+All model weights (every tier + language + table/formula) are fetched from the
+GitHub Release at build time, so there is no language-bundle build arg.
 
 ## CPU image
 
@@ -112,7 +116,9 @@ These are read by the server itself and apply to both Dockerfiles:
 | `DISABLE_LAYOUT` | unset | Skip loading PP-DocLayoutV3 (smaller startup, no `?layout=1`). |
 | `MAX_IMAGE_DIM` | `16384` | Pre/post-decode dimension cap (clamped `[64, 65535]`). |
 | `MAX_PDF_PAGES` | `2000` | Hard cap on `/ocr/pdf` page count. |
-| `OCR_REC_MODE` | `mobile` | Default recognizer (`mobile` / `server`). |
+| `OCR_MODEL` | `tiny` | Recognizer tier / language: `tiny`/`small`/`medium` (Latin+Chinese+Japanese) or `arabic`/`eslav`/`korean`/`thai`/`greek`. |
+| `TABLE_BACKEND` | unset | `slanext` enables table→HTML (baked encoder auto-resolves). Run per request with `?tables=1`. |
+| `FORMULA_BACKEND` | unset | `ppformulanet_s` enables formula→LaTeX (baked weights auto-resolve); `ppformulanet_plus_m` for Chinese (GPU). Run per request with `?formulas=1`. |
 | `MAX_BODY_MB` | `100` | nginx `client_max_body_size` (consumed by the nginx template). |
 | `MODELS_RELEASE_URL` | release URL | Override the models bundle base URL at build time. |
 

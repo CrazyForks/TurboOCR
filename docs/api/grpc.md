@@ -29,12 +29,13 @@ service OCRService {
     completes. The `grpc::StatusCode` + message remain primary for
     older clients; `x-error-code` is purely additive.
 
-Known codes (from `proto/ocr.proto:12-17`): `LAYOUT_DISABLED`,
+Known codes (from `proto/ocr.proto:12-18`): `LAYOUT_DISABLED`,
 `INVALID_PARAMETER`, `BASE64_DECODE_FAILED`, `IMAGE_DECODE_FAILED`,
 `DIMENSIONS_TOO_LARGE`, `EMPTY_BATCH`, `MISSING_IMAGE`, `MISSING_PDF`,
 `INVALID_DPI`, `INVALID_DIMENSIONS`, `BODY_SIZE_MISMATCH`,
 `PDF_RENDER_FAILED`, `PDF_NOT_AVAILABLE`, `EMPTY_PDF`, `SERVER_BUSY`,
-`INFERENCE_ERROR`, `NOT_READY`.
+`INFERENCE_ERROR`, `NOT_READY`, `TABLE_BACKEND_DISABLED`,
+`FORMULA_BACKEND_DISABLED`, `STRUCTURED_MODE_NO_STRUCTURE`.
 
 ## Response mode (json_bytes vs. structured)
 
@@ -52,9 +53,10 @@ and only `json_response` is filled.
 !!! warning "`tables`/`formulas` require json_bytes mode"
     The structured `results` field carries text only — the proto has no
     table/formula message. So in `structured` response mode a `tables=1`/
-    `formulas=1` request still runs the stage but the HTML/LaTeX is **not**
-    returned. Read `tables`/`formulas` from `json_response` (the default
-    `json_bytes` mode), exactly like the HTTP API.
+    `formulas=1` request is **rejected** with `UNIMPLEMENTED` +
+    `x-error-code: STRUCTURED_MODE_NO_STRUCTURE` (it is not silently
+    degraded). Use the default `json_bytes` mode and read `tables`/`formulas`
+    from `json_response`, exactly like the HTTP API.
 
 `reading_order` is duplicated as a top-level repeated field for clients
 that don't parse the JSON.

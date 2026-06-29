@@ -29,16 +29,17 @@ a degraded stage never looks identical to a page that genuinely had no formula.
 
 | Env | Meaning |
 | --- | --- |
-| `FORMULA_BACKEND=ppformulanet_s` | Select the local PP-FormulaNet-S backend |
-| `FORMULA_ONNX=…/ppformulanet_s/` | Model root; the GPU loads its `fast/` split graphs |
-| `FORMULA_TOKENIZER=…/ppformulanet_s/tokenizer.json` | BPE vocabulary + merges |
+| `FORMULA_BACKEND=ppformulanet_s` | Select the local PP-FormulaNet-S backend. **This is all you need** — the baked weights at `models/formula/ppformulanet_s/` auto-resolve. |
+| `FORMULA_ONNX=…/ppformulanet_s/` | **Override only** — point at a non-baked model root (the GPU loads its `fast/` split graphs from it). Not needed with the baked image. |
+| `FORMULA_TOKENIZER=…/ppformulanet_s/tokenizer.json` | **Override only** — non-baked tokenizer path. |
 | `PPFNS_CHUNK` | Decode batch size (default 8; clamped to [1, 32]) |
 | `PPFNS_DROP_COLLAPSE=1` | Drop mode-collapsed runaway decodes to empty (opt-in; measured worse overall) |
 
 ### Swapping the local model: `-S` (fast) ⇄ `plus-M` (Chinese)
 
-Two local in-process C++ formula models are selectable via `FORMULA_BACKEND` — pick
-one and point `FORMULA_ONNX`/`FORMULA_TOKENIZER` at its files:
+Two local in-process C++ formula models are selectable via `FORMULA_BACKEND`
+(weights auto-resolve from `models/formula/<engine>/`; the `FORMULA_ONNX`/
+`FORMULA_TOKENIZER` overrides below are optional, for non-baked locations):
 
 | `FORMULA_BACKEND` | Model | Chinese (CJK-F1) | English | Speed¹ |
 | --- | --- | --- | --- | --- |
@@ -52,10 +53,8 @@ zero Chinese; `plus-M` recovers ~73% of Chinese characters and edges out `-S` on
 at ~1/12 the throughput.** Use `-S` by default, swap to `plus-M` for Chinese documents.
 
 ```bash
-# Chinese-capable:
-FORMULA_BACKEND=ppformulanet_plus_m \
-FORMULA_ONNX=…/models/formula/ppformulanet_plus_m \
-FORMULA_TOKENIZER=…/models/formula/ppformulanet_plus_m/tokenizer.json
+# Chinese-capable (GPU only) — weights auto-resolve from the baked dir:
+FORMULA_BACKEND=ppformulanet_plus_m
 ```
 
 `plus-M` uses the **same in-process FAST host-loop design** as `-S` (its own

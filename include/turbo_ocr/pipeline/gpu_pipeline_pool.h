@@ -68,14 +68,29 @@ inline void maybe_load_router_models(OcrPipeline &pipeline) {
     });
     return;
   }
+  // Auto-resolve the baked formula weights when only FORMULA_BACKEND is set
+  // (parity with TABLE_BACKEND=slanext, which defaults its encoder path): use
+  // models/formula/<engine> and let the recognizer find its own files (fast/ for
+  // -S, the dir itself for plus-M). Gated on FORMULA_BACKEND being EXPLICITLY
+  // set, so text-only stays the default; the per-request ?formulas=1 opt-in
+  // still gates execution (loading a backend != running it).
+  std::string formula_onnx = env("FORMULA_ONNX");
+  std::string formula_tok  = env("FORMULA_TOKENIZER");
+  if (const char *fb = std::getenv("FORMULA_BACKEND");
+      fb && *fb && formula_onnx.empty() &&
+      (std::string(fb) == "ppformulanet_s" ||
+       std::string(fb) == "ppformulanet_plus_m")) {
+    formula_onnx = std::string("models/formula/") + fb;
+    if (formula_tok.empty()) formula_tok = formula_onnx + "/tokenizer.json";
+  }
   // Router (CuaRouter) + formula stage. A
   // CONFIGURED backend that fails to load (out-of-memory / bad model) ABORTS
   // boot — we never start a server that silently produces no formulas/tables.
   if (!pipeline.load_router_models(
           env("TABLE_CLS_TRT"), env("TABLE_CELL_WIRED_TRT"),
           env("TABLE_CELL_WIRELESS_TRT"), env("TABLE_SLANEXT_WIRED_TRT"),
-          env("TABLE_SLANEXT_WIRELESS_TRT"), env("FORMULA_ONNX"),
-          env("FORMULA_TOKENIZER")))
+          env("TABLE_SLANEXT_WIRELESS_TRT"), formula_onnx,
+          formula_tok))
     throw turbo_ocr::ModelLoadError(
         "configured formula backend failed to load (out-of-memory or bad model); "
         "refusing to start with formulas silently disabled — lower "

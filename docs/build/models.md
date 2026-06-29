@@ -10,7 +10,7 @@
 ## Release URL
 
 ```bash
-MODELS_RELEASE_URL="${MODELS_RELEASE_URL:-https://github.com/aiptimizer/TurboOCR/releases/download/models-v2.1.0}"
+MODELS_RELEASE_URL="${MODELS_RELEASE_URL:-https://github.com/aiptimizer/TurboOCR/releases/download/models-v3.0.0-ppocrv6}"
 ```
 
 Override `MODELS_RELEASE_URL` to pin a different release tag (e.g.
@@ -20,27 +20,29 @@ inside an air-gapped mirror). The fetcher first downloads
 
 ## Per-language download flow
 
-For every language in `LANGS=(chinese greek eslav arabic korean thai)`
-(plus `chinese-server` when `OCR_INCLUDE_SERVER=1`):
+The PP-OCRv6 tiers cover Latin + Chinese + Japanese, so Chinese is **not** a
+separate download. Only the non-Latin scripts have per-language recognizers —
+for every script in `LANGS=(greek eslav arabic korean thai)`:
 
 ```text
 ${MODELS_RELEASE_URL}/rec-${lang}.onnx   →  models/rec/${lang}/rec.onnx
 ${MODELS_RELEASE_URL}/dict-${lang}.txt   →  models/rec/${lang}/dict.txt
 ```
 
-!!! note "chinese-server reuses chinese's dict"
-    `chinese-server` is a bigger PP-OCRv5 backbone trained on the same
-    label set, so the fetcher copies `chinese/dict.txt` rather than
-    pulling a duplicate (`fetch_release_models.sh:67-70`).
-
-The shared / Latin-default heads land at:
+The default PP-OCRv6 det/rec/cls tiers + shared stages land at:
 
 ```text
-${MODELS_RELEASE_URL}/det.onnx       →  models/det.onnx
-${MODELS_RELEASE_URL}/cls.onnx       →  models/cls.onnx
-${MODELS_RELEASE_URL}/rec.onnx       →  models/rec.onnx       (Latin)
-${MODELS_RELEASE_URL}/keys.txt       →  models/keys.txt       (Latin)
-${MODELS_RELEASE_URL}/layout.onnx    →  models/layout/layout.onnx
+${MODELS_RELEASE_URL}/det.onnx        →  models/det.onnx        (PP-OCRv6 medium det)
+${MODELS_RELEASE_URL}/det_small.onnx  →  models/det_small.onnx
+${MODELS_RELEASE_URL}/det_tiny.onnx   →  models/det_tiny.onnx   (default tier)
+${MODELS_RELEASE_URL}/rec.onnx        →  models/rec.onnx        (PP-OCRv6 medium, Latin+CJK)
+${MODELS_RELEASE_URL}/rec_small.onnx  →  models/rec_small.onnx
+${MODELS_RELEASE_URL}/rec_tiny.onnx   →  models/rec_tiny.onnx   (default tier)
+${MODELS_RELEASE_URL}/keys.txt        →  models/keys.txt
+${MODELS_RELEASE_URL}/keys_tiny.txt   →  models/keys_tiny.txt
+${MODELS_RELEASE_URL}/cls.onnx        →  models/cls.onnx
+${MODELS_RELEASE_URL}/layout.onnx     →  models/layout/layout.onnx
+${MODELS_RELEASE_URL}/doc_ori.onnx    →  models/doc_ori.onnx
 ```
 
 ## On-disk inventory
@@ -49,13 +51,13 @@ Verified tree from this checkout (`find models -maxdepth 3 -type f`):
 
 ```text
 cls.onnx
-det.onnx
-keys.txt
+det.onnx              det_small.onnx   det_tiny.onnx     # PP-OCRv6 det tiers
+rec.onnx             rec_small.onnx   rec_tiny.onnx      # PP-OCRv6 rec tiers (Latin+CJK)
+keys.txt             keys_tiny.txt
+doc_ori.onnx
 MANIFEST.txt
-rec.onnx
 layout/layout.onnx
 rec/arabic/{rec.onnx,dict.txt}
-rec/chinese/{rec.onnx,dict.txt}
 rec/eslav/{rec.onnx,dict.txt}
 rec/greek/{rec.onnx,dict.txt}
 rec/korean/{rec.onnx,dict.txt}
@@ -132,5 +134,5 @@ asset that drifts from the pinned hashes.
       hand.
     - [Build → Docker](docker.md) — how the fetcher is staged into the
       image.
-    - [Models → Formula](../models/formula.md) — the three-engine
-      flow that replaces PP-FormulaNet-S.
+    - [Models → Formula](../models/formula.md) — PP-FormulaNet-S, the live
+      backend (the archival three-engine export is documented there too).

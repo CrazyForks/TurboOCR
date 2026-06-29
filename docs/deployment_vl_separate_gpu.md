@@ -78,7 +78,7 @@ LD_LIBRARY_PATH=/path/to/TensorRT/lib \
 
 Verify the wiring (no secrets are emitted — names + kinds only):
 ```bash
-curl -s http://127.0.0.1:18080/capabilities | jq .routing
+curl -s http://127.0.0.1:8080/capabilities | jq .routing
 # { "routes": {"table":"vl_table","formula":"vl_formula","text":"default"},
 #   "backends": {"vl_table":{"kind":"openai"}, "vl_formula":{"kind":"openai"},
 #                "slanext_local":{"kind":"local"}} }

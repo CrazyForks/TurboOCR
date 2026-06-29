@@ -39,7 +39,7 @@ while slot N's H2D copy is still in flight
 
 | Field | Value |
 | --- | --- |
-| ONNX path | `models/rec.onnx` (PP-OCRv5 Latin) plus per-script under `models/rec/{arabic,chinese,korean,greek,eslav,thai}/rec.onnx` |
+| ONNX path | `models/rec{,_small,_tiny}.onnx` (PP-OCRv6 medium/small/tiny, Latin+Chinese+Japanese; default tier `tiny`) plus per-script under `models/rec/{arabic,korean,greek,eslav,thai}/rec.onnx` (retained PP-OCRv5) |
 | Engine cache key | `rec_<gpu>_<trt_version>.plan` (one per script) |
 | Input tensor | `x : (N, 3, 48, W)` float32, BGR, ImageNet-normalised |
 | Dynamic profile | MIN `(1,3,48,32)` · OPT `(32,3,48,320)` · MAX `(32,3,48,4000)` |

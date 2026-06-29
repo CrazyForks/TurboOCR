@@ -136,8 +136,8 @@ identifiers regardless of transport (`proto/ocr.proto:5-22`).
 | `BODY_SIZE_MISMATCH` | 400 | `/ocr/pixels` body length != `width × height × channels`. |
 | `EMPTY_BATCH` | 400 | `/ocr/batch` received an empty `images` array. |
 | `LAYOUT_DISABLED` | 400 | A layout-dependent feature requested against a `DISABLE_LAYOUT=1` server. |
-| `TABLE_BACKEND_DISABLED` | 400 | `tables=1` requested but no table backend loaded (`TABLE_BACKEND=` + `TABLE_SLANEXT_ENCODER_ONNX=`). |
-| `FORMULA_BACKEND_DISABLED` | 400 | `formulas=1` requested but no formula backend loaded (`FORMULA_ONNX=` + `FORMULA_TOKENIZER=`). |
+| `TABLE_BACKEND_DISABLED` | 400 | `tables=1` requested but no table backend loaded — start with `TABLE_BACKEND=slanext` (weights auto-resolve). |
+| `FORMULA_BACKEND_DISABLED` | 400 | `formulas=1` requested but no formula backend loaded — start with `FORMULA_BACKEND=ppformulanet_s` (weights auto-resolve). |
 | `STRUCTURED_MODE_NO_STRUCTURE` | 400/UNIMPLEMENTED | gRPC `tables`/`formulas` requested under `structured` response mode (use `json_bytes`). |
 | `MISSING_FILE` | 400 | Multipart upload missing the `file`/`pdf` field. |
 | `MISSING_PDF` | 400 | PDF payload absent. |

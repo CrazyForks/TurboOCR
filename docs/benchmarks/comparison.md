@@ -8,8 +8,9 @@ parsing (papers/books with tables and formulas).
     - **Forms & receipts:** TurboOCR has the best text accuracy *and* is 15–90×
       faster than every other engine.
     - **Full document parsing:** TurboOCR's local pipeline reaches **0.90 Overall**
-      on OmniDocBench at **20 pages/s**, within ~5 points of **PaddleOCR-VL (0.95)**
-      — which runs at **0.9 pages/s**. A ~20× speed gap, fully local, no API.
+      on a **125-doc OmniDocBench subset** at **20 pages/s**, within ~5 points of
+      **PaddleOCR-VL (0.95, same subset)** — which runs at **0.9 pages/s**. A ~20×
+      speed gap, fully local, no API. (Subset, not the full 1651-page set.)
 
 ## What is measured
 
@@ -17,9 +18,13 @@ parsing (papers/books with tables and formulas).
   lowercased, split into ≥2-char tokens, scored by set overlap. Every engine gets
   the same image and the same metric. FUNSD (English forms) and CORD (English
   receipts), 50 pages each.
-- **Full document parsing:** the **official OmniDocBench scorer** over 125 complex
-  English documents. Text = 1 − text-block edit distance, Formula = CDM, Table =
-  TEDS-structure, Overall = mean of the three.
+- **Full document parsing:** the **official OmniDocBench scorer** over a
+  **125-document stratified subset** of OmniDocBench — **not** the full 1651-page
+  set. The subset is table/formula-heavy (used for fast iteration); every pipeline
+  is scored on the same 125 documents, so the comparison is apples-to-apples but
+  the absolute Overall is not directly comparable to full-1651 leaderboard numbers.
+  Text = 1 − text-block edit distance, Formula = CDM, Table = TEDS-structure,
+  Overall = mean of the three.
 - **Hardware:** RTX 5090. Throughput is steady-state at saturating concurrency;
   the full-pipeline figure runs layout + text + table + formula together.
 
@@ -46,7 +51,8 @@ next-most-accurate engine.
 ## Full document parsing (full pipeline)
 
 Each pipeline is run end-to-end (layout → region recognition → reading-order
-assembly) and scored by the official OmniDocBench scorer on 125 documents.
+assembly) and scored by the official OmniDocBench scorer on a **125-document
+subset** (the same documents for every pipeline; not the full 1651-page set).
 
 | Pipeline | Text | Formula (CDM) | Table (TEDS) | Overall | pg/s |
 |---|---:|---:|---:|---:|---:|

@@ -124,8 +124,8 @@ identifiers regardless of transport (`proto/ocr.proto:5-22`).
 | `EMPTY_BODY` | 400 | Request body was empty. |
 | `INVALID_JSON` | 400 | JSON body failed to parse. |
 | `MISSING_IMAGE` | 400 | Expected image field absent from the payload. |
-| `MISSING_HEADER` | 400 | A required header (e.g. `X-Width` on `/ocr/pixels`) was missing. |
-| `INVALID_HEADER` | 400 | A header was present but malformed or out of range. |
+| `MISSING_DIMENSIONS` | 400 | `/ocr/pixels` width/height absent from both query params and `X-*` headers. |
+| `DIMENSION_CONFLICT` | 400 | `/ocr/pixels` query param and `X-*` header give different width/height/channels. |
 | `BASE64_DECODE_FAILED` | 400 | Base64-encoded input could not be decoded. |
 | `IMAGE_DECODE_FAILED` | 400 | Image bytes could not be decoded by any codec path. |
 | `INVALID_PARAMETER` | 400 | A query parameter value was rejected. |
@@ -136,6 +136,9 @@ identifiers regardless of transport (`proto/ocr.proto:5-22`).
 | `BODY_SIZE_MISMATCH` | 400 | `/ocr/pixels` body length != `width × height × channels`. |
 | `EMPTY_BATCH` | 400 | `/ocr/batch` received an empty `images` array. |
 | `LAYOUT_DISABLED` | 400 | A layout-dependent feature requested against a `DISABLE_LAYOUT=1` server. |
+| `TABLE_BACKEND_DISABLED` | 400 | `tables=1` requested but no table backend loaded (`TABLE_BACKEND=` + `TABLE_SLANEXT_ENCODER_ONNX=`). |
+| `FORMULA_BACKEND_DISABLED` | 400 | `formulas=1` requested but no formula backend loaded (`FORMULA_ONNX=` + `FORMULA_TOKENIZER=`). |
+| `STRUCTURED_MODE_NO_STRUCTURE` | 400/UNIMPLEMENTED | gRPC `tables`/`formulas` requested under `structured` response mode (use `json_bytes`). |
 | `MISSING_FILE` | 400 | Multipart upload missing the `file`/`pdf` field. |
 | `MISSING_PDF` | 400 | PDF payload absent. |
 | `INVALID_MULTIPART` | 400 | Multipart body could not be parsed. |
@@ -150,7 +153,7 @@ identifiers regardless of transport (`proto/ocr.proto:5-22`).
     The gRPC "known codes" comment in `proto/ocr.proto` additionally lists
     `PDF_NOT_AVAILABLE` (returned when the build lacks PDF support) and does
     not enumerate the HTTP-only client-validation codes
-    (`UNSUPPORTED_PARAMETER`, `MISSING_HEADER`, `INVALID_HEADER`,
+    (`UNSUPPORTED_PARAMETER`, `MISSING_DIMENSIONS`, `DIMENSION_CONFLICT`,
     `INVALID_JSON`). The `x-error-code` field is additive over the primary
     `grpc::StatusCode`, so older clients can ignore it.
 

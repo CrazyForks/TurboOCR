@@ -26,8 +26,8 @@ Parsed by `server::parse_query_options()` in
 | `layout` | `0` | Run PP-DocLayoutV3 and emit a `layout` array. |
 | `reading_order` | `0` | XY-cut over the layout boxes; emits `reading_order`. Auto-enables `layout`. |
 | `as_blocks` | `0` | Emit paragraph-level `blocks`. Auto-enables `layout` + `reading_order`. |
-| `tables` | startup default | Run the CUA router's table branch (SLANeXt, or a VLM backend) and emit `tables`. Auto-enables `layout`. |
-| `formulas` | startup default | Run the formula branch (PP-FormulaNet-S, in-process ORT-CUDA-13) and emit `formulas`. Auto-enables `layout`. |
+| `tables` | `0` | Run the table branch (SLANeXt, or a VLM backend) and emit `tables`. Strict opt-in: `1` requires a table backend configured at startup, else `400 TABLE_BACKEND_DISABLED`. Auto-enables `layout`. |
+| `formulas` | `0` | Run the formula branch (PP-FormulaNet-S, in-process ORT-CUDA-13) and emit `formulas`. Strict opt-in: `1` requires a formula backend configured at startup, else `400 FORMULA_BACKEND_DISABLED`. Auto-enables `layout`. |
 | `rec_mode` | env `OCR_REC_MODE` | Per-request recognizer override (`mobile` / `server`). |
 
 !!! note "Optional fields stay byte-identical when empty"
@@ -154,8 +154,15 @@ BGR or grayscale buffer. Zero decode overhead, the lowest-latency entry
 point.
 
 - **Body**: raw pixel data, exactly `width × height × channels` bytes.
-- **Required headers**: `X-Width`, `X-Height`. Optional `X-Channels`
-  (defaults to `3`; only `1` or `3` accepted).
+- **Dimensions**: pass `?width=`&`height=` query params (preferred), or the
+  legacy `X-Width` / `X-Height` headers (kept for back-compat since v2.3).
+  `channels`/`X-Channels` is optional (defaults to `3`; only `1` or `3`).
+  Query params win when both are supplied — **unless they disagree**, which
+  returns `400 DIMENSION_CONFLICT`. Missing width/height → `400 MISSING_DIMENSIONS`.
+  Requests that use the legacy `X-*` headers get a `Deprecation: true` response
+  header (RFC 8594) plus an `X-Deprecation-Notice` pointing to the query params.
+- **Opt-in params** (`layout`, `reading_order`, `tables`, `formulas`, …) are
+  query params, same as every other route.
 - **Dim guard**: same `MAX_IMAGE_DIM` as `/ocr/raw`.
 
 ### Request
@@ -163,10 +170,10 @@ point.
 === "bash"
 
     ```bash
-    curl -X POST http://localhost:8000/ocr/pixels \
-         -H 'X-Width: 1280' -H 'X-Height: 720' -H 'X-Channels: 3' \
+    curl -X POST 'http://localhost:8000/ocr/pixels?width=1280&height=720&channels=3' \
          -H 'Content-Type: application/octet-stream' \
          --data-binary @frame.bgr
+    # (legacy, still supported: -H 'X-Width: 1280' -H 'X-Height: 720' instead of the query params)
     ```
 
 === "python"
@@ -199,8 +206,9 @@ point.
 
 Response shape is identical to `/ocr/raw`.
 
-Error codes: `MISSING_HEADER`, `INVALID_HEADER`, `INVALID_DIMENSIONS`,
-`DIMENSIONS_TOO_LARGE`, `BODY_SIZE_MISMATCH`, plus the shared set.
+Error codes: `MISSING_DIMENSIONS` (no width/height via query or header),
+`DIMENSION_CONFLICT` (query param and `X-*` header disagree), `INVALID_DIMENSIONS`,
+`DIMENSIONS_TOO_LARGE`, `PIXELS_TOO_LARGE`, `BODY_SIZE_MISMATCH`, plus the shared set.
 
 ---
 

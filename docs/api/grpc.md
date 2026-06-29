@@ -49,6 +49,13 @@ When the server is launched with `--grpc-response-mode=json_only` (see
 `./turboocr-server --print-config`), the structured fields are skipped
 and only `json_response` is filled.
 
+!!! warning "`tables`/`formulas` require json_bytes mode"
+    The structured `results` field carries text only — the proto has no
+    table/formula message. So in `structured` response mode a `tables=1`/
+    `formulas=1` request still runs the stage but the HTML/LaTeX is **not**
+    returned. Read `tables`/`formulas` from `json_response` (the default
+    `json_bytes` mode), exactly like the HTTP API.
+
 `reading_order` is duplicated as a top-level repeated field for clients
 that don't parse the JSON.
 
@@ -69,10 +76,17 @@ message OCRRequest {
   int32 channels      = 9;
   bool  reading_order = 10;  // auto-enables layout
   bool  as_blocks     = 11;  // auto-enables layout + reading_order
+  bool  tables        = 12;  // strict opt-in; auto-enables layout
+  bool  formulas      = 13;  // strict opt-in; auto-enables layout
 }
 ```
 
-The encoded path mirrors HTTP `/ocr/raw`; the pixels path mirrors
+`tables`/`formulas` are strict opt-in (like HTTP `?tables=1`/`?formulas=1`): a
+configured backend is necessary but the field must be set for the stage to run.
+Setting the field with no backend configured fails loud — `INVALID_ARGUMENT` with
+`x-error-code: TABLE_BACKEND_DISABLED` / `FORMULA_BACKEND_DISABLED`.
+They surface in `json_response` (json_bytes mode). The encoded path mirrors HTTP
+`/ocr/raw`; the pixels path mirrors
 `/ocr/pixels`. Layout / reading-order / blocks have the same
 auto-promotion rules as the HTTP query parsers — see
 `include/turbo_ocr/server/grpc_service.h:217-225`.
@@ -147,6 +161,8 @@ message OCRBatchRequest {
   bool  layout            = 3;
   bool  reading_order     = 4;  // auto-enables layout
   bool  as_blocks         = 5;  // auto-enables layout + reading_order
+  bool  tables            = 6;  // strict opt-in; auto-enables layout
+  bool  formulas          = 7;  // strict opt-in; auto-enables layout
 }
 
 message OCRBatchResponse {
@@ -172,6 +188,8 @@ message OCRPDFRequest {
   int32  dpi       = 3;   // default 100, clamped to [50, 600]
   bool   layout    = 4;
   bool   as_blocks = 5;   // auto-enables layout
+  bool   tables    = 6;   // strict opt-in; auto-enables layout
+  bool   formulas  = 7;   // strict opt-in; auto-enables layout
 }
 
 message OCRPDFResponse {

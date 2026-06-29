@@ -35,7 +35,7 @@
   <a href="#models">Models</a> &middot;
   <a href="#upgrading-to-v3-breaking-changes">v3 changes</a> &middot;
   <a href="#api">API</a> &middot;
-  <a href="https://aiptimizer.github.io/TurboOCR/">Docs</a>
+  <a href="docs/index.md">Docs</a>
 </p>
 
 ---
@@ -43,12 +43,12 @@
 An extremely fast GPU **document parser** — not just OCR. PP-OCRv6 detection +
 recognition, plus layout, tables (→ HTML), formulas (→ LaTeX) and reading-order
 **Markdown**, the whole pipeline on a single multi-stream CUDA/TensorRT engine,
-locally (no VLM), behind HTTP and gRPC. It turns documents into structured data
-at OCR speed — **200–556 images/s on one GPU**, where VLM document parsers like
-PaddleOCR-VL run ~1–2 pages/s. On forms and receipts it is both the most accurate
-open engine and 15–90× faster than classic OCR engines.
+locally (no VLM), behind HTTP and gRPC. Whole-page OCR runs at **up to 559 images/s
+on one GPU**, and full structured parsing (layout + tables + formulas) at **~20
+pages/s** — where VLM document parsers like PaddleOCR-VL run ~1 page/s. On forms and
+receipts it is both the most accurate open engine and 15–90× faster than classic OCR engines.
 
-- 🚀 **Up to 556 img/s** (receipts) / **481 img/s** (forms) on one RTX 5090, fastest by default
+- 🚀 **Up to 559 img/s** (receipts) / **520 img/s** (forms) on one RTX 5090, fastest by default
 - 🎯 **Most accurate on forms & receipts** &mdash; beats PaddleOCR-VL, PaddleOCR-Python, RapidOCR, EasyOCR and Tesseract ([benchmarks](#benchmarks))
 - 🧠 **PP-OCRv6** &mdash; one model covers Latin + Chinese + Japanese; pick `tiny` (default) / `small` / `medium`
 - 🌐 **More scripts** &mdash; Arabic, Cyrillic, Korean, Thai, Greek via retained PP-OCRv5 recognizers
@@ -57,7 +57,7 @@ open engine and 15–90× faster than classic OCR engines.
 - 🔢 **Tables & formulas** &mdash; opt-in SLANet+ table → HTML and PP-FormulaNet-S formula → LaTeX, emitted alongside the text ([how to enable](#tables--formulas))
 - 🐳 **One-line Docker deploy** with TensorRT engines auto-built on first start, **Prometheus** metrics on `/metrics`
 
-Full documentation: **<https://aiptimizer.github.io/TurboOCR/>**
+Full documentation: **[docs/](docs/index.md)**
 
 ---
 
@@ -83,60 +83,18 @@ curl -X POST http://localhost:8000/ocr/raw \
 {"results": [{"text": "Invoice Total", "confidence": 0.97, "bounding_box": [[42,10],[210,10],[210,38],[42,38]]}]}
 ```
 
-→ [Docker & deployment](https://aiptimizer.github.io/TurboOCR/build/docker/) · [Build from source](https://aiptimizer.github.io/TurboOCR/build/native/)
+→ [Docker & deployment](docs/build/docker.md) · [Build from source](docs/build/native.md)
 
 ---
 
 ## Benchmarks
 
-Like-for-like against the common OCR engines on a single RTX 5090. Two comparisons:
-**whole-page OCR on English forms & receipts** (every engine), and **full-pipeline parsing
-of complex English documents** — text, formulas and tables scored together on OmniDocBench.
+On a single RTX 5090, vs every common OCR engine:
 
-### Forms & receipts — English (whole-page OCR)
+- **Forms & receipts:** best accuracy (FUNSD 92% / CORD 93% word-F1 on the medium tier) and **15–90× faster** than every other engine — up to **559 img/s** on the default tiny tier.
+- **Full document parsing:** **0.90** OmniDocBench Overall at **20 pages/s**, within ~5 points of PaddleOCR-VL (0.95) which runs at ~1 pg/s — fully local, no API.
 
-Same images, same word-F1 metric for every engine; FUNSD (English forms) and CORD (English receipts), 50 pages each. Word-F1 = lowercased ≥2-char token overlap.
-
-![OCR accuracy on forms and receipts](tests/benchmark/comparison/images/compare_accuracy.png)
-![Throughput on forms and receipts](tests/benchmark/comparison/images/compare_throughput.png)
-
-| Engine | FUNSD F1 | CORD F1 | Speed (FUNSD) |
-|---|---:|---:|---:|
-| **TurboOCR-medium** | **92.3%** | **93.4%** | 89 img/s |
-| TurboOCR-small | 90.8% | 92.8% | 234 img/s |
-| TurboOCR-tiny *(default)* | 85.4% | 88.9% | **481 img/s** |
-| TurboOCR-v5 *(legacy)* | 90.2% | 91.8% | 249 img/s |
-| PaddleOCR-VL-1.6 | 91.6% | 89.4% | 5 img/s |
-| PaddleOCR PP-OCRv5 (Python) | 86.6% | 86.4% | 6 img/s |
-| RapidOCR (GPU) | 69.1% | 82.6% | 2 img/s |
-| EasyOCR | 59.8% | 67.3% | 3 img/s |
-| Tesseract | 62.3% | 38.2% | 2 img/s |
-
-TurboOCR has the best accuracy **and** is 15–90× faster than every other engine on forms and receipts.
-
-### Complex documents — English (full pipeline, all metrics)
-
-Papers and books need layout-aware parsing, so each pipeline is run end-to-end
-(layout → region recognition → reading order) and scored by the **official OmniDocBench
-scorer** on **English** documents (125 docs · 67 tables · 66 formulas). Every metric —
-text, formula and table — is measured, so the Latin-only v5 path is a fair comparison and
-is included.
-
-| Pipeline | Text | Formula CDM | Table TEDS | Overall | Speed |
-|---|---:|---:|---:|---:|---:|
-| PaddleOCR-VL-1.6 | 97.1% | 0.973 | 0.915 | 0.953 | 0.94 pg/s |
-| TurboOCR-medium | 95.6% | 0.917 | 0.819 | 0.897 | 35 pg/s |
-| TurboOCR-small | 95.6% | 0.917 | 0.819 | 0.897 | 70 pg/s |
-| TurboOCR-tiny *(default)* | 95.4% | 0.917 | 0.819 | 0.897 | **108 pg/s** |
-| TurboOCR-v5 *(legacy)* | 95.8% | 0.917 | 0.819 | 0.898 | 108 pg/s |
-
-Text = 1 − text-block edit distance; Table TEDS = structure-only; Overall = mean of the three.
-Formula CDM and Table TEDS are **identical across the TurboOCR rows** — every tier (and v5)
-shares the same PP-FormulaNet-S and SLANet-Plus stages; only the text recognizer differs. On
-English text TurboOCR lands within **~1.5 points** of PaddleOCR-VL while running **35–115×
-faster**; the rest of the Overall gap is table/formula recognition, where the VLM leads.
-
-→ Full tables, metric definitions, languages, and how each pipeline is run: [Engine comparison](https://aiptimizer.github.io/TurboOCR/benchmarks/comparison/)
+→ [Full benchmarks & methodology](docs/benchmarks/comparison.md)
 
 ---
 
@@ -165,16 +123,23 @@ retained PP-OCRv5 recognizers, also via `OCR_MODEL`: `arabic`, `eslav` (Cyrillic
 The table/formula stages always run **locally** in C++ by default (SLANet-Plus, and
 PP-FormulaNet-S on ORT-CUDA-13).
 
-→ [Model selection guide](https://aiptimizer.github.io/TurboOCR/models/selection/)
+→ [Model selection guide](docs/models/selection.md)
 
 ---
 
 ## Tables & formulas
 
-Table and formula recognition are **opt-in**: the router only loads them when a
-backend is configured at startup, so the default text path is untouched. Once a
-backend is set, run any request with `layout` enabled and the response gains
-`tables` (HTML + cell quads) and/or `formulas` (LaTeX) arrays.
+Table and formula recognition are **strictly opt-in, per request**. The router
+only loads a backend when one is configured at startup, *and* a stage runs only
+when the request explicitly asks for it with `?tables=1` and/or `?formulas=1`
+(gRPC: the `tables` / `formulas` request fields). `layout` alone never triggers
+them, so the default path pays nothing. When requested (and a backend is loaded),
+the response gains `tables` (HTML + cell quads) and/or `formulas` (LaTeX) arrays.
+`tables=1`/`formulas=1` auto-enable layout. Asking for a stage the server wasn't
+started with is a hard error (`400 TABLE_BACKEND_DISABLED` / `FORMULA_BACKEND_DISABLED`),
+never a silent empty result — check `GET /capabilities` for what a server supports.
+(`/ocr/markdown` always includes both, best-effort, since a faithful Markdown export
+needs them.)
 
 | Capability | Enable at startup | Recognizer |
 |---|---|---|
@@ -186,11 +151,11 @@ docker run --gpus all -p 8000:8000 \
   -e FORMULA_BACKEND=ppformulanet_s -e TABLE_BACKEND=slanext \
   -v trt-cache:/home/ocr/.cache/turbo-ocr ghcr.io/aiptimizer/turboocr:latest
 
-curl -X POST "http://localhost:8000/ocr/raw?layout=1" \
+curl -X POST "http://localhost:8000/ocr/raw?layout=1&tables=1&formulas=1" \
   --data-binary @paper.png -H "Content-Type: image/png"
 ```
 
-→ [Tables](https://aiptimizer.github.io/TurboOCR/models/table/) · [Formulas](https://aiptimizer.github.io/TurboOCR/models/formula/)
+→ [Tables](docs/models/table.md) · [Formulas](docs/models/formula.md)
 
 ---
 
@@ -279,14 +244,16 @@ One binary serves HTTP and gRPC from a shared GPU pipeline pool.
 | `GET /metrics` | Prometheus metrics |
 | `GET /health` · `/health/live` · `/health/ready` | Liveness / readiness probes |
 
-All endpoints accept `?layout=1` (region detection + reading order). Example:
+All endpoints accept `?layout=1` (region detection + reading order), and
+`?tables=1` / `?formulas=1` to additionally run table → HTML / formula → LaTeX on
+detected regions (strict opt-in — see [Tables & formulas](#tables--formulas)). Example:
 
 ```bash
-curl -X POST "http://localhost:8000/ocr/raw?layout=1" \
+curl -X POST "http://localhost:8000/ocr/raw?layout=1&tables=1&formulas=1" \
   --data-binary @document.png -H "Content-Type: image/png"
 ```
 
-→ [HTTP API](https://aiptimizer.github.io/TurboOCR/api/http/) · [gRPC API](https://aiptimizer.github.io/TurboOCR/api/grpc/) · [Monitoring](https://aiptimizer.github.io/TurboOCR/api/monitoring/)
+→ [HTTP API](docs/api/http.md) · [gRPC API](docs/api/grpc.md) · [Monitoring](docs/api/monitoring.md)
 
 ---
 
@@ -304,7 +271,7 @@ Common ones:
 | `REQUEST_TIMEOUT_MS` | `60000` | Per-request inference deadline; on overrun returns `504` and frees the slot. `0` = unbounded (pre-v3 behaviour). |
 | `PIPELINE_POOL_SIZE` | auto | Concurrent GPU pipelines |
 
-→ [Full configuration reference (35+ variables)](https://aiptimizer.github.io/TurboOCR/build/config/)
+→ [Full configuration reference (35+ variables)](docs/build/config.md)
 
 ---
 
@@ -325,7 +292,7 @@ LD_LIBRARY_PATH=/usr/local/tensorrt/lib ./build/turboocr-server
 Needs GCC 13.3+/C++20, CUDA + TensorRT 10.2+, OpenCV 4.x, Drogon 1.9+, gRPC.
 Wuffs, Clipper, and PDFium are vendored in `third_party/`.
 
-→ [Build guide & GPU-architecture notes](https://aiptimizer.github.io/TurboOCR/build/native/)
+→ [Build guide & GPU-architecture notes](docs/build/native.md)
 
 ---
 

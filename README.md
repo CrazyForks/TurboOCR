@@ -71,8 +71,12 @@ docker run --gpus all -p 8000:8000 -p 50051:50051 \
   ghcr.io/aiptimizer/turboocr:latest
 ```
 
-First startup builds TensorRT engines from ONNX (~90s); the named volume caches
-them for instant restarts. nginx (port 8000) reverse-proxies to the server.
+First startup builds TensorRT engines from ONNX. This takes about 90 seconds on a
+5090 GPU and up to an hour on older ones. Set `TRT_OPT_LEVEL=3` to cut build time
+3 to 5x with a small speed regression. The named volume caches the engines, so
+subsequent starts are instant. During the build, requests return a connection
+refused error from nginx until the backend is ready. nginx (port 8000)
+reverse-proxies to Drogon (port 8080), and both start automatically.
 
 ```bash
 curl -X POST http://localhost:8000/ocr/raw \

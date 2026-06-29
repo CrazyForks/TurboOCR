@@ -44,12 +44,12 @@ An extremely fast GPU **document parser** — not just OCR. PP-OCRv6 detection +
 recognition, plus layout, tables (→ HTML), formulas (→ LaTeX) and reading-order
 **Markdown**, the whole pipeline on a single multi-stream CUDA/TensorRT engine,
 locally (no VLM), behind HTTP and gRPC. Whole-page OCR runs at **up to 559 images/s
-on one GPU**, and full structured parsing (layout + tables + formulas) at **~20
-pages/s** — where VLM document parsers like PaddleOCR-VL run ~1 page/s. On forms and
-receipts it is both the most accurate open engine and 15–90× faster than classic OCR engines.
+on receipts** (one RTX 5090), and full structured parsing (layout + tables + formulas)
+at **~20 pages/s** — where VLM document parsers like PaddleOCR-VL run ~1 page/s. On
+forms and receipts it is accurate and 15–90× faster than classic OCR engines.
 
 - 🚀 **Up to 559 img/s** (receipts) / **520 img/s** (forms) on one RTX 5090, fastest by default
-- 🎯 **Most accurate on forms & receipts** &mdash; beats PaddleOCR-VL, PaddleOCR-Python, RapidOCR, EasyOCR and Tesseract ([benchmarks](#benchmarks))
+- 🎯 **Accurate on forms & receipts** &mdash; competitive with PaddleOCR-VL, PaddleOCR-Python, RapidOCR, EasyOCR and Tesseract ([benchmarks](#benchmarks))
 - 🧠 **PP-OCRv6** &mdash; one model covers Latin + Chinese + Japanese; pick `tiny` (default) / `small` / `medium`
 - 🌐 **More scripts** &mdash; Arabic, Cyrillic, Korean, Thai, Greek via retained PP-OCRv5 recognizers
 - 📄 **PDF native** &mdash; pages rendered and OCR'd in parallel, optional page-image export & auto-rotation
@@ -95,7 +95,7 @@ curl -X POST http://localhost:8000/ocr/raw \
 
 On a single RTX 5090, vs every common OCR engine:
 
-- **Forms & receipts:** best accuracy (FUNSD 92% / CORD 93% word-F1 on the medium tier) and **15–90× faster** than every other engine — up to **559 img/s** on the default tiny tier.
+- **Forms & receipts:** accurate (FUNSD 92% / CORD 93% word-F1 on the medium tier) and **15–90× faster** than every other engine — up to **559 img/s** (receipts) on the default tiny tier.
 - **Full document parsing:** **0.90** OmniDocBench Overall at **20 pages/s**, within ~5 points of PaddleOCR-VL (0.95) which runs at ~1 pg/s — fully local, no API.
 
 → [Full benchmarks & methodology](docs/benchmarks/comparison.md)

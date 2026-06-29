@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <format>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,6 +30,7 @@
 #include "turbo_ocr/server/server_bootstrap.h"
 #include "turbo_ocr/server/server_config.h"
 #include "turbo_ocr/server/server_types.h"
+#include "turbo_ocr/server/pixel_dims.h"
 #include "turbo_ocr/server/work_pool.h"
 #include "turbo_ocr/routes/common_routes.h"
 #include "turbo_ocr/routes/pdf_routes.h"
@@ -36,10 +38,35 @@
 using turbo_ocr::Box;
 using turbo_ocr::OCRResultItem;
 using turbo_ocr::base64_decode;
-using turbo_ocr::results_to_json;
-using turbo_ocr::emit_results_json;
 
 namespace bootstrap = turbo_ocr::server::bootstrap;
+
+namespace {
+// Mirrors reject_unknown_query_params in the shared routes: when
+// TURBO_OCR_STRICT_QUERY_PARAMS=1, reject any query param not in `allowed`
+// (400 INVALID_PARAMETER). No-op otherwise. Applied to the CPU-inline
+// /ocr/pixels and /ocr/batch handlers so strict mode behaves like the GPU build.
+[[nodiscard]] bool cpu_reject_unknown_query_params(
+    const drogon::HttpRequestPtr &req,
+    std::initializer_list<std::string_view> allowed,
+    turbo_ocr::server::DrogonCallback &callback) {
+  static const bool strict =
+      turbo_ocr::server::env_enabled("TURBO_OCR_STRICT_QUERY_PARAMS");
+  if (!strict) return false;
+  for (const auto &kv : req->getParameters()) {
+    bool known = false;
+    for (auto a : allowed) if (a == kv.first) { known = true; break; }
+    if (!known) {
+      callback(turbo_ocr::server::error_response(drogon::k400BadRequest,
+          "INVALID_PARAMETER",
+          std::format("Unknown query parameter '{}' "
+                      "(TURBO_OCR_STRICT_QUERY_PARAMS=1)", kv.first)));
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace
 
 int main(int argc, char **argv) try {
   TOCR_LOG_INFO("PaddleOCR CPU-Only Mode (ONNX Runtime)");
@@ -124,6 +151,10 @@ int main(int argc, char **argv) try {
   // ORT-CPU; TABLE_SLANEXT_ENCODER_ONNX enables the SLANeXt ORT-CPU encoder +
   // host GRU decode. A configured-but-unloadable backend is fatal (never serve
   // a silently structure-less pipeline). Loaded into every pipeline in the pool.
+  // Lifted to function scope so the route handlers can fail-loud (400
+  // TABLE_BACKEND_DISABLED / FORMULA_BACKEND_DISABLED) when a client asks for a
+  // stage this server didn't load.
+  bool table_available = false, formula_available = false;
   {
     const std::string formula_onnx = turbo_ocr::server::env_or("FORMULA_ONNX", "");
     const std::string formula_tok = turbo_ocr::server::env_or("FORMULA_TOKENIZER", "");
@@ -141,9 +172,14 @@ int main(int argc, char **argv) try {
           TOCR_LOG_ERROR("CPU table backend failed to load — refusing to start");
           return 1;
         }
+        // Read availability from what actually loaded into the pipeline (single
+        // source of truth for the tables=1/formulas=1 fail-loud gate), not env
+        // intent. All pipelines load identically, so the last wins.
+        table_available = handle->has_table_backend();
+        formula_available = handle->has_formula_backend();
       }
-      if (want_formula) TOCR_LOG_INFO("Formula stage enabled (CPU/ONNX Runtime)");
-      if (want_table) TOCR_LOG_INFO("Table stage enabled (CPU/ONNX Runtime)");
+      if (formula_available) TOCR_LOG_INFO("Formula stage enabled (CPU/ONNX Runtime)");
+      if (table_available) TOCR_LOG_INFO("Table stage enabled (CPU/ONNX Runtime)");
     }
   }
 
@@ -175,7 +211,8 @@ int main(int argc, char **argv) try {
           -> turbo_ocr::server::InferResult {
     auto handle = pool->acquire();
     auto out = handle->run_with_layout(img, opts.want_layout,
-                                        opts.want_reading_order);
+                                        opts.want_reading_order,
+                                        opts.want_tables, opts.want_formulas);
     return turbo_ocr::server::InferResult{
         .results          = std::move(out.results),
         .layout           = std::move(out.layout),
@@ -214,7 +251,8 @@ int main(int argc, char **argv) try {
     }
   };
   turbo_ocr::routes::register_common_routes(work_pool, infer, decode,
-                                             layout_available, readiness);
+                                             layout_available, table_available,
+                                             formula_available, readiness);
 
   // GET /capabilities (M6) — advertise this build's honored feature set so a
   // client can discover the known GPU/CPU divergences without trial requests.
@@ -224,6 +262,8 @@ int main(int argc, char **argv) try {
     turbo_ocr::routes::CapabilitiesInfo caps;
     caps.is_gpu              = false;
     caps.layout_available    = layout_available;
+    caps.table_available     = table_available;
+    caps.formula_available   = formula_available;
     caps.autorotate_available = doc_ori_available;
     caps.profile_endpoint    = true;
     caps.grpc_response_mode  =
@@ -252,7 +292,7 @@ int main(int argc, char **argv) try {
   // --- /ocr/pixels endpoint (raw BGR pixel data, zero decode overhead) ---
   drogon::app().registerHandler(
       "/ocr/pixels",
-      [&work_pool, &infer, layout_available](
+      [&work_pool, &infer, layout_available, table_available, formula_available](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
         turbo_ocr::server::InferOptions opts;
@@ -263,33 +303,29 @@ int main(int argc, char **argv) try {
               drogon::k400BadRequest, r.error_code.c_str(), r.error));
           return;
         }
-
-        auto w_str = req->getHeader("X-Width");
-        auto h_str = req->getHeader("X-Height");
-        auto c_str = req->getHeader("X-Channels");
-
-        if (w_str.empty() || h_str.empty()) {
-          callback(turbo_ocr::server::error_response(drogon::k400BadRequest,
-                                    "MISSING_HEADER", "Missing X-Width or X-Height headers"));
+        if (cpu_reject_unknown_query_params(
+                req, {"layout", "reading_order", "as_blocks", "tables",
+                      "formulas", "width", "height", "channels"}, callback))
+          return;
+        if (auto r = turbo_ocr::server::check_structure_backends(
+                opts, table_available, formula_available);
+            !r.error.empty()) {
+          callback(turbo_ocr::server::error_response(
+              drogon::k400BadRequest, r.error_code.c_str(), r.error));
           return;
         }
 
-        int width, height, channels;
-        try {
-          width = std::stoi(w_str);
-          height = std::stoi(h_str);
-          channels = c_str.empty() ? 3 : std::stoi(c_str);
-        } catch (const std::exception &) {
+        // Dimensions: query params (preferred) with the legacy X-* headers as a
+        // v2.3-compat fallback; conflict -> 400. Shared with the GPU handler.
+        const auto dims = turbo_ocr::server::resolve_pixel_dims(req);
+        if (!dims.ok()) {
           callback(turbo_ocr::server::error_response(drogon::k400BadRequest,
-              "INVALID_HEADER", "Invalid X-Width, X-Height, or X-Channels header value"));
+              dims.error_code.c_str(), dims.error));
           return;
         }
-
-        if (width <= 0 || height <= 0 || (channels != 1 && channels != 3)) {
-          callback(turbo_ocr::server::error_response(drogon::k400BadRequest,
-              "INVALID_DIMENSIONS", "Invalid dimensions or channels"));
-          return;
-        }
+        const int width = dims.width, height = dims.height,
+                  channels = dims.channels;
+        const bool used_legacy_dim_header = dims.used_legacy_header;
 
         // Configurable via MAX_IMAGE_DIM (default 16384). Same env var as
         // the GPU path so both servers share one knob.
@@ -319,7 +355,8 @@ int main(int argc, char **argv) try {
         }
 
         turbo_ocr::server::submit_work(work_pool, std::move(callback),
-            [req, &infer, width, height, channels, opts](turbo_ocr::server::DrogonCallback &cb) {
+            [req, &infer, width, height, channels, opts,
+             used_legacy_dim_header](turbo_ocr::server::DrogonCallback &cb) {
           turbo_ocr::server::run_with_error_handling(cb, "/ocr/pixels", [&] {
             cv::Mat img(height, width,
                         channels == 3 ? CV_8UC3 : CV_8UC1,
@@ -330,8 +367,11 @@ int main(int argc, char **argv) try {
             if (channels == 1)
               cv::cvtColor(img, img, cv::COLOR_GRAY2BGR);
             auto inf = infer(img, opts);
-            cb(turbo_ocr::server::json_response(
-                turbo_ocr::server::emit_infer_result_json(inf, opts.want_blocks)));
+            auto resp = turbo_ocr::server::json_response(
+                turbo_ocr::server::emit_infer_result_json(inf, opts.want_blocks));
+            if (used_legacy_dim_header)
+              turbo_ocr::server::stamp_pixel_dim_deprecation(resp);
+            cb(resp);
           });
         });
       },
@@ -343,6 +383,7 @@ int main(int argc, char **argv) try {
   const turbo_ocr::pdf::PdfMode default_pdf_mode = cfg.default_pdf_mode;
 
   turbo_ocr::routes::register_pdf_route(work_pool, infer, pdf_renderer, default_pdf_mode, layout_available,
+                                        table_available, formula_available,
                                         cfg.max_pdf_pages, orient_fn);
 
   // --- /ocr/batch endpoint (CPU version) ---
@@ -350,13 +391,24 @@ int main(int argc, char **argv) try {
   drogon::app().registerHandler(
       "/ocr/batch",
       [&work_pool, &pool, pool_size, &decode, layout_available,
-       max_batch_images](
+       table_available, formula_available, max_batch_images](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
         turbo_ocr::server::InferOptions opts;
         if (auto r = turbo_ocr::server::parse_query_options(
                 req, layout_available, &opts);
+            !r.error.empty()) {
+          callback(turbo_ocr::server::error_response(
+              drogon::k400BadRequest, r.error_code.c_str(), r.error));
+          return;
+        }
+        if (cpu_reject_unknown_query_params(
+                req, {"layout", "reading_order", "as_blocks", "tables",
+                      "formulas"}, callback))
+          return;
+        if (auto r = turbo_ocr::server::check_structure_backends(
+                opts, table_available, formula_available);
             !r.error.empty()) {
           callback(turbo_ocr::server::error_response(
               drogon::k400BadRequest, r.error_code.c_str(), r.error));
@@ -409,9 +461,9 @@ int main(int argc, char **argv) try {
           // length so callers can correlate batch_results[i] with their
           // images[i]; failed slots get tagged in `error`, never dropped.
           struct BatchItem {
-            std::vector<OCRResultItem> results;
-            std::vector<turbo_ocr::layout::LayoutBox> layout;
-            std::vector<int> reading_order;
+            // Full per-page result so the serializer emits tables/formulas (+
+            // degradation) when the request opted in, identical to /ocr/raw.
+            turbo_ocr::pipeline::OcrPipelineResult out;
             std::string error;          // empty when the slot succeeded
           };
           std::vector<BatchItem> batch_items(n);
@@ -525,11 +577,9 @@ int main(int argc, char **argv) try {
                   // Per-image try/catch so one image failing does NOT
                   // leave all later slots silently empty with HTTP 200.
                   try {
-                    auto out = handle->run_with_layout(imgs[idx], want_layout,
-                                                       opts.want_reading_order);
-                    batch_items[idx].results = std::move(out.results);
-                    batch_items[idx].layout = std::move(out.layout);
-                    batch_items[idx].reading_order = std::move(out.reading_order);
+                    batch_items[idx].out = handle->run_with_layout(
+                        imgs[idx], want_layout, opts.want_reading_order,
+                        opts.want_tables, opts.want_formulas);
                   } catch (const std::exception &e) {
                     TOCR_LOG_ERROR("Batch image error", "route", "/ocr/batch",
                                    "image_index", idx, "error",
@@ -552,7 +602,7 @@ int main(int argc, char **argv) try {
           json_str += "{\"batch_results\":[";
           for (size_t i = 0; i < batch_items.size(); ++i) {
             if (i > 0) json_str += ',';
-            json_str += emit_results_json(batch_items[i].results, batch_items[i].layout, batch_items[i].reading_order, opts.want_blocks);
+            json_str += turbo_ocr::emit_pipeline_result_json(batch_items[i].out, opts.want_blocks);
           }
           json_str += "],\"errors\":[";
           for (size_t i = 0; i < batch_items.size(); ++i) {
@@ -578,7 +628,8 @@ int main(int argc, char **argv) try {
 
   // gRPC server
   auto grpc_handle = turbo_ocr::server::start_grpc_server(
-      infer, cfg, &pdf_renderer, layout_available, readiness);
+      infer, cfg, &pdf_renderer, layout_available, readiness,
+      table_available, formula_available);
   // Published for the signal-handler drain thread. Not dangling: grpc_handle
   // owns the server on main()'s stack and is destroyed only after run() returns
   // (i.e. after the drain has driven app().quit()). See server_bootstrap.h.

@@ -2,7 +2,6 @@
 
 #include <cstdlib>
 #include <fstream>
-#include <sstream>
 #include <array>
 
 #include <nlohmann/json.hpp>

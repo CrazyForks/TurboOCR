@@ -98,6 +98,8 @@ struct PdfJobOptions {
   bool want_layout = false;
   bool want_reading_order = false;
   bool want_blocks = false;
+  bool want_tables = false;
+  bool want_formulas = false;
   bool autorotate = false;
   PdfImageMode image_mode = PdfImageMode::None;
   pdf::EncodeOptions encode_opts{};
@@ -316,6 +318,10 @@ struct PdfPageSink {
   PdfImageMode image_mode = PdfImageMode::None;
   pdf::EncodeOptions encode_opts{};
   bool autorotate = false;
+  // Strict opt-in: run table / formula recognition on layout regions only when
+  // the request asked (?tables=1 / ?formulas=1). Default off.
+  bool want_tables = false;
+  bool want_formulas = false;
   // Rendered pages whose PPM could not be read back (a server-side fault).
   std::atomic<int> decode_failures{0};
   // Pages whose OCR/inference threw — counted by the true page count (the whole
@@ -418,7 +424,15 @@ inline void ocr_single_page(GpuPipelineEntry &e, PdfPageSink &sink,
   }
 
   try {
-    if (page_mode_of(sink, page_idx) == pdf::PdfMode::Geometric) {
+    // Geometric (born-digital/text-layer) pages normally take the layout-only
+    // fast path. But table/formula recognition runs on the rendered image via
+    // the router, which the layout-only path doesn't invoke — so when the client
+    // opted into structure, fall through to the full OCR+structure branch
+    // (parity with the CPU/InferFunc PDF path); otherwise structure would be
+    // silently dropped on born-digital pages.
+    const bool structure_requested = sink.want_tables || sink.want_formulas;
+    if (page_mode_of(sink, page_idx) == pdf::PdfMode::Geometric &&
+        !structure_requested) {
       // Geometric pages are born-digital/upright with pt-space text boxes;
       // autorotate does not apply (rotating would desync the boxes). Encode +
       // run layout-only when requested.
@@ -437,7 +451,9 @@ inline void ocr_single_page(GpuPipelineEntry &e, PdfPageSink &sink,
       if (orient) classification::rotate_upright(img, orient);
       auto encoded = maybe_encode_page(sink, img);
       auto out = e.pipeline->run_with_layout(img, e.stream, layout_enabled,
-                                             want_reading_order);
+                                             want_reading_order, /*routing=*/{},
+                                             /*defer_external=*/false,
+                                             sink.want_tables, sink.want_formulas);
       store_ocr_page(sink, page_idx, std::move(out), img.cols, img.rows,
                      std::move(encoded), orient);
     }
@@ -527,7 +543,8 @@ inline int run_streamed_render_cpu(
     const std::vector<uint8_t> &need_render, int &decode_failures,
     int &page_failures, PdfImageMode image_mode,
     const pdf::EncodeOptions &encode_opts,
-    bool autorotate, const server::OrientFunc &orient_fn) {
+    bool autorotate, const server::OrientFunc &orient_fn,
+    bool want_tables = false, bool want_formulas = false) {
   auto stream_handle = pdf_renderer.render_streamed(pdf_data, pdf_len, dpi,
       [&](int page_idx, const std::string &ppm_path) noexcept {
        try {
@@ -551,6 +568,8 @@ inline int run_streamed_render_cpu(
         server::InferOptions inf_opts;
         inf_opts.want_layout = want_layout;
         inf_opts.want_reading_order = want_reading_order;
+        inf_opts.want_tables = want_tables;
+        inf_opts.want_formulas = want_formulas;
         if (mode == pdf::PdfMode::Ocr)
           pg.resolved_mode = pdf::PdfMode::Ocr;
 
@@ -651,6 +670,8 @@ inline int run_streamed_render_cpu(
   sink->image_mode = opts.image_mode;
   sink->encode_opts = opts.encode_opts;
   sink->autorotate = opts.autorotate;
+  sink->want_tables = opts.want_tables;
+  sink->want_formulas = opts.want_formulas;
 
   pdf::PdfMode mode = opts.mode;
   open_pdf_for_text_layer(pdf_data, pdf_len, mode, sink->pdf_doc,
@@ -809,7 +830,7 @@ inline int run_streamed_render_cpu(
           infer, pdf_renderer, pdf_data, pdf_len, opts.dpi, opts.want_layout,
           opts.want_reading_order, mode, page_results, need_render,
           decode_failures, page_failures, opts.image_mode, opts.encode_opts,
-          opts.autorotate, orient_fn);
+          opts.autorotate, orient_fn, opts.want_tables, opts.want_formulas);
       if (static_cast<int>(page_results.size()) < num_pages)
         page_results.resize(num_pages);
     }

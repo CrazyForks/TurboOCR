@@ -85,6 +85,12 @@ emit_infer_result_json(InferResult &inf, bool want_blocks) {
 struct InferOptions {
   bool want_layout = false;
   bool want_reading_order = false;
+  // ?tables=1 / ?formulas=1 — strict opt-in. Even when a table/formula backend
+  // is configured at startup, the stage runs ONLY when the request asks for it.
+  // Both imply layout (recognition runs on layout-detected regions), so either
+  // auto-enables want_layout. Default false: layout alone never triggers them.
+  bool want_tables = false;
+  bool want_formulas = false;
   // ?as_blocks=1 — emit a `blocks` array (paragraph-level aggregate,
   // one entry per non-empty layout cell, mirrors PaddleX's
   // PP-StructureV3 parsing_res_list granularity). Auto-enables layout
@@ -395,6 +401,55 @@ parse_query_options(const drogon::HttpRequestPtr &req,
     out->want_layout = true;
   }
 
+  if (auto err = parse_bool_query(req, "tables", &out->want_tables);
+      !err.empty())
+    return {err, "INVALID_PARAMETER"};
+  if (auto err = parse_bool_query(req, "formulas", &out->want_formulas);
+      !err.empty())
+    return {err, "INVALID_PARAMETER"};
+  // Table/formula recognition runs on layout-detected regions, so either flag
+  // implies layout. Auto-enable it (mirrors as_blocks) so ?tables=1 / ?formulas=1
+  // work standalone; require the layout model to be present.
+  if ((out->want_tables || out->want_formulas) && !layout_available) {
+    return {"tables=1/formulas=1 require the layout model: start the server "
+            "without DISABLE_LAYOUT=1 (layout is on by default)",
+            "LAYOUT_DISABLED"};
+  }
+  if (out->want_tables || out->want_formulas)
+    out->want_layout = true;
+
+  return {};
+}
+
+// Fail loud when the client opted into a structure stage the server can't do:
+// tables=1 / formulas=1 with no backend configured at startup. Returns
+// TABLE_BACKEND_DISABLED / FORMULA_BACKEND_DISABLED (a 400) rather than the
+// silent empty result a missing backend would otherwise produce — clients can
+// discover availability up front via GET /capabilities. Call after
+// parse_query_options at every route that honors the user's tables/formulas
+// flags (NOT /ocr/markdown, which sets them best-effort).
+// `table_available`/`formula_available` must reflect what the pipeline ACTUALLY
+// loaded for the route DEFAULT (not the routing-name set): a per-request
+// ?route_table=/?route_formula= override is deliberately NOT treated as
+// satisfying availability here, because `synth_from_env` always names the
+// default formula route ("formula-env") even with no model loaded — honoring an
+// override would let `?formulas=1&route_formula=formula-env` slip past the gate
+// and then return a silent empty result. To use tables/formulas the route
+// default backend must be configured; an override only selects among loaded
+// backends once the default gate passes.
+[[nodiscard]] inline ParseOptionsResult
+check_structure_backends(const InferOptions &o, bool table_available,
+                         bool formula_available) {
+  if (o.want_tables && !table_available)
+    return {"tables=1 requested but no table backend is configured. Start the "
+            "server with TABLE_BACKEND= + TABLE_SLANEXT_ENCODER_ONNX= (see GET "
+            "/capabilities for what this server supports).",
+            "TABLE_BACKEND_DISABLED"};
+  if (o.want_formulas && !formula_available)
+    return {"formulas=1 requested but no formula backend is configured. Start "
+            "the server with FORMULA_ONNX= + FORMULA_TOKENIZER= (see GET "
+            "/capabilities for what this server supports).",
+            "FORMULA_BACKEND_DISABLED"};
   return {};
 }
 

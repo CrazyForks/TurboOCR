@@ -14,6 +14,8 @@ void register_image_routes(server::WorkPool &pool,
                            const server::ImageDecoder &decode,
                            bool nvjpeg_available,
                            bool layout_available,
+                           bool table_available,
+                           bool formula_available,
                            int max_batch_images = 1024);
 
 } // namespace turbo_ocr::routes

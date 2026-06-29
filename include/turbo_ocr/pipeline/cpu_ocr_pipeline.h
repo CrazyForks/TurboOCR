@@ -40,6 +40,12 @@ public:
   // Reads TABLE_SLANEXT_* env knobs internally. Enables per-table-region HTML.
   [[nodiscard]] bool load_table_backend();
 
+  // Opt-in availability read from what actually loaded — the same pointers
+  // run_structure_stages gates on — so the server's tables=1/formulas=1
+  // fail-loud check can't drift from the loaded backends.
+  [[nodiscard]] bool has_table_backend() const { return table_ != nullptr; }
+  [[nodiscard]] bool has_formula_backend() const { return formula_ != nullptr; }
+
   // Load the document-orientation model (ONNX). Optional; powers autorotate.
   [[nodiscard]] bool load_doc_ori_model(const std::string &onnx_path);
   [[nodiscard]] bool has_doc_ori() const noexcept { return use_doc_ori_; }
@@ -56,13 +62,16 @@ public:
   /// omits the key.
   [[nodiscard]] OcrPipelineResult run_with_layout(const cv::Mat &img,
                                                    bool want_layout = false,
-                                                   bool want_reading_order = false);
+                                                   bool want_reading_order = false,
+                                                   bool want_tables = false,
+                                                   bool want_formulas = false);
 
 private:
   // Recognize formula + table regions of `img` from its layout boxes, filling
-  // out.formulas / out.tables. No-op when the respective backend is unloaded
-  // or no matching layout region exists.
-  void run_structure_stages(const cv::Mat &img, OcrPipelineResult &out);
+  // out.formulas / out.tables. Strict opt-in: a stage runs only when its flag
+  // is set AND its backend is loaded AND a matching layout region exists.
+  void run_structure_stages(const cv::Mat &img, OcrPipelineResult &out,
+                            bool want_tables, bool want_formulas);
 
   std::unique_ptr<detection::CpuPaddleDet> det_;
   std::unique_ptr<classification::CpuPaddleCls> cls_;

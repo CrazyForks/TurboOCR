@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -286,11 +287,16 @@ int main(int argc, char **argv) try {
     // run_with_error_handling maps it to HTTP 504 (INFERENCE_TIMEOUT).
     const bool want_layout = opts.want_layout;
     const bool want_reading_order = opts.want_reading_order;
+    const bool want_tables = opts.want_tables;
+    const bool want_formulas = opts.want_formulas;
     const auto routing_override = opts.routing_override;  // by-value (timeout-safe)
     auto out = dispatcher->submit_for_default(
-        [img, want_layout, want_reading_order, routing_override](auto &e) {
+        [img, want_layout, want_reading_order, want_tables, want_formulas,
+         routing_override](auto &e) {
           return e.pipeline->run_with_layout(img, e.stream, want_layout,
-                                             want_reading_order, routing_override);
+                                             want_reading_order, routing_override,
+                                             /*defer_external=*/false,
+                                             want_tables, want_formulas);
         });
     // dispatch_router_ ran synchronously (defer_external defaults false on this
     // path), so out carries any table/formula structure + degradation flags.
@@ -376,10 +382,27 @@ int main(int argc, char **argv) try {
     return ok;
   };
   turbo_ocr::routes::register_health_route(readiness, &work_pool);
-  turbo_ocr::routes::register_ocr_base64_route(work_pool, infer, decode, layout_available);
+  // Structure-backend availability, read from a warmed pipeline itself (the
+  // exact default-entry pointers dispatch_router_ gates `tables=1`/`formulas=1`
+  // on) rather than re-deriving from config — single source of truth, can't
+  // drift. Computed once, fed to the HTTP routes, the gRPC service, and
+  // /capabilities so the fail-loud gate is consistent everywhere.
+  // Deadline-free submit().get() (not submit_for_default): this is a trivial
+  // pointer read on the warmed pool, not request work, so it must not be bound
+  // by REQUEST_TIMEOUT_MS — a stray TimeoutError here would abort startup.
+  const auto struct_avail = dispatcher->submit([](auto &e) {
+    return std::pair<bool, bool>{e.pipeline->has_default_table_backend(),
+                                 e.pipeline->has_default_formula_backend()};
+  }).get();
+  const bool table_avail   = struct_avail.first;
+  const bool formula_avail = struct_avail.second;
+  turbo_ocr::routes::register_ocr_base64_route(work_pool, infer, decode,
+                                               layout_available, table_avail,
+                                               formula_avail);
   turbo_ocr::routes::register_image_routes(work_pool, *dispatcher, decode, nvjpeg_available, layout_available,
-                                           cfg.max_batch_images);
+                                           table_avail, formula_avail, cfg.max_batch_images);
   turbo_ocr::routes::register_pdf_route(work_pool, *dispatcher, pdf_renderer, default_pdf_mode, layout_available,
+                                        table_avail, formula_avail,
                                         /*default_dpi=*/100,
                                         cfg.max_pdf_pages,
                                         /*doc_ori_available=*/!doc_ori_model.empty());
@@ -391,6 +414,8 @@ int main(int argc, char **argv) try {
     turbo_ocr::routes::CapabilitiesInfo caps;
     caps.is_gpu              = true;
     caps.layout_available    = layout_available;
+    caps.table_available     = table_avail;
+    caps.formula_available   = formula_avail;
     caps.autorotate_available = !doc_ori_model.empty();
     caps.profile_endpoint    = false;
     caps.grpc_response_mode  =
@@ -420,9 +445,11 @@ int main(int argc, char **argv) try {
     return probe->ok.load(std::memory_order_acquire);
   };
 
-  // gRPC
+  // gRPC — same availability bools as the HTTP routes so the fail-loud gate is
+  // consistent across transports (TABLE_BACKEND_DISABLED / FORMULA_BACKEND_DISABLED).
   auto grpc_handle = turbo_ocr::server::start_grpc_server(
-      *dispatcher, cfg, &pdf_renderer, layout_available, readiness_cached);
+      *dispatcher, cfg, &pdf_renderer, layout_available, readiness_cached,
+      table_avail, formula_avail);
   // Published for the signal-handler drain thread. Not dangling: grpc_handle
   // owns the server on main()'s stack and is destroyed only after run() returns
   // (i.e. after the drain has driven app().quit()). See server_bootstrap.h.

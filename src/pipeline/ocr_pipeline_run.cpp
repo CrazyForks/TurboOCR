@@ -47,7 +47,9 @@ void OcrPipeline::dispatch_router_(OcrPipelineResult &out,
                                    const std::vector<Box> &boxes,
                                    PipelineTimer &timer,
                                    const routing::RequestRouting &routing,
-                                   bool defer_external) {
+                                   bool defer_external,
+                                   bool want_tables,
+                                   bool want_formulas) {
   // text-only short-circuits — every one of these MUST bail BEFORE any
   // new CUDA API call (plan 04 §7 invariants).
   if (!router_) return;
@@ -64,8 +66,11 @@ void OcrPipeline::dispatch_router_(OcrPipelineResult &out,
   table::ITableRecognizer   *table_rec   = pick_table_recognizer_(routing.table);
   formula::IFormulaRecognizer *formula_rec = pick_formula_recognizer_(routing.formula);
 
-  const bool has_table   = !plan_.table_layout_ids.empty() && table_rec;
-  const bool has_formula = !plan_.formula_layout_ids.empty() && formula_rec;
+  // Strict opt-in: a configured backend is necessary but not sufficient — the
+  // request must explicitly ask (?tables=1 / ?formulas=1). Layout alone never
+  // triggers them.
+  const bool has_table   = want_tables   && !plan_.table_layout_ids.empty()   && table_rec;
+  const bool has_formula = want_formulas && !plan_.formula_layout_ids.empty() && formula_rec;
   if (!has_table && !has_formula) return;          // routed-all-text bail
 
   // A CUDA fault in the table/formula stage is caught here so a recoverable one
@@ -236,7 +241,9 @@ OcrPipelineResult OcrPipeline::run_with_layout(const cv::Mat &img,
                                                bool want_layout,
                                                bool want_reading_order,
                                                const routing::RequestRouting &routing,
-                                               bool defer_external) {
+                                               bool defer_external,
+                                               bool want_tables,
+                                               bool want_formulas) {
   const bool layout_active = use_layout_ && want_layout;
   if (img.empty()) [[unlikely]] return OcrPipelineResult{};
 
@@ -380,7 +387,8 @@ OcrPipelineResult OcrPipeline::run_with_layout(const cv::Mat &img,
 
   // CUA router + table/formula dispatch. No-op on text-only pages (see
   // dispatch_router_'s short-circuits — plan 04 §7).
-  dispatch_router_(out, gpu_img, boxes, timer, routing, defer_external);
+  dispatch_router_(out, gpu_img, boxes, timer, routing, defer_external,
+                   want_tables, want_formulas);
 
   // Reading-order over layout regions, with synthetic XY-cut entries
   // for orphan results so unmatched detections (page numbers, headers
@@ -444,7 +452,9 @@ OcrPipelineResult OcrPipeline::run_with_layout(GpuImage gpu_img,
                                                bool want_layout,
                                                bool want_reading_order,
                                                const routing::RequestRouting &routing,
-                                               bool defer_external) {
+                                               bool defer_external,
+                                               bool want_tables,
+                                               bool want_formulas) {
   const bool layout_active = use_layout_ && want_layout;
   PipelineTimer timer;
   timer.init(stream);
@@ -536,7 +546,8 @@ OcrPipelineResult OcrPipeline::run_with_layout(GpuImage gpu_img,
   }
 
   // CUA router + table/formula dispatch (text-only path bails inside).
-  dispatch_router_(out, gpu_img, boxes, timer, routing, defer_external);
+  dispatch_router_(out, gpu_img, boxes, timer, routing, defer_external,
+                   want_tables, want_formulas);
 
   // Reading-order — see run(...) above for the contract; helper handles
   // orphan results (missing layout match) via synthetic XY-cut entries.
@@ -565,7 +576,8 @@ std::vector<std::vector<OCRResultItem>> OcrPipeline::run_batch(
 
 std::vector<OcrPipelineResult> OcrPipeline::run_batch_with_layout(
     const std::vector<cv::Mat> &imgs, cudaStream_t stream,
-    bool want_layout, bool want_reading_order) {
+    bool want_layout, bool want_reading_order,
+    bool want_tables, bool want_formulas) {
   if (imgs.empty())
     return {};
 
@@ -573,7 +585,9 @@ std::vector<OcrPipelineResult> OcrPipeline::run_batch_with_layout(
   if (imgs.size() == 1) {
     std::vector<OcrPipelineResult> single;
     single.push_back(run_with_layout(imgs[0], stream, want_layout,
-                                     want_reading_order));
+                                     want_reading_order, /*routing=*/{},
+                                     /*defer_external=*/false,
+                                     want_tables, want_formulas));
     return single;
   }
 
@@ -740,7 +754,7 @@ std::vector<OcrPipelineResult> OcrPipeline::run_batch_with_layout(
   // a layout model — text-only batches pay zero layout/router cost.
   if (want_layout && use_layout_ && layout_)
     run_batch_layout_stage_(image_crops, want_reading_order, stream,
-                            all_results);
+                            all_results, want_tables, want_formulas);
 
   // No cleanup needed — batch_img_bufs_ are pre-allocated and reused
 
@@ -750,7 +764,8 @@ std::vector<OcrPipelineResult> OcrPipeline::run_batch_with_layout(
 void OcrPipeline::run_batch_layout_stage_(
     const std::vector<PaddleRec::ImageCrops> &image_crops,
     bool want_reading_order, cudaStream_t stream,
-    std::vector<OcrPipelineResult> &outs) {
+    std::vector<OcrPipelineResult> &outs,
+    bool want_tables, bool want_formulas) {
   const int batch_n = static_cast<int>(image_crops.size());
 
   // All det/rec GPU work is host-synced by this point (run_multi syncs
@@ -769,7 +784,9 @@ void OcrPipeline::run_batch_layout_stage_(
       continue;
     outs[i].layout = layout_->collect();
     PipelineTimer t;
-    dispatch_router_(outs[i], gpu_img, image_crops[i].boxes, t);
+    dispatch_router_(outs[i], gpu_img, image_crops[i].boxes, t,
+                     /*routing=*/{}, /*defer_external=*/false,
+                     want_tables, want_formulas);
   }
 
   // Reading order — same contract as run_with_layout: helper handles

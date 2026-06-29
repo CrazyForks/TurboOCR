@@ -21,6 +21,7 @@
 #include "turbo_ocr/decode/nvjpeg_decoder.h"
 #include "turbo_ocr/server/env_utils.h"
 #include "turbo_ocr/server/error_codes.h"
+#include "turbo_ocr/server/pixel_dims.h"
 
 using turbo_ocr::decode::NvJpegDecoder;
 
@@ -80,7 +81,9 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
                                  pipeline::PipelineDispatcher &dispatcher,
                                  const server::ImageDecoder &decode,
                                  bool nvjpeg_available,
-                                 bool layout_available) {
+                                 bool layout_available,
+                                 bool table_available,
+                                 bool formula_available) {
   // Per-request routing override (Tier-A) validation set: computed ONCE from
   // the same routing config the pipeline loaded, so route-layer validation and
   // the pipeline's recognizer registry never drift (both via
@@ -88,10 +91,14 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
   const auto rtbl = routing::load_routing_config();
   const std::set<std::string> valid_table   = routing::routable_backend_names(rtbl, "table");
   const std::set<std::string> valid_formula = routing::routable_backend_names(rtbl, "formula");
+  // Fail-loud availability comes from the warmed pipeline (single source of
+  // truth), threaded down from main(); not re-derived from config here.
+  const bool table_avail   = table_available;
+  const bool formula_avail = formula_available;
   drogon::app().registerHandler(
       "/ocr/raw",
       [&pool, &dispatcher, &decode, nvjpeg_available, layout_available,
-       valid_table, valid_formula](
+       valid_table, valid_formula, table_avail, formula_avail](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
@@ -118,9 +125,15 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
       return;
     }
     if (reject_unknown_query_params(
-            req, {"layout", "reading_order", "as_blocks",
+            req, {"layout", "reading_order", "as_blocks", "tables", "formulas",
                   "route_table", "route_formula"}, callback))
       return;
+    if (auto r = server::check_structure_backends(opts, table_avail, formula_avail);
+        !r.error.empty()) {
+      callback(server::error_response(drogon::k400BadRequest,
+                                       r.error_code.c_str(), r.error));
+      return;
+    }
 
     server::submit_work(pool, std::move(callback),
         [req, &dispatcher, &decode, nvjpeg_available, opts](server::DrogonCallback &cb) {
@@ -191,7 +204,9 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
                                                      opts.want_layout,
                                                      opts.want_reading_order,
                                                      opts.routing_override,
-                                                     /*defer_external=*/true);
+                                                     /*defer_external=*/true,
+                                                     opts.want_tables,
+                                                     opts.want_formulas);
                 } catch (const std::exception &) {
                   // GPU fast path failed (e.g. layout/pipeline error); fall
                   // through to the CPU decode + standard path below.
@@ -224,7 +239,9 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
                                                opts.want_layout,
                                                opts.want_reading_order,
                                                opts.routing_override,
-                                               /*defer_external=*/true);
+                                               /*defer_external=*/true,
+                                               opts.want_tables,
+                                               opts.want_formulas);
           });
           } catch (const turbo_ocr::TimeoutError &) {
             cb(timeout_response());
@@ -262,7 +279,9 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
                                                 opts.want_layout,
                                                 opts.want_reading_order,
                                                 opts.routing_override,
-                                                /*defer_external=*/true);
+                                                /*defer_external=*/true,
+                                                opts.want_tables,
+                                                opts.want_formulas);
           });
         } catch (const turbo_ocr::TimeoutError &) {
           cb(timeout_response());
@@ -474,7 +493,8 @@ void batch_run_pipeline(pipeline::PipelineDispatcher &dispatcher,
               std::make_move_iterator(imgs.begin() + end));
           try {
             auto chunk_results = e.pipeline->run_batch_with_layout(
-                chunk, e.stream, want_layout, opts.want_reading_order);
+                chunk, e.stream, want_layout, opts.want_reading_order,
+                opts.want_tables, opts.want_formulas);
             for (size_t j = 0; j < chunk_results.size(); ++j)
               o.outs[offset + j] = std::move(chunk_results[j]);
           } catch (const std::exception &) {
@@ -486,7 +506,9 @@ void batch_run_pipeline(pipeline::PipelineDispatcher &dispatcher,
             for (size_t j = 0; j < chunk.size(); ++j) {
               try {
                 o.outs[offset + j] = e.pipeline->run_with_layout(
-                    chunk[j], e.stream, want_layout, opts.want_reading_order);
+                    chunk[j], e.stream, want_layout, opts.want_reading_order,
+                    /*routing=*/{}, /*defer_external=*/false,
+                    opts.want_tables, opts.want_formulas);
               } catch (const turbo_ocr::PoolExhaustedError &) {
                 throw;  // -> 503 at the route, never a per-slot tag
               } catch (const std::exception &ex) {
@@ -588,11 +610,17 @@ void register_ocr_batch_route_gpu(server::WorkPool &pool,
                                    const server::ImageDecoder &decode,
                                    bool nvjpeg_available,
                                    bool layout_available,
+                                   bool table_available,
+                                   bool formula_available,
                                    int max_batch_images) {
+  // Availability from the warmed pipeline (single source of truth), threaded
+  // from main(); not re-derived from config.
+  const bool table_avail   = table_available;
+  const bool formula_avail = formula_available;
   drogon::app().registerHandler(
       "/ocr/batch",
       [&pool, &dispatcher, &decode, nvjpeg_available, layout_available,
-       max_batch_images](
+       table_avail, formula_avail, max_batch_images](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
@@ -604,8 +632,14 @@ void register_ocr_batch_route_gpu(server::WorkPool &pool,
       return;
     }
     if (reject_unknown_query_params(
-            req, {"layout", "reading_order", "as_blocks"}, callback))
+            req, {"layout", "reading_order", "as_blocks", "tables", "formulas"}, callback))
       return;
+    if (auto r = server::check_structure_backends(opts, table_avail, formula_avail);
+        !r.error.empty()) {
+      callback(server::error_response(drogon::k400BadRequest,
+                                       r.error_code.c_str(), r.error));
+      return;
+    }
 
     auto json = req->getJsonObject();
     if (!json) {
@@ -694,10 +728,16 @@ void register_ocr_batch_route_gpu(server::WorkPool &pool,
 // --- /ocr/pixels: raw BGR pixel data, zero decode overhead ---
 void register_ocr_pixels_route_gpu(server::WorkPool &pool,
                                     pipeline::PipelineDispatcher &dispatcher,
-                                    bool layout_available) {
+                                    bool layout_available,
+                                    bool table_available,
+                                    bool formula_available) {
+  // Availability from the warmed pipeline (single source of truth), threaded
+  // from main(); not re-derived from config.
+  const bool table_avail   = table_available;
+  const bool formula_avail = formula_available;
   drogon::app().registerHandler(
       "/ocr/pixels",
-      [&pool, &dispatcher, layout_available](
+      [&pool, &dispatcher, layout_available, table_avail, formula_avail](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
@@ -709,33 +749,26 @@ void register_ocr_pixels_route_gpu(server::WorkPool &pool,
       return;
     }
     if (reject_unknown_query_params(
-            req, {"layout", "reading_order", "as_blocks"}, callback))
+            req, {"layout", "reading_order", "as_blocks", "tables", "formulas",
+                  "width", "height", "channels"}, callback))
       return;
-
-    auto w_str = req->getHeader("X-Width");
-    auto h_str = req->getHeader("X-Height");
-    auto c_str = req->getHeader("X-Channels");
-
-    if (w_str.empty() || h_str.empty()) {
-      callback(server::error_response(drogon::k400BadRequest, "MISSING_HEADER", "Missing X-Width or X-Height headers"));
+    if (auto r = server::check_structure_backends(opts, table_avail, formula_avail);
+        !r.error.empty()) {
+      callback(server::error_response(drogon::k400BadRequest,
+                                       r.error_code.c_str(), r.error));
       return;
     }
 
-    int width, height, channels;
-    try {
-      width = std::stoi(w_str);
-      height = std::stoi(h_str);
-      channels = c_str.empty() ? 3 : std::stoi(c_str);
-    } catch (const std::exception &) {
-      callback(server::error_response(drogon::k400BadRequest, "INVALID_HEADER",
-          "Invalid X-Width, X-Height, or X-Channels header value"));
+    // Dimensions: query params (preferred) with the legacy X-* headers as a
+    // v2.3-compat fallback; conflict -> 400. Shared with the CPU handler.
+    const auto dims = server::resolve_pixel_dims(req);
+    if (!dims.ok()) {
+      callback(server::error_response(drogon::k400BadRequest,
+          dims.error_code.c_str(), dims.error));
       return;
     }
-
-    if (width <= 0 || height <= 0 || (channels != 1 && channels != 3)) {
-      callback(server::error_response(drogon::k400BadRequest, "INVALID_DIMENSIONS", "Invalid dimensions or channels"));
-      return;
-    }
+    const int width = dims.width, height = dims.height, channels = dims.channels;
+    const bool used_legacy_dim_header = dims.used_legacy_header;
 
     // Configurable via MAX_IMAGE_DIM (default 16384). Read once on first
     // request and cached for the process lifetime.
@@ -761,7 +794,8 @@ void register_ocr_pixels_route_gpu(server::WorkPool &pool,
     }
 
     server::submit_work(pool, std::move(callback),
-        [req, &dispatcher, width, height, channels, opts](server::DrogonCallback &cb) {
+        [req, &dispatcher, width, height, channels, opts,
+         used_legacy_dim_header](server::DrogonCallback &cb) {
       server::run_with_error_handling(cb, "/ocr/pixels", [&] {
         cv::Mat img(height, width, channels == 3 ? CV_8UC3 : CV_8UC1,
                     const_cast<char *>(req->body().data()));
@@ -779,13 +813,21 @@ void register_ocr_pixels_route_gpu(server::WorkPool &pool,
           out = dispatcher.submit_for_default([img, req, opts](auto &e) {
             return e.pipeline->run_with_layout(img, e.stream,
                                                 opts.want_layout,
-                                                opts.want_reading_order);
+                                                opts.want_reading_order,
+                                                opts.routing_override,
+                                                /*defer_external=*/false,
+                                                opts.want_tables,
+                                                opts.want_formulas);
           });
         } catch (const turbo_ocr::TimeoutError &) {
           cb(timeout_response());
           return;
         }
-        cb(server::json_response(emit_pipeline_result_json(out, opts.want_blocks)));
+        auto resp = server::json_response(
+            emit_pipeline_result_json(out, opts.want_blocks));
+        if (used_legacy_dim_header)
+          server::stamp_pixel_dim_deprecation(resp);
+        cb(resp);
       });
     });
   }, {drogon::Post});
@@ -795,10 +837,13 @@ void register_ocr_pixels_route_gpu(server::WorkPool &pool,
 void register_ocr_markdown_route_gpu(server::WorkPool &pool,
                                      pipeline::PipelineDispatcher &dispatcher,
                                      const server::ImageDecoder &decode,
-                                     bool layout_available) {
+                                     bool layout_available,
+                                     bool table_available,
+                                     bool formula_available) {
   drogon::app().registerHandler(
       "/ocr/markdown",
-      [&pool, &dispatcher, &decode, layout_available](
+      [&pool, &dispatcher, &decode, layout_available, table_available,
+       formula_available](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
         if (req->body().empty()) {
@@ -822,8 +867,16 @@ void register_ocr_markdown_route_gpu(server::WorkPool &pool,
           std::cerr << "[/ocr/markdown] embed=0 (file-ref) is not supported over HTTP — "
                        "returning self-contained data-URIs instead\n";
 
+        // Faithful export gates structure on what the server actually loaded:
+        // request table/formula recognition only when their backends exist, so
+        // a text-only server produces honest text markdown rather than silently
+        // dropping table/formula sections it claimed (via the hardcoded flags)
+        // to have attempted. Matches /capabilities and the fail-loud routes.
+        const bool md_want_tables = table_available;
+        const bool md_want_formulas = formula_available;
         server::submit_work(pool, std::move(callback),
-            [req, &dispatcher, &decode, embed](server::DrogonCallback &cb) {
+            [req, &dispatcher, &decode, embed, md_want_tables,
+             md_want_formulas](server::DrogonCallback &cb) {
           server::run_with_error_handling(cb, "/ocr/markdown", [&] {
             const auto *data =
                 reinterpret_cast<const unsigned char *>(req->body().data());
@@ -848,11 +901,13 @@ void register_ocr_markdown_route_gpu(server::WorkPool &pool,
 
             pipeline::OcrPipelineResult out;
             try {
-              out = dispatcher.submit_for_default([img](auto &e) {
+              out = dispatcher.submit_for_default(
+                  [img, md_want_tables, md_want_formulas](auto &e) {
                 return e.pipeline->run_with_layout(
                     img, e.stream, /*want_layout=*/true,
                     /*want_reading_order=*/true, /*routing=*/{},
-                    /*defer_external=*/true);
+                    /*defer_external=*/true,
+                    md_want_tables, md_want_formulas);
               });
             } catch (const turbo_ocr::TimeoutError &) {
               cb(timeout_response());
@@ -1071,12 +1126,18 @@ void register_image_routes(server::WorkPool &pool,
                            const server::ImageDecoder &decode,
                            bool nvjpeg_available,
                            bool layout_available,
+                           bool table_available,
+                           bool formula_available,
                            int max_batch_images) {
-  register_ocr_raw_route_gpu(pool, dispatcher, decode, nvjpeg_available, layout_available);
-  register_ocr_batch_route_gpu(pool, dispatcher, decode, nvjpeg_available, layout_available,
+  register_ocr_raw_route_gpu(pool, dispatcher, decode, nvjpeg_available,
+                             layout_available, table_available, formula_available);
+  register_ocr_batch_route_gpu(pool, dispatcher, decode, nvjpeg_available,
+                               layout_available, table_available, formula_available,
                                max_batch_images);
-  register_ocr_pixels_route_gpu(pool, dispatcher, layout_available);
-  register_ocr_markdown_route_gpu(pool, dispatcher, decode, layout_available);
+  register_ocr_pixels_route_gpu(pool, dispatcher, layout_available,
+                                table_available, formula_available);
+  register_ocr_markdown_route_gpu(pool, dispatcher, decode, layout_available,
+                                  table_available, formula_available);
   register_infer_route_gpu(pool, dispatcher, decode);
 }
 

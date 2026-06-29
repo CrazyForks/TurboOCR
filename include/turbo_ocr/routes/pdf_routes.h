@@ -15,6 +15,8 @@ void register_pdf_route(server::WorkPool &pool,
                         render::PdfRenderer &pdf_renderer,
                         pdf::PdfMode default_pdf_mode,
                         bool layout_available,
+                        bool table_available,
+                        bool formula_available,
                         int default_dpi = 100,
                         int max_pdf_pages = 2000,
                         bool doc_ori_available = false);
@@ -27,6 +29,8 @@ void register_pdf_route(server::WorkPool &pool,
                         render::PdfRenderer &pdf_renderer,
                         pdf::PdfMode default_pdf_mode,
                         bool layout_available,
+                        bool table_available,
+                        bool formula_available,
                         int max_pdf_pages = 2000,
                         server::OrientFunc orient_fn = {});
 

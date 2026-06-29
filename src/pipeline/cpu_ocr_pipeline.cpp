@@ -150,11 +150,13 @@ bool CpuOcrPipeline::load_table_backend() {
 }
 
 void CpuOcrPipeline::run_structure_stages(const cv::Mat &img,
-                                          OcrPipelineResult &out) {
-  if ((!formula_ && !table_) || out.layout.empty()) return;
+                                          OcrPipelineResult &out,
+                                          bool want_tables, bool want_formulas) {
+  if (out.layout.empty()) return;
+  if (!(want_tables && table_) && !(want_formulas && formula_)) return;
 
   // Formula regions -> LaTeX (display_formula / formula_number / inline_formula).
-  if (formula_ && formula_->ready()) {
+  if (want_formulas && formula_ && formula_->ready()) {
     turbo_ocr::prof::Scope _s(turbo_ocr::prof::FORMULA);
     std::vector<Box> fboxes;
     std::vector<int> flids;
@@ -187,7 +189,7 @@ void CpuOcrPipeline::run_structure_stages(const cv::Mat &img,
   }
 
   // Table regions -> HTML.
-  if (table_ && table_->ready()) {
+  if (want_tables && table_ && table_->ready()) {
     turbo_ocr::prof::Scope _s(turbo_ocr::prof::TABLE);
     std::vector<Box> tboxes;
     std::vector<int> tlids;
@@ -231,7 +233,9 @@ int CpuOcrPipeline::detect_orientation(const cv::Mat &bgr) {
 
 OcrPipelineResult CpuOcrPipeline::run_with_layout(const cv::Mat &img,
                                                     bool want_layout,
-                                                    bool want_reading_order) {
+                                                    bool want_reading_order,
+                                                    bool want_tables,
+                                                    bool want_formulas) {
   OcrPipelineResult out;
   out.results = run(img);
   if (want_layout && layout_) {
@@ -240,7 +244,8 @@ OcrPipelineResult CpuOcrPipeline::run_with_layout(const cv::Mat &img,
   }
 
   // Formula + table recognition over the detected layout regions (CUDA-free).
-  run_structure_stages(img, out);
+  // Strict opt-in — layout alone never triggers them (parity with the GPU path).
+  run_structure_stages(img, out, want_tables, want_formulas);
 
   // Reading-order over layout regions, with synthetic XY-cut entries
   // for orphan results (results whose centroid falls outside every

@@ -85,11 +85,42 @@ grpc_check_layout_request(grpc::ServerContext *ctx, bool req_layout,
                       "image, or the server was started with DISABLE_LAYOUT=1.");
   }
   if (req_reading_order && !layout_available) {
+    // `req_reading_order` here folds in reading_order/as_blocks/tables/formulas
+    // — every layout-derived feature — so keep the message generic.
     return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
                       "LAYOUT_DISABLED",
-                      "reading_order=1 requires the layout model: start the "
-                      "server without DISABLE_LAYOUT=1 (layout is on by default)");
+                      "reading_order/as_blocks/tables/formulas require the "
+                      "layout model: start the server without DISABLE_LAYOUT=1 "
+                      "(layout is on by default)");
   }
+  return std::nullopt;
+}
+
+// Fail loud over gRPC when the client opts into a structure stage the server
+// can't do (parity with the HTTP check_structure_backends).
+[[nodiscard]] inline std::optional<grpc::Status>
+grpc_check_structure_backends(grpc::ServerContext *ctx, bool want_tables,
+                              bool want_formulas, bool table_available,
+                              bool formula_available,
+                              bool json_bytes_mode) {
+  // Structured response mode carries only `results` (the proto has no
+  // table/formula message). Running the stage then dropping it is a silent
+  // failure — reject loudly so a structured-mode client knows to use json_bytes.
+  if ((want_tables || want_formulas) && !json_bytes_mode)
+    return grpc_error(ctx, grpc::StatusCode::UNIMPLEMENTED,
+                      "STRUCTURED_MODE_NO_STRUCTURE",
+                      "tables/formulas require the json_bytes gRPC response mode "
+                      "(structured mode returns only text results)");
+  if (want_tables && !table_available)
+    return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+                      "TABLE_BACKEND_DISABLED",
+                      "tables=1 requested but no table backend is configured "
+                      "(start the server with TABLE_BACKEND=...)");
+  if (want_formulas && !formula_available)
+    return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+                      "FORMULA_BACKEND_DISABLED",
+                      "formulas=1 requested but no formula backend is configured "
+                      "(start the server with FORMULA_BACKEND=...)");
   return std::nullopt;
 }
 
@@ -140,10 +171,12 @@ inline cv::Mat grpc_decode_image(std::string_view image_data) {
 inline std::future<pipeline::OcrPipelineResult>
 grpc_jpeg_decode_and_infer(pipeline::PipelineDispatcher &dispatcher,
                            std::string_view image_bytes,
-                           bool want_layout, bool want_reading_order) {
+                           bool want_layout, bool want_reading_order,
+                           bool want_tables = false, bool want_formulas = false) {
   std::string owned(image_bytes);
   return dispatcher.submit(
-      [owned = std::move(owned), want_layout, want_reading_order](
+      [owned = std::move(owned), want_layout, want_reading_order,
+       want_tables, want_formulas](
           auto &e) -> pipeline::OcrPipelineResult {
         const auto *d =
             reinterpret_cast<const unsigned char *>(owned.data());
@@ -169,7 +202,8 @@ grpc_jpeg_decode_and_infer(pipeline::PipelineDispatcher &dispatcher,
                   .data = d_buf, .step = pitch, .rows = h, .cols = w};
               try {
                 return e.pipeline->run_with_layout(
-                    gi, e.stream, want_layout, want_reading_order);
+                    gi, e.stream, want_layout, want_reading_order, /*routing=*/{},
+                    /*defer_external=*/false, want_tables, want_formulas);
               } catch (const std::exception &) {
                 // Best-effort GPU zero-copy fast path: if inference on the
                 // nvJPEG-decoded GPU buffer fails, fall through to the CPU
@@ -199,7 +233,9 @@ grpc_jpeg_decode_and_infer(pipeline::PipelineDispatcher &dispatcher,
               "Image area {}x{} exceeds maximum of {} pixels",
               img.cols, img.rows, decode::max_image_pixels()));
         return e.pipeline->run_with_layout(img, e.stream, want_layout,
-                                           want_reading_order);
+                                           want_reading_order, /*routing=*/{},
+                                           /*defer_external=*/false,
+                                           want_tables, want_formulas);
       });
 }
 #endif
@@ -247,6 +283,14 @@ public:
     readiness_check_ = std::move(check);
   }
 
+  /// Advertise which structure backends are configured so the RPCs can fail
+  /// loud (TABLE_BACKEND_DISABLED / FORMULA_BACKEND_DISABLED) when a client
+  /// asks for tables/formulas this server can't produce. Default: both false.
+  void set_structure_availability(bool table_available, bool formula_available) {
+    table_available_ = table_available;
+    formula_available_ = formula_available;
+  }
+
   // ---- Health ----
   grpc::Status Health(grpc::ServerContext *ctx,
                       const ocr::HealthRequest *,
@@ -277,17 +321,24 @@ public:
                          const ocr::OCRRequest *request,
                          ocr::OCRResponse *response) override {
     if (auto err = grpc_check_layout_request(ctx, request->layout(),
-            request->reading_order() || request->as_blocks(),
+            request->reading_order() || request->as_blocks() ||
+            request->tables() || request->formulas(),
             layout_available_); err)
       return *err;
     bool want_layout = request->layout();
     bool want_reading_order = request->reading_order();
     const bool want_blocks = request->as_blocks();
+    const bool want_tables = request->tables();
+    const bool want_formulas = request->formulas();
     if (want_blocks) {
       want_reading_order = true;
       want_layout = true;
     }
-    if (want_reading_order) want_layout = true;
+    if (want_reading_order || want_tables || want_formulas) want_layout = true;
+    if (auto err = grpc_check_structure_backends(ctx, want_tables, want_formulas,
+            table_available_, formula_available_,
+            mode_ == GrpcResponseMode::json_bytes); err)
+      return *err;
 
     // Pixels path: raw BGR pixel data
     if (!request->pixels().empty()) {
@@ -335,8 +386,9 @@ public:
         cv::cvtColor(img, img, cv::COLOR_GRAY2BGR);
 
       try {
-        auto out = run_infer(img, want_layout, want_reading_order);
-        fill_response(response, out.results, out.layout, out.reading_order, want_blocks);
+        auto out = run_infer(img, want_layout, want_reading_order,
+                             want_tables, want_formulas);
+        fill_response(response, out, want_blocks);
         return grpc::Status::OK;
       } catch (const turbo_ocr::PoolExhaustedError &e) {
         return grpc_error(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED,
@@ -375,10 +427,10 @@ public:
           // timed-out future is safe to abandon (C4).
           auto fut = grpc_jpeg_decode_and_infer(*dispatcher_, request->image(),
                                                  want_layout,
-                                                 want_reading_order);
+                                                 want_reading_order,
+                                                 want_tables, want_formulas);
           auto out = pipeline::get_with_timeout(fut, request_timeout_ms_);
-          fill_response(response, out.results, out.layout, out.reading_order,
-                        want_blocks);
+          fill_response(response, out, want_blocks);
           return grpc::Status::OK;
         } catch (const turbo_ocr::ImageTooLargeError &e) {
           return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
@@ -422,8 +474,9 @@ public:
     }
 
     try {
-      auto out = run_infer(img, want_layout, want_reading_order);
-      fill_response(response, out.results, out.layout, out.reading_order, want_blocks);
+      auto out = run_infer(img, want_layout, want_reading_order,
+                           want_tables, want_formulas);
+      fill_response(response, out, want_blocks);
       return grpc::Status::OK;
     } catch (const turbo_ocr::PoolExhaustedError &e) {
       return grpc_error(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED,
@@ -458,17 +511,24 @@ public:
           std::format("images has {} entries, max is {}", n, max_batch_images_));
 
     if (auto err = grpc_check_layout_request(ctx, request->layout(),
-            request->reading_order() || request->as_blocks(),
+            request->reading_order() || request->as_blocks() ||
+            request->tables() || request->formulas(),
             layout_available_); err)
       return *err;
     bool want_layout = request->layout();
     bool want_reading_order = request->reading_order();
     const bool want_blocks = request->as_blocks();
+    const bool want_tables = request->tables();
+    const bool want_formulas = request->formulas();
     if (want_blocks) {
       want_reading_order = true;
       want_layout = true;
     }
-    if (want_reading_order) want_layout = true;
+    if (want_reading_order || want_tables || want_formulas) want_layout = true;
+    if (auto err = grpc_check_structure_backends(ctx, want_tables, want_formulas,
+            table_available_, formula_available_,
+            mode_ == GrpcResponseMode::json_bytes); err)
+      return *err;
 
     // Per-slot oversize handling: an oversized image is dropped to an empty
     // slot (0 detections), NOT a whole-RPC abort — one decompression-bomb in
@@ -569,14 +629,16 @@ public:
           if (is_jpeg[i]) {
             futs[i] = grpc_jpeg_decode_and_infer(
                 *dispatcher_, request->images(i), want_layout,
-                want_reading_order);
+                want_reading_order, want_tables, want_formulas);
           } else if (!imgs[i].empty()) {
             cv::Mat img_owned = std::move(imgs[i]);
             futs[i] = dispatcher_->submit(
                 [img_owned = std::move(img_owned), want_layout,
-                 want_reading_order](auto &e) {
+                 want_reading_order, want_tables, want_formulas](auto &e) {
                   return e.pipeline->run_with_layout(
-                      img_owned, e.stream, want_layout, want_reading_order);
+                      img_owned, e.stream, want_layout, want_reading_order,
+                      /*routing=*/{}, /*defer_external=*/false,
+                      want_tables, want_formulas);
                 });
           }
         } catch (const turbo_ocr::PoolExhaustedError &e) {
@@ -619,8 +681,7 @@ public:
           } else {
             out = futs[i].get();
           }
-          fill_response(entries[i], out.results, out.layout,
-                        out.reading_order, want_blocks);
+          fill_response(entries[i], out, want_blocks);
         } catch (const std::exception &e) {
           std::cerr << std::format("[gRPC Batch] Image {} error: {}\n",
                                    i, e.what());
@@ -647,9 +708,9 @@ public:
             if (i >= n) break;
             if (imgs[i].empty()) continue;
             try {
-              auto out = run_infer(imgs[i], want_layout, want_reading_order);
-              fill_response(entries[i], out.results, out.layout,
-                            out.reading_order, want_blocks);
+              auto out = run_infer(imgs[i], want_layout, want_reading_order,
+                                   want_tables, want_formulas);
+              fill_response(entries[i], out, want_blocks);
             } catch (const std::exception &e) {
               std::cerr << std::format("[gRPC Batch] Image {} error: {}\n",
                                        i, e.what());
@@ -678,7 +739,8 @@ public:
                         "MISSING_PDF", "Empty PDF data");
 
     if (auto err = grpc_check_layout_request(ctx, request->layout(),
-            /*reading_order=*/request->as_blocks(),
+            /*reading_order=*/request->as_blocks() ||
+            request->tables() || request->formulas(),
             layout_available_); err)
       return *err;
 
@@ -688,7 +750,13 @@ public:
     bool want_layout = request->layout();
     const bool want_blocks = request->as_blocks();
     const bool want_reading_order = want_blocks;
-    if (want_blocks) want_layout = true;
+    const bool want_tables = request->tables();
+    const bool want_formulas = request->formulas();
+    if (want_blocks || want_tables || want_formulas) want_layout = true;
+    if (auto err = grpc_check_structure_backends(ctx, want_tables, want_formulas,
+            table_available_, formula_available_,
+            mode_ == GrpcResponseMode::json_bytes); err)
+      return *err;
 
     int dpi = request->dpi();
     if (dpi == 0) dpi = default_pdf_dpi_;
@@ -726,6 +794,8 @@ public:
     job_opts.want_layout = want_layout;
     job_opts.want_reading_order = want_reading_order;
     job_opts.want_blocks = want_blocks;
+    job_opts.want_tables = want_tables;
+    job_opts.want_formulas = want_formulas;
     // Bound the GPU per-page future join with the configured request deadline so
     // a wedged page can't hang the RPC (no-op on the sequential CPU overload).
     job_opts.request_timeout_ms = request_timeout_ms_;
@@ -745,9 +815,21 @@ public:
           job_opts.mode = pdf::PdfMode::Auto;
         job = pipeline::run_pdf_job(
             [this](const cv::Mat &img, const InferOptions &o) {
-              auto r = run_infer(img, o.want_layout, o.want_reading_order);
-              return InferResult{std::move(r.results), std::move(r.layout),
-                                 std::move(r.reading_order)};
+              auto r = run_infer(img, o.want_layout, o.want_reading_order,
+                                 o.want_tables, o.want_formulas);
+              return InferResult{
+                  .results          = std::move(r.results),
+                  .layout           = std::move(r.layout),
+                  .reading_order    = std::move(r.reading_order),
+                  .tables           = std::move(r.tables),
+                  .formulas         = std::move(r.formulas),
+                  .formula_degraded = r.formula_degraded,
+                  .formula_warning  = std::move(r.formula_warning),
+                  .table_degraded   = r.table_degraded,
+                  .table_warning    = std::move(r.table_warning),
+                  .text_degraded    = r.text_degraded,
+                  .text_warning     = std::move(r.text_warning),
+              };
             },
             *pdf_renderer_, pdf_data, pdf_len, job_opts,
             server::OrientFunc{});
@@ -825,24 +907,20 @@ private:
     }
   }
 
+  // Takes the full pipeline result so json_bytes mode emits the SAME body as the
+  // HTTP routes — including `tables`/`formulas` (+ degradation flags) when the
+  // request opted in (?tables=1 / ?formulas=1). Structured mode carries only
+  // `results` (the proto has no table/formula message), same as before.
   void fill_response(ocr::OCRResponse *response,
-                     std::vector<OCRResultItem> &results,
-                     std::vector<layout::LayoutBox> &layout_boxes,
-                     const std::vector<int> &reading_order = {},
+                     pipeline::OcrPipelineResult &out,
                      bool want_blocks = false) {
-    response->set_num_detections(static_cast<int>(results.size()));
+    response->set_num_detections(static_cast<int>(out.results.size()));
     if (mode_ == GrpcResponseMode::json_bytes) {
-      if (!reading_order.empty()) {
-        response->set_json_response(emit_results_json(
-            results, layout_boxes, reading_order, want_blocks));
-      } else if (layout_boxes.empty()) {
-        response->set_json_response(results_to_json(results));
-      } else {
-        response->set_json_response(results_to_json(results, layout_boxes));
-      }
+      response->set_json_response(
+          turbo_ocr::emit_pipeline_result_json(out, want_blocks));
     } else {
-      response->mutable_results()->Reserve(static_cast<int>(results.size()));
-      for (const auto &item : results) {
+      response->mutable_results()->Reserve(static_cast<int>(out.results.size()));
+      for (const auto &item : out.results) {
         auto *result = response->add_results();
         result->set_text(item.text);
         result->set_confidence(item.confidence);
@@ -858,10 +936,10 @@ private:
     }
     // Always populate the dedicated reading_order field so non-JSON
     // clients can read it without parsing json_response.
-    if (!reading_order.empty()) {
+    if (!out.reading_order.empty()) {
       response->mutable_reading_order()->Reserve(
-          static_cast<int>(reading_order.size()));
-      for (int idx : reading_order) response->add_reading_order(idx);
+          static_cast<int>(out.reading_order.size()));
+      for (int idx : out.reading_order) response->add_reading_order(idx);
     }
   }
 
@@ -888,26 +966,43 @@ private:
   /// is computed over layout regions — the contract matches the HTTP
   /// `?reading_order=1` query handler.
   pipeline::OcrPipelineResult run_infer(const cv::Mat &img, bool want_layout,
-                                         bool want_reading_order = false) {
-    if (want_reading_order) want_layout = want_layout || layout_available_;
+                                         bool want_reading_order = false,
+                                         bool want_tables = false,
+                                         bool want_formulas = false) {
+    if (want_reading_order || want_tables || want_formulas)
+      want_layout = want_layout || layout_available_;
     if (infer_fn_) {
       InferOptions opts;
       opts.want_layout = want_layout;
       opts.want_reading_order = want_reading_order;
+      opts.want_tables = want_tables;
+      opts.want_formulas = want_formulas;
       auto r = infer_fn_(img, opts);
-      return pipeline::OcrPipelineResult{
-          .results       = std::move(r.results),
-          .layout        = std::move(r.layout),
-          .reading_order = std::move(r.reading_order),
-      };
+      pipeline::OcrPipelineResult res;
+      res.results          = std::move(r.results);
+      res.layout           = std::move(r.layout);
+      res.reading_order    = std::move(r.reading_order);
+      res.tables           = std::move(r.tables);
+      res.formulas         = std::move(r.formulas);
+      // Carry the no-silent-failure degradation signals too — without these a
+      // failed table/formula/text stage would return a clean 200 over gRPC.
+      res.formula_degraded = r.formula_degraded;
+      res.formula_warning  = std::move(r.formula_warning);
+      res.table_degraded   = r.table_degraded;
+      res.table_warning    = std::move(r.table_warning);
+      res.text_degraded    = r.text_degraded;
+      res.text_warning     = std::move(r.text_warning);
+      return res;
     }
 #ifndef USE_CPU_ONLY
     // BY-VALUE capture of img (cheap cv::Mat refcount bump): submit_for_default
     // may abandon the task on timeout, so it must not reference caller stack.
     return dispatcher_->submit_for_default(
-        [img, want_layout, want_reading_order](auto &e) {
+        [img, want_layout, want_reading_order, want_tables, want_formulas](auto &e) {
           return e.pipeline->run_with_layout(img, e.stream, want_layout,
-                                             want_reading_order);
+                                             want_reading_order, /*routing=*/{},
+                                             /*defer_external=*/false,
+                                             want_tables, want_formulas);
         });
 #else
     throw std::logic_error("No inference backend configured");
@@ -923,6 +1018,8 @@ private:
   render::PdfRenderer *pdf_renderer_ = nullptr;
   pdf::PdfMode default_pdf_mode_ = pdf::PdfMode::Ocr;
   bool layout_available_ = false;
+  bool table_available_ = false;
+  bool formula_available_ = false;
   int grpc_batch_workers_ = 8;
   int max_pdf_pages_ = 2000;
   int max_batch_images_ = 1024;
@@ -992,10 +1089,13 @@ inline GrpcHandle start_grpc_server(pipeline::PipelineDispatcher &dispatcher,
                                      const ServerConfig &cfg,
                                      render::PdfRenderer *pdf_renderer = nullptr,
                                      bool layout_available = false,
-                                     std::function<bool()> readiness_check = {}) {
+                                     std::function<bool()> readiness_check = {},
+                                     bool table_available = false,
+                                     bool formula_available = false) {
   auto service = std::make_shared<OCRServiceImpl>(
       dispatcher, cfg, pdf_renderer, layout_available);
   service->set_readiness_check(std::move(readiness_check));
+  service->set_structure_availability(table_available, formula_available);
   return detail::launch_grpc_server(std::move(service), cfg.grpc_port, cfg);
 }
 #endif
@@ -1005,10 +1105,13 @@ inline GrpcHandle start_grpc_server(InferFunc infer_fn,
                                      const ServerConfig &cfg,
                                      render::PdfRenderer *pdf_renderer = nullptr,
                                      bool layout_available = false,
-                                     std::function<bool()> readiness_check = {}) {
+                                     std::function<bool()> readiness_check = {},
+                                     bool table_available = false,
+                                     bool formula_available = false) {
   auto service = std::make_shared<OCRServiceImpl>(
       std::move(infer_fn), cfg, pdf_renderer, layout_available);
   service->set_readiness_check(std::move(readiness_check));
+  service->set_structure_availability(table_available, formula_available);
   return detail::launch_grpc_server(std::move(service), cfg.grpc_port, cfg);
 }
 

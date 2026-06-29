@@ -23,6 +23,8 @@ struct CapabilitiesInfo {
 
   // ---- features ----
   bool layout_available = false;      // layout stage loaded
+  bool table_available = false;       // a table backend loaded (tables=1 works)
+  bool formula_available = false;     // a formula backend loaded (formulas=1 works)
   bool autorotate_available = false;  // doc-orientation model loaded
   bool profile_endpoint = false;      // GET /profile registered (CPU only)
   // gRPC response encoding: "json_bytes" (default) or "structured".
@@ -61,15 +63,23 @@ void register_capabilities_route(const CapabilitiesInfo &info);
 void register_health_route(std::function<bool()> readiness_check = nullptr,
                            server::WorkPool *pool = nullptr);
 
+// `table_available`/`formula_available` MUST reflect what this build's pipeline
+// actually loaded (GPU: routing-derived; CPU: env-derived) so the fail-loud 400
+// matches reality — passing the routing-name set here would silently diverge on
+// the CPU build. See check_structure_backends.
 void register_ocr_base64_route(server::WorkPool &pool,
                                 const server::InferFunc &infer,
                                 const server::ImageDecoder &decode,
-                                bool layout_available);
+                                bool layout_available,
+                                bool table_available,
+                                bool formula_available);
 
 void register_ocr_raw_route(server::WorkPool &pool,
                              const server::InferFunc &infer,
                              const server::ImageDecoder &decode,
-                             bool layout_available);
+                             bool layout_available,
+                             bool table_available,
+                             bool formula_available);
 
 /// Convenience: register /health + /ocr + /ocr/raw (CPU paths).
 /// `readiness_check` is forwarded to /health/ready and should also be
@@ -78,6 +88,8 @@ void register_common_routes(server::WorkPool &pool,
                              const server::InferFunc &infer,
                              const server::ImageDecoder &decode,
                              bool layout_available,
+                             bool table_available,
+                             bool formula_available,
                              std::function<bool()> readiness_check = nullptr);
 
 } // namespace turbo_ocr::routes

@@ -96,6 +96,17 @@ public:
     return formula_registry_.find(name) != formula_registry_.end();
   }
 
+  // Default (no-override) opt-in availability: these are the exact pointers
+  // dispatch_router_ picks for routing.table=="default" / the default formula
+  // route, so the server's `tables=1`/`formulas=1` fail-loud gate reads the
+  // truth from what actually loaded rather than re-deriving it from config.
+  [[nodiscard]] bool has_default_table_backend() const {
+    return table_recognizer_ != nullptr;
+  }
+  [[nodiscard]] bool has_default_formula_backend() const {
+    return formula_ != nullptr;
+  }
+
   // Tier-B: run ONE crop (the whole image is the region) through a backend for
   // `modality` ("table"|"formula") and return the raw recognized string (HTML
   // for table, LaTeX/text for formula). Empty string for the legitimately-empty
@@ -164,13 +175,17 @@ public:
                                                    bool want_layout = false,
                                                    bool want_reading_order = false,
                                                    const routing::RequestRouting &routing = {},
-                                                   bool defer_external = false);
+                                                   bool defer_external = false,
+                                                   bool want_tables = false,
+                                                   bool want_formulas = false);
   [[nodiscard]] OcrPipelineResult run_with_layout(GpuImage gpu_img,
                                                    cudaStream_t stream = 0,
                                                    bool want_layout = false,
                                                    bool want_reading_order = false,
                                                    const routing::RequestRouting &routing = {},
-                                                   bool defer_external = false);
+                                                   bool defer_external = false,
+                                                   bool want_tables = false,
+                                                   bool want_formulas = false);
 
   // Layout-only path: upload the image, run the PP-DocLayoutV3 inference,
   // collect the boxes, and return. Skips detection, angle classification,
@@ -207,7 +222,9 @@ public:
   run_batch_with_layout(const std::vector<cv::Mat> &imgs,
                         cudaStream_t stream = 0,
                         bool want_layout = false,
-                        bool want_reading_order = false);
+                        bool want_reading_order = false,
+                        bool want_tables = false,
+                        bool want_formulas = false);
 
 private:
   std::unique_ptr<detection::PaddleDet> det_;
@@ -327,7 +344,9 @@ private:
                         const std::vector<Box> &boxes,
                         PipelineTimer &timer,
                         const routing::RequestRouting &routing = {},
-                        bool defer_external = false);
+                        bool defer_external = false,
+                        bool want_tables = false,
+                        bool want_formulas = false);
 
   // Resolve the recognizer for a per-request dispatch: the named override entry
   // when `name` is non-empty AND present in the registry, else the route
@@ -351,7 +370,9 @@ private:
       const std::vector<recognition::PaddleRec::ImageCrops> &image_crops,
       bool want_reading_order,
       cudaStream_t stream,
-      std::vector<OcrPipelineResult> &outs);
+      std::vector<OcrPipelineResult> &outs,
+      bool want_tables = false,
+      bool want_formulas = false);
 };
 
 } // namespace turbo_ocr::pipeline

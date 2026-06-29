@@ -361,13 +361,20 @@ void register_pdf_route(server::WorkPool &pool,
                         render::PdfRenderer &pdf_renderer,
                         pdf::PdfMode default_pdf_mode,
                         bool layout_available,
+                        bool table_available,
+                        bool formula_available,
                         int default_dpi,
                         int max_pdf_pages,
                         bool doc_ori_available) {
 
+  // Availability from the warmed pipeline (single source of truth), threaded
+  // from main(); not re-derived from config.
+  const bool table_avail   = table_available;
+  const bool formula_avail = formula_available;
   drogon::app().registerHandler(
       "/ocr/pdf",
       [&pool, &dispatcher, &pdf_renderer, default_pdf_mode, layout_available,
+       table_avail, formula_avail,
        default_dpi, max_pdf_pages, doc_ori_available](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
@@ -390,12 +397,21 @@ void register_pdf_route(server::WorkPool &pool,
     const bool layout_enabled = opts.want_layout;
     const bool want_reading_order = opts.want_reading_order;
     const bool want_blocks = opts.want_blocks;
+    const bool want_tables = opts.want_tables;
+    const bool want_formulas = opts.want_formulas;
 
     if (reject_unknown_query_params(
-            req, {"layout", "reading_order", "as_blocks", "dpi", "mode",
+            req, {"layout", "reading_order", "as_blocks", "tables", "formulas",
+                  "dpi", "mode",
                   "images", "format", "lossless", "png_compression", "quality",
                   "max_side", "autorotate"}, callback))
       return;
+    if (auto r = server::check_structure_backends(opts, table_avail, formula_avail);
+        !r.error.empty()) {
+      callback(server::error_response(drogon::k400BadRequest,
+                                       r.error_code.c_str(), r.error));
+      return;
+    }
 
     auto dpi_str = req->getParameter("dpi");
     // Absent -> default; present-but-garbage/overflow -> -1 -> rejected below
@@ -444,7 +460,7 @@ void register_pdf_route(server::WorkPool &pool,
 
     server::submit_work(pool, std::move(callback),
         [pdf_buf, req, &dispatcher, &pdf_renderer,
-         layout_enabled, want_reading_order, want_blocks,
+         layout_enabled, want_reading_order, want_blocks, want_tables, want_formulas,
          dpi, req_mode, image_mode,
          encode_opts, max_pdf_pages, autorotate](server::DrogonCallback &cb) {
      // Wrap the whole body: post-render work (emit_pdf_response's multi-GB
@@ -463,6 +479,8 @@ void register_pdf_route(server::WorkPool &pool,
       job_opts.want_layout = layout_enabled;
       job_opts.want_reading_order = want_reading_order;
       job_opts.want_blocks = want_blocks;
+      job_opts.want_tables = want_tables;
+      job_opts.want_formulas = want_formulas;
       job_opts.autorotate = autorotate;
       job_opts.image_mode = image_mode;
       job_opts.encode_opts = encode_opts;
@@ -490,13 +508,20 @@ void register_pdf_route(server::WorkPool &pool,
                         render::PdfRenderer &pdf_renderer,
                         pdf::PdfMode default_pdf_mode,
                         bool layout_available,
+                        bool table_available,
+                        bool formula_available,
                         int max_pdf_pages,
                         server::OrientFunc orient_fn) {
   const bool doc_ori_available = static_cast<bool>(orient_fn);
+  // Availability passed in (CPU: env-derived = what actually loaded), not
+  // routing-derived — the CPU pipeline loads table/formula from env, not routing.
+  const bool table_avail   = table_available;
+  const bool formula_avail = formula_available;
 
   drogon::app().registerHandler(
       "/ocr/pdf",
       [&pool, &infer, &pdf_renderer, default_pdf_mode, layout_available,
+       table_avail, formula_avail,
        max_pdf_pages, orient_fn, doc_ori_available](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
@@ -518,12 +543,21 @@ void register_pdf_route(server::WorkPool &pool,
     const bool want_layout = opts.want_layout;
     const bool want_reading_order = opts.want_reading_order;
     const bool want_blocks = opts.want_blocks;
+    const bool want_tables = opts.want_tables;
+    const bool want_formulas = opts.want_formulas;
 
     if (reject_unknown_query_params(
-            req, {"layout", "reading_order", "as_blocks", "dpi", "mode",
+            req, {"layout", "reading_order", "as_blocks", "tables", "formulas",
+                  "dpi", "mode",
                   "images", "format", "lossless", "png_compression", "quality",
                   "max_side", "autorotate"}, callback))
       return;
+    if (auto r = server::check_structure_backends(opts, table_avail, formula_avail);
+        !r.error.empty()) {
+      callback(server::error_response(drogon::k400BadRequest,
+                                       r.error_code.c_str(), r.error));
+      return;
+    }
 
     auto dpi_str = req->getParameter("dpi");
     int dpi = dpi_str.empty() ? kCpuDefaultDpi : query_int(std::string(dpi_str), -1);
@@ -566,7 +600,7 @@ void register_pdf_route(server::WorkPool &pool,
 
     server::submit_work(pool, std::move(callback),
         [pdf_buf, &infer, &pdf_renderer, want_layout,
-         want_reading_order, want_blocks, dpi,
+         want_reading_order, want_blocks, want_tables, want_formulas, dpi,
          req_mode, image_mode, encode_opts, max_pdf_pages,
          autorotate, orient_fn](server::DrogonCallback &cb) {
      // See GPU route: wrap the body so a post-render bad_alloc returns 500
@@ -594,6 +628,8 @@ void register_pdf_route(server::WorkPool &pool,
       job_opts.want_layout = want_layout;
       job_opts.want_reading_order = want_reading_order;
       job_opts.want_blocks = want_blocks;
+      job_opts.want_tables = want_tables;
+      job_opts.want_formulas = want_formulas;
       job_opts.autorotate = autorotate;
       job_opts.image_mode = image_mode;
       job_opts.encode_opts = encode_opts;

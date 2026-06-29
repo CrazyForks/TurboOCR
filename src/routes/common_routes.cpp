@@ -105,6 +105,8 @@ void register_capabilities_route(const CapabilitiesInfo &info) {
   body += info.is_gpu ? "gpu" : "cpu";
   body += R"(","features":{)";
   body += R"("layout":)";          body += b(info.layout_available);
+  body += R"(,"tables":)";         body += b(info.table_available);
+  body += R"(,"formulas":)";       body += b(info.formula_available);
   body += R"(,"autorotate":)";     body += b(info.autorotate_available);
   body += R"(,"profile_endpoint":)"; body += b(info.profile_endpoint);
   body += R"(,"grpc_response_mode":")";
@@ -213,15 +215,22 @@ void register_health_route(std::function<bool()> readiness_check,
 void register_ocr_base64_route(server::WorkPool &pool,
                                 const server::InferFunc &infer,
                                 const server::ImageDecoder &decode,
-                                bool layout_available) {
+                                bool layout_available,
+                                bool table_available,
+                                bool formula_available) {
   // Tier-A override validation set (see register_ocr_raw_route_gpu); computed
-  // once from the same routing config the pipeline loaded.
+  // once from the same routing config the pipeline loaded. Availability for the
+  // fail-loud gate is passed in (build-specific: what actually loaded), NOT
+  // re-derived here — see check_structure_backends.
   const auto rtbl = routing::load_routing_config();
   const std::set<std::string> valid_table   = routing::routable_backend_names(rtbl, "table");
   const std::set<std::string> valid_formula = routing::routable_backend_names(rtbl, "formula");
+  const bool table_avail   = table_available;
+  const bool formula_avail = formula_available;
   drogon::app().registerHandler(
       "/ocr",
-      [&pool, &infer, &decode, layout_available, valid_table, valid_formula](
+      [&pool, &infer, &decode, layout_available, valid_table, valid_formula,
+       table_avail, formula_avail](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
@@ -233,8 +242,14 @@ void register_ocr_base64_route(server::WorkPool &pool,
           return;
         }
         if (reject_unknown_query_params(
-                req, {"layout", "reading_order", "as_blocks"}, callback))
+                req, {"layout", "reading_order", "as_blocks", "tables", "formulas"}, callback))
           return;
+        if (auto r = server::check_structure_backends(opts, table_avail, formula_avail);
+            !r.error.empty()) {
+          callback(server::error_response(drogon::k400BadRequest,
+                                           r.error_code.c_str(), r.error));
+          return;
+        }
 
         auto json = req->getJsonObject();
         if (!json) {
@@ -297,10 +312,14 @@ void register_ocr_base64_route(server::WorkPool &pool,
 void register_ocr_raw_route(server::WorkPool &pool,
                              const server::InferFunc &infer,
                              const server::ImageDecoder &decode,
-                             bool layout_available) {
+                             bool layout_available,
+                             bool table_available,
+                             bool formula_available) {
+  const bool table_avail   = table_available;
+  const bool formula_avail = formula_available;
   drogon::app().registerHandler(
       "/ocr/raw",
-      [&pool, &infer, &decode, layout_available](
+      [&pool, &infer, &decode, layout_available, table_avail, formula_avail](
           const drogon::HttpRequestPtr &req,
           std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
@@ -317,8 +336,14 @@ void register_ocr_raw_route(server::WorkPool &pool,
           return;
         }
         if (reject_unknown_query_params(
-                req, {"layout", "reading_order", "as_blocks"}, callback))
+                req, {"layout", "reading_order", "as_blocks", "tables", "formulas"}, callback))
           return;
+        if (auto r = server::check_structure_backends(opts, table_avail, formula_avail);
+            !r.error.empty()) {
+          callback(server::error_response(drogon::k400BadRequest,
+                                           r.error_code.c_str(), r.error));
+          return;
+        }
 
         server::submit_work(pool, std::move(callback),
             [req, &infer, &decode, opts](server::DrogonCallback &cb) {
@@ -348,14 +373,18 @@ void register_common_routes(server::WorkPool &pool,
                              const server::InferFunc &infer,
                              const server::ImageDecoder &decode,
                              bool layout_available,
+                             bool table_available,
+                             bool formula_available,
                              std::function<bool()> readiness_check) {
   // Forward the pool so /health/ready offloads the readiness probe off the
   // event loop — the CPU readiness check calls pool->acquire(), which blocks
   // on a condition variable (unbounded for the CPU pool) when all pipelines
   // are busy; running it inline would wedge a Drogon IO thread under load.
   register_health_route(std::move(readiness_check), &pool);
-  register_ocr_base64_route(pool, infer, decode, layout_available);
-  register_ocr_raw_route(pool, infer, decode, layout_available);
+  register_ocr_base64_route(pool, infer, decode, layout_available,
+                            table_available, formula_available);
+  register_ocr_raw_route(pool, infer, decode, layout_available,
+                         table_available, formula_available);
 }
 
 } // namespace turbo_ocr::routes

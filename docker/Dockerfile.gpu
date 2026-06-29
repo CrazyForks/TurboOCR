@@ -75,9 +75,9 @@ RUN cd /tmp && \
 #   curl -sL https://github.com/microsoft/onnxruntime/releases/download/v<NEW>/onnxruntime-linux-x64-<NEW>.tgz | sha256sum
 ARG ORT_VERSION=1.22.0
 ARG ORT_SHA256=8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3
-# The aarch64 tarball has a different hash; pass --build-arg ORT_SHA256_ARM64=...
-# to verify it (empty = download without checksum).
-ARG ORT_SHA256_ARM64=
+# The aarch64 tarball has a different hash; override with --build-arg
+# ORT_SHA256_ARM64=... after an ORT_VERSION bump (empty = download without checksum).
+ARG ORT_SHA256_ARM64=bb76395092d150b52c7092dc6b8f2fe4d80f0f3bf0416d2f269193e347e24702
 RUN cd /tmp && \
     case "${TARGETARCH:-amd64}" in \
       arm64) ORT_ARCH=aarch64; ORT_SHA=${ORT_SHA256_ARM64} ;; \

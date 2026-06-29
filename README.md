@@ -95,8 +95,8 @@ curl -X POST http://localhost:8000/ocr/raw \
 
 On a single RTX 5090, vs every common OCR engine:
 
-- **Forms & receipts:** accurate (FUNSD 92% / CORD 93% word-F1 on the medium tier) and **15–90× faster** than every other engine — up to **559 img/s** (receipts) on the default tiny tier.
-- **Full document parsing:** **0.90** Overall on a **125-doc OmniDocBench subset** at **20 pages/s**, within ~5 points of PaddleOCR-VL (0.95, same subset) which runs at ~1 pg/s — fully local, no API. (Subset, not the full 1651-page set — see [benchmarks](#benchmarks).)
+- **Forms & receipts (English):** accurate (FUNSD 92% / CORD 93% word-F1 on the medium tier) and **15–90× faster** than every other engine — up to **559 img/s** (receipts) on the default tiny tier. FUNSD/CORD are English/Latin-script datasets; the EN+ZH full-document numbers below include Chinese.
+- **Full document parsing (EN+ZH):** **0.90** Overall on a **125-doc OmniDocBench subset** at **20 pages/s**, within ~5 points of PaddleOCR-VL (0.95, same subset) which runs at ~1 pg/s — fully local, no API. (Subset including Chinese pages, not the full 1651-page set — see [benchmarks](#benchmarks).)
 
 → [Full benchmarks & methodology](docs/benchmarks/comparison.md)
 

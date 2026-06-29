@@ -109,7 +109,9 @@ jobs:
           file: docker/Dockerfile.cpu
           platforms: ${{ startsWith(github.ref, 'refs/tags/v') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
           push: ${{ startsWith(github.ref, 'refs/tags/v') }}
-          tags: ghcr.io/aiptimizer/turboocr:${{ github.ref_name }}-cpu
+          # PR refs (e.g. "20/merge") aren't valid Docker tags; only tag builds
+          # push, so a fixed "ci" tag is fine for the PR build-validation case.
+          tags: ghcr.io/aiptimizer/turboocr:${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'ci' }}-cpu
 
   # Nightly sanitizer run (L2). ASAN catches leaks/UAF, TSAN catches data races.
   # Too slow per-push, so scheduled-only.

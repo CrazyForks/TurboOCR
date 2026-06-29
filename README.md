@@ -87,6 +87,33 @@ curl -X POST http://localhost:8000/ocr/raw \
 {"results": [{"text": "Invoice Total", "confidence": 0.97, "bounding_box": [[42,10],[210,10],[210,38],[42,38]]}]}
 ```
 
+### Start it with the stages you want
+
+All weights are baked into the image — just set the backend env var to load a
+stage (no paths needed). Layout is on by default; each extra stage still only
+runs when the request asks for it.
+
+```bash
+# text + layout (default)
+docker run --gpus all -p 8000:8000 -p 50051:50051 \
+  -v trt-cache:/home/ocr/.cache/turbo-ocr ghcr.io/aiptimizer/turboocr:latest
+
+# + tables (→ HTML)       add  -e TABLE_BACKEND=slanext
+# + formulas (→ LaTeX)    add  -e FORMULA_BACKEND=ppformulanet_s
+# + both                  add  -e TABLE_BACKEND=slanext -e FORMULA_BACKEND=ppformulanet_s
+# bigger / other language add  -e OCR_MODEL=medium   (tiny | small | medium | arabic | eslav | korean | thai | greek)
+```
+
+Then opt in per request (combine freely; `tables`/`formulas` auto-enable layout):
+
+```bash
+curl -X POST "http://localhost:8000/ocr/raw?layout=1&tables=1&formulas=1" \
+  --data-binary @paper.png -H "Content-Type: image/png"
+# PDF:  POST /ocr/pdf   ·   Markdown export: POST /ocr/markdown   ·   gRPC: port 50051
+```
+
+`GET /capabilities` reports which stages a running server has loaded.
+
 → [Docker & deployment](docs/build/docker.md) · [Build from source](docs/build/native.md)
 
 ---

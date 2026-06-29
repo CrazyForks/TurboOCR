@@ -214,8 +214,8 @@ python3 scripts/bench_speed_matrix.py --n 125 --pool-sizes 2 --concurrency 8
 python3 scripts/bench_speed_matrix.py --baseline result/bench_speed_matrix.json   # regression gate (>15%)
 
 # Accuracy — boot a server with the config, then score (needs omnidocbench/.venv):
-#   local:  TABLE_BACKEND=slanext + SLANEXT envs + FORMULA_BACKEND=ppformulanet_s + FORMULA_ONNX/_TOKENIZER
-#           (in-process ORT-CUDA-13 — no Python sidecar; see the vLLM-free recipe below)
+#   local:  TABLE_BACKEND=slanext + FORMULA_BACKEND=ppformulanet_s  (both auto-resolve
+#           the baked weights; in-process ORT-CUDA-13 — no Python sidecar)
 #   hybrid: TURBO_ROUTING_CONFIG=routing.json (table/formula -> vl), TABLE_SLANEXT_* for slanext_local
 python3 scripts/omnidoc_run_and_score_n.py --server-url http://localhost:8822 --experiment-name local_125
 
@@ -231,14 +231,13 @@ vllm serve models/vlm/paddleocr_vl_1_5 --port 8077 --trust-remote-code \
 ```
 Build recipe (clean): `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTENSORRT_DIR=<trt> -DFETCH_MODELS=OFF`.
 
-For the local pipeline, enable the formula backend + the reading-order param:
+For the local pipeline, just set the formula backend (weights auto-resolve from
+the baked `models/formula/ppformulanet_s/`):
 ```bash
-FORMULA_BACKEND=ppformulanet_s \
-  FORMULA_ONNX=models/formula/ppformulanet_s/ \
-  FORMULA_TOKENIZER=models/formula/ppformulanet_s/tokenizer.json \
-  ./build/turboocr-server ...
+FORMULA_BACKEND=ppformulanet_s ./build/turboocr-server ...
 # Runs in-process on ORT-CUDA-13 (no Python, no sidecar) from the fast/ split
 # graphs. It fails loud if it can't reach the GPU or the fast/ graphs are
 # missing, and surfaces per-region failures as formula_degraded.
-# Knob: PPFNS_CHUNK (decode batch, default 8).
+# Override the path with FORMULA_ONNX / FORMULA_TOKENIZER only for a non-baked
+# location. Knob: PPFNS_CHUNK (decode batch, default 8).
 ```

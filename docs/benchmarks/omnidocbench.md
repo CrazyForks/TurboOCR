@@ -173,8 +173,11 @@ internal engineering notes for the per-attempt diary.
 ## 6. Reproduce
 
 ```bash
-# 1. Start the OCR server (assumes engines are built and cached)
+# 1. Start the OCR server with table + formula enabled (else ?tables=1&formulas=1
+#    below returns 400 ...BACKEND_DISABLED). Backend vars auto-resolve the baked
+#    weights — no model paths needed.
 LD_LIBRARY_PATH="$HOME/TensorRT-10.15.1.29/lib:$LD_LIBRARY_PATH" \
+  TABLE_BACKEND=slanext FORMULA_BACKEND=ppformulanet_s \
   ./build/turboocr-server --http-port 8000 --log-level warn &
 
 # 2. Render predictions for all 1651 pages (~18 s wall on RTX 5090)

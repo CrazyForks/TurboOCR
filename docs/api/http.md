@@ -5,7 +5,10 @@
     entirely; `POST /ocr/batch` and `POST /ocr/pdf` cover multi-image and PDF
     inputs; `POST /ocr/markdown` (GPU build) exports a parsed page as
     Markdown. `GET /health/live` and `GET /health/ready` are
-    Kubernetes-friendly probes. Default bind: `http://localhost:8000`.
+    Kubernetes-friendly probes. The Docker image is fronted by nginx on
+    `http://localhost:8000`; a native build binds port **8080** directly
+    (`PORT`, default 8080). The examples below use `:8000` (the Docker port) —
+    use `:8080` for a native server.
 
 Routes are registered in these files:
 
@@ -28,7 +31,6 @@ Parsed by `server::parse_query_options()` in
 | `as_blocks` | `0` | Emit paragraph-level `blocks`. Auto-enables `layout` + `reading_order`. |
 | `tables` | `0` | Run the table branch (SLANeXt, or a VLM backend) and emit `tables`. Strict opt-in: `1` requires a table backend configured at startup, else `400 TABLE_BACKEND_DISABLED`. Auto-enables `layout`. |
 | `formulas` | `0` | Run the formula branch (PP-FormulaNet-S, in-process ORT-CUDA-13) and emit `formulas`. Strict opt-in: `1` requires a formula backend configured at startup, else `400 FORMULA_BACKEND_DISABLED`. Auto-enables `layout`. |
-| `rec_mode` | env `OCR_REC_MODE` | Per-request recognizer override (`mobile` / `server`). |
 
 !!! note "Optional fields stay byte-identical when empty"
     `layout`, `reading_order`, `blocks`, `tables`, `formulas` are
@@ -183,10 +185,9 @@ point.
     img = cv2.imread("frame.png")  # BGR uint8
     h, w, c = img.shape
     r = requests.post(
-        "http://localhost:8000/ocr/pixels",
+        f"http://localhost:8000/ocr/pixels?width={w}&height={h}&channels={c}",
         data=img.tobytes(),
-        headers={"X-Width": str(w), "X-Height": str(h), "X-Channels": str(c),
-                 "Content-Type": "application/octet-stream"},
+        headers={"Content-Type": "application/octet-stream"},
     )
     ```
 
@@ -194,12 +195,9 @@ point.
 
     ```javascript
     // bgr = Uint8Array length = w*h*3
-    await fetch("http://localhost:8000/ocr/pixels", {
+    await fetch(`http://localhost:8000/ocr/pixels?width=${w}&height=${h}&channels=3`, {
       method: "POST",
-      headers: {
-        "X-Width": String(w), "X-Height": String(h), "X-Channels": "3",
-        "Content-Type": "application/octet-stream",
-      },
+      headers: { "Content-Type": "application/octet-stream" },
       body: bgr,
     });
     ```
@@ -477,6 +475,28 @@ curl http://localhost:8000/health/ready
     engine-build time as a hard failure
     (`docker/nginx.conf.template:36-47`).
 
+## `GET /capabilities`
+
+Reports what the running server actually loaded — use it to check whether
+`tables`/`formulas` will work before sending `?tables=1`/`?formulas=1` (those
+return `400 *_BACKEND_DISABLED` when the backend isn't loaded).
+
+```bash
+curl http://localhost:8000/capabilities
+```
+
+```json
+{
+  "is_gpu": true,
+  "features": { "layout": true, "tables": true, "formulas": true, "autorotate": false },
+  "routing": { "routes": { "table": "table-env", "formula": "formula-env", "text": "default" } }
+}
+```
+
+`features.{layout,tables,formulas,autorotate}` reflect the loaded stages (formula
+and table are `true` only when their backend env var was set at startup). The
+`routing` block lists backend **names + kinds only** — never URLs/keys.
+
 ## Error envelope
 
 Every error response carries the shared envelope:
@@ -486,7 +506,7 @@ Every error response carries the shared envelope:
            "message": "Image dimensions 32000x32000 exceed maximum of 16384x16384"}}
 ```
 
-Codes are documented inline in `proto/ocr.proto:12-17` and are the same
+Codes are documented inline in `proto/ocr.proto:12-18` and are the same
 strings the gRPC server surfaces in the `x-error-code` trailing metadata
 field.
 

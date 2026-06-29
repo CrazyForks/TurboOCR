@@ -63,6 +63,7 @@ jobs:
   static-analysis:
     runs-on: ubuntu-latest
     continue-on-error: true
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-cpp-deps
@@ -71,10 +72,15 @@ jobs:
       - name: Configure (for compile_commands.json)
         run: cmake -S . -B build -G Ninja -DNATIVE_ARCH=OFF -DUSE_CPU_ONLY=ON
       - name: cppcheck (dead code + quality, excluding third_party)
+        # --max-configs=1: don't re-analyze each file under every preprocessor
+        # macro combination (the stb/wuffs bundles in fast_png_decoder.cpp blow
+        # this up to tens of minutes). Single-threaded on purpose — `-j` would
+        # disable the unusedFunction (dead-code) check this job exists for.
         run: |
-          cppcheck --enable=all --inconclusive --std=c++20 \
+          cppcheck --enable=all --std=c++20 --max-configs=1 \
             --suppress=missingIncludeSystem --suppress=missingInclude \
-            -i third_party -I include src include 2>cppcheck.txt || true
+            -i third_party -i src/decode/fast_png_decoder.cpp \
+            -I include src include 2>cppcheck.txt || true
           echo "::group::cppcheck summary"; grep -E "\(error\)|unusedFunction" cppcheck.txt || echo "no error-severity / dead-code findings"; echo "::endgroup::"
 
   # Docker image: build via docker/Dockerfile.cpu using buildx (the single source

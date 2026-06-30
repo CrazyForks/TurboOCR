@@ -13,6 +13,10 @@ __pycache__/
 timing.cache
 .DS_Store
 PP-OCRv6_MIGRATION_PLAN.md
+# webui (Vite + React demo) — node deps and build output are never tracked.
+webui/node_modules/
+webui/dist/
+webui/.vite/
 # Model weights — all bundles are fetched at build time from the pinned
 # GitHub Release (scripts/fetch_release_models.sh). Native builds with
 # FETCH_MODELS=ON populate this dir on first cmake --build; nothing under

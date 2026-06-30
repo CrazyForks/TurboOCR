@@ -61,6 +61,33 @@ Full documentation: **[docs/](docs/index.md)**
 
 ---
 
+## Web GUI (Studio)
+
+A clean web UI to drop in an image or PDF, run OCR, see the layout overlay and
+reading order, select the recognised text right on the page, and download a
+searchable PDF. Server + GUI start together with one command, **from the repo
+root**:
+
+```bash
+# from the repository root (where docker-compose.demo.yml lives)
+docker compose -f docker-compose.demo.yml up --build        # GPU
+# or, CPU-only:
+docker compose -f docker-compose.demo.cpu.yml up --build
+```
+
+Then open **http://localhost:3000**. For local dev instead, run the GUI from the
+`webui/` directory against a server on `:8000`:
+
+```bash
+cd webui
+npm install
+npm run dev        # http://localhost:3000, proxies /api -> :8000
+```
+
+More in [webui/README.md](webui/README.md).
+
+---
+
 ## Quick Start
 
 **Requirements:** Linux, NVIDIA driver 595+, Turing or newer GPU (RTX 20-series / GTX 16-series+). Plan for ~4 GB VRAM text-only and ~8 GB for the full pipeline (layout + tables + formulas); each extra `PIPELINE_POOL_SIZE` replica adds roughly another full set, so lower it on smaller cards.

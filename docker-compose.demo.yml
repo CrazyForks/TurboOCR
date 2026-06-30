@@ -1,0 +1,48 @@
+# TurboOCR demo: the GPU OCR server + the web GUI, fully separated.
+#
+#   docker compose -f docker-compose.demo.yml up --build
+#
+# GUI:    http://localhost:3000
+# Server: http://localhost:8000  (also reachable directly for curl)
+#
+# The webui container's nginx proxies /api/* -> http://ocr:8000, so the browser
+# is always same-origin and the server needs no CORS. The OCR service MUST be
+# named `ocr` (webui/nginx.conf hardcodes that upstream).
+services:
+  ocr:
+    image: ghcr.io/aiptimizer/turboocr:latest
+    environment:
+      # Enable the table + formula stages (strict per-request opt-in still
+      # applies: a request only runs them with ?tables=1 / ?formulas=1).
+      TABLE_BACKEND: slanext
+      FORMULA_BACKEND: ppformulanet_s
+    ports:
+      - "8000:8000"
+    volumes:
+      - trt-cache:/home/ocr/.cache/turbo-ocr
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+  webui:
+    build: ./webui
+    ports:
+      - "3000:3000"
+    depends_on:
+      ocr:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  trt-cache:

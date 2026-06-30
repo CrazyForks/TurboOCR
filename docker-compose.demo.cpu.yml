@@ -1,0 +1,38 @@
+# TurboOCR demo, CPU-only (no GPU required) + the web GUI, fully separated.
+#
+#   docker compose -f docker-compose.demo.cpu.yml up --build
+#
+# GUI:    http://localhost:3000
+# Server: http://localhost:8000
+#
+# Same proxy story as the GPU compose; the OCR service must be named `ocr`.
+# Pin a real published CPU tag (CI pushes :<version>-cpu on each release).
+services:
+  ocr:
+    image: ghcr.io/aiptimizer/turboocr:v3.0.1-cpu
+    environment:
+      TABLE_BACKEND: slanext
+      FORMULA_BACKEND: ppformulanet_s
+    ports:
+      - "8000:8000"
+    volumes:
+      - ort-cache:/home/ocr/.cache/turbo-ocr
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  webui:
+    build: ./webui
+    ports:
+      - "3000:3000"
+    depends_on:
+      ocr:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  ort-cache:

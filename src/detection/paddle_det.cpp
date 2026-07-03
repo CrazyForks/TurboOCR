@@ -8,8 +8,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <iostream>
 #include <ranges>
-#include <unordered_map>
 
 #include <opencv2/imgproc.hpp>
 
@@ -33,8 +33,6 @@ bool PaddleDet::init_buffers(const DetResizeParams& resize, const DbParams& db) 
   kMaxSideLen_ = effective_det_max_side(resize_);
 
   size_t max_pixels = static_cast<size_t>(kMaxSideLen_) * kMaxSideLen_;
-  input_size_ = max_pixels * 3 * sizeof(float);
-  output_size_ = max_pixels * sizeof(float);
 
   d_input_ = CudaPtr<float>(max_pixels * 3);
   d_output_ = CudaPtr<float>(max_pixels);
@@ -43,8 +41,6 @@ bool PaddleDet::init_buffers(const DetResizeParams& resize, const DbParams& db) 
   d_bitmap_buf_ = CudaPtr<uint8_t>(max_pixels);
 
   // Pre-allocate batch buffers (kMaxBatchSize x max_pixels)
-  batch_input_size_ = static_cast<size_t>(kMaxBatchSize) * max_pixels * 3 * sizeof(float);
-  batch_output_size_ = static_cast<size_t>(kMaxBatchSize) * max_pixels * sizeof(float);
   d_batch_input_ = CudaPtr<float>(static_cast<size_t>(kMaxBatchSize) * max_pixels * 3);
   d_batch_output_ = CudaPtr<float>(static_cast<size_t>(kMaxBatchSize) * max_pixels);
   d_batch_bitmap_ = CudaPtr<uint8_t>(static_cast<size_t>(kMaxBatchSize) * max_pixels);
@@ -60,10 +56,6 @@ bool PaddleDet::init_buffers(const DetResizeParams& resize, const DbParams& db) 
   h_batch_src_heights_ = CudaHostPtr<int>(kMaxBatchSize);
   h_batch_src_widths_ = CudaHostPtr<int>(kMaxBatchSize);
 
-  // Set working pointers to the single-image buffers
-  cur_output_ = d_output_.get();
-  cur_bitmap_ = d_bitmap_buf_.get();
-
   // Bind I/O pointers once for single-image path (never change)
   engine_->bind_io(d_input_.get(), d_output_.get());
 
@@ -77,13 +69,34 @@ bool PaddleDet::init_buffers(const DetResizeParams& resize, const DbParams& db) 
 
   // GPU CCL mode: 0=CPU contours, 1=GPU CCL+per-ROI findContours (default),
   // 2=all-GPU JFA per-component Euclidean unclip
-  if (const char *env = std::getenv("GPU_CCL"))
-    gpu_ccl_mode_ = std::atoi(env);
-  // box_thresh_ + unclip_scale_ apply to all three modes (0/1/2).
-  if (const char *env = std::getenv("GPU_BOX_THRESH"))
-    box_thresh_ = (float)std::atof(env);
-  if (const char *env = std::getenv("GPU_UNCLIP_SCALE"))
-    unclip_scale_ = (float)std::atof(env);
+  //
+  // Empty/garbage env values keep the default instead of atoi/atof-ing to 0,
+  // and parsed values are CLAMPED to sane ranges (a 0/negative box_thresh
+  // floods spurious boxes; a 0 unclip_scale collapses every polygon; inf
+  // disables detection entirely — same silent-failure class as GitHub #23).
+  // The server also strict-validates these at boot with the same ranges; this
+  // lenient layer covers CLI/tools.
+  auto env_val = [](const char *name, auto cur, auto parse) {
+    const char *env = std::getenv(name);
+    if (!env || !*env) return cur;
+    char *end = nullptr;
+    auto v = parse(env, &end);
+    if (end == env || *end != '\0' || std::isnan(static_cast<double>(v))) {
+      std::cerr << "[PaddleDet] ignoring malformed " << name << "=\"" << env << "\"\n";
+      return cur;
+    }
+    return static_cast<decltype(cur)>(v);
+  };
+  gpu_ccl_mode_ = std::clamp(
+      env_val("GPU_CCL", gpu_ccl_mode_,
+              [](const char *s, char **e) { return std::strtol(s, e, 10); }),
+      0, 2);
+  // box_thresh_ + unclip_scale_ apply to all three modes (0/1/2). Ranges match
+  // the server-boot validation in server_config.h::from_env.
+  box_thresh_ = std::clamp(env_val("GPU_BOX_THRESH", box_thresh_, std::strtof),
+                           0.001f, 1.0f);
+  unclip_scale_ = std::clamp(env_val("GPU_UNCLIP_SCALE", unclip_scale_, std::strtof),
+                             0.1f, 10.0f);
 
   if (gpu_ccl_mode_ > 0) {
     // Pre-allocate ALL GPU CCL buffers (no per-request alloc)
@@ -106,6 +119,9 @@ bool PaddleDet::init_buffers(const DetResizeParams& resize, const DbParams& db) 
     d_jfa_seeds_ = CudaPtr<uint32_t>(max_pixels);
     d_jfa_seeds_alt_ = CudaPtr<uint32_t>(max_pixels);
     d_expand_per_comp_ = CudaPtr<float>(turbo_ocr::kernels::kMaxGpuComponents);
+    d_perim_per_comp_ = CudaPtr<int>(turbo_ocr::kernels::kMaxGpuComponents);
+    d_ccl_moments_ = CudaPtr<unsigned long long>(turbo_ocr::kernels::kMaxGpuComponents * 6);
+    d_ccl_orient_ = CudaPtr<float>(turbo_ocr::kernels::kMaxGpuComponents * 6);
     h_exp_boxes_ = CudaHostPtr<turbo_ocr::kernels::GpuDetBox>(
         turbo_ocr::kernels::kMaxGpuComponents);
   }
@@ -116,7 +132,8 @@ bool PaddleDet::init_buffers(const DetResizeParams& resize, const DbParams& db) 
 // GPU CCL path: connected component labeling on GPU, then extract real contours
 // from bitmap within each component's bbox for accurate unclip polygons.
 std::vector<Box>
-PaddleDet::run_gpu_ccl(int resize_h, int resize_w,
+PaddleDet::run_gpu_ccl(const float *d_pred, const uint8_t *d_bitmap,
+                        int resize_h, int resize_w,
                         int orig_h, int orig_w,
                         cudaStream_t stream) {
   float ratio_h = static_cast<float>(resize_h) / orig_h;
@@ -124,7 +141,7 @@ PaddleDet::run_gpu_ccl(int resize_h, int resize_w,
 
   int h_num_boxes = 0;
   turbo_ocr::kernels::cuda_gpu_ccl_detect(
-      cur_bitmap_, cur_output_, resize_w, resize_h,
+      d_bitmap, d_pred, resize_w, resize_h,
       box_thresh_,
       d_ccl_labels_.get(), d_ccl_compact_ids_.get(), d_ccl_id_counter_.get(),
       d_ccl_bboxes_.get(), d_ccl_num_boxes_.get(),
@@ -142,7 +159,7 @@ PaddleDet::run_gpu_ccl(int resize_h, int resize_w,
     h_bitmap_pixels_ = bitmap_pixels;
   }
   cv::Mat bitmap(resize_h, resize_w, CV_8UC1, h_bitmap_.get());
-  CUDA_CHECK(cudaMemcpyAsync(bitmap.data, cur_bitmap_, resize_w * resize_h,
+  CUDA_CHECK(cudaMemcpyAsync(bitmap.data, d_bitmap, resize_w * resize_h,
                               cudaMemcpyDeviceToHost, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
   // No pred_map download -- use gb.score from GPU CCL instead of box_score_fast
@@ -240,7 +257,8 @@ PaddleDet::run_gpu_ccl(int resize_h, int resize_w,
 // 4. GPU bbox extraction: one block per component scans expanded labels
 // 5. Copy expanded bboxes → scale → filter → output
 std::vector<Box>
-PaddleDet::run_gpu_ccl_fast(int resize_h, int resize_w,
+PaddleDet::run_gpu_ccl_fast(const float *d_pred, const uint8_t *d_bitmap,
+                              int resize_h, int resize_w,
                               int orig_h, int orig_w,
                               cudaStream_t stream) {
   float ratio_h = static_cast<float>(resize_h) / orig_h;
@@ -250,7 +268,7 @@ PaddleDet::run_gpu_ccl_fast(int resize_h, int resize_w,
   int h_num_boxes = 0;
   int h_num_total = 0;
   turbo_ocr::kernels::cuda_gpu_ccl_detect(
-      cur_bitmap_, cur_output_, resize_w, resize_h,
+      d_bitmap, d_pred, resize_w, resize_h,
       box_thresh_,
       d_ccl_labels_.get(), d_ccl_compact_ids_.get(), d_ccl_id_counter_.get(),
       d_ccl_bboxes_.get(), d_ccl_num_boxes_.get(),
@@ -261,32 +279,48 @@ PaddleDet::run_gpu_ccl_fast(int resize_h, int resize_w,
 
   // Process all PRE-filter compact_ids — that's what compact_ids[] stores.
   // Score+size filter is applied inside compute_expand_per_comp_kernel.
+  // LOAD-BEARING BOUND: every id stored in compact_ids[] is < kMaxGpuComponents
+  // or -1 — ccl_buf_compact_assign_kernel (kernels.cu) writes -1 for roots past
+  // the cap, so the [compact_id]-indexed buffers below (perim/expand/exp_bboxes,
+  // all sized kMaxGpuComponents) can never be written out of bounds even when
+  // h_num_total exceeds the cap. num_slots clamps only the COUNT.
   using turbo_ocr::kernels::GpuDetBox;
   using turbo_ocr::kernels::kMaxGpuComponents;
   int num_slots = std::min(h_num_total, (int)kMaxGpuComponents);
   if (num_slots == 0) return boxes;
 
-  // Step 2: Per-component expand distance from CCL bboxes (Clipper-equivalent
-  // area*ratio/perim). Indexed by PRE-filter compact_id. kMaxExpand is the
-  // global cutoff; it also bounds the JFA jump range below — keep them equal.
+  // Step 2a: Per-component contour (crack) perimeter — the true divisor for the
+  // area*ratio/perimeter unclip, matching cv2.arcLength. Must precede the expand
+  // computation below. Fully device-resident.
+  turbo_ocr::kernels::cuda_accumulate_crack_perimeter(
+      d_ccl_compact_ids_.get(), d_bitmap, resize_w, resize_h, num_slots,
+      d_perim_per_comp_.get(), stream);
+
+  // Step 2b: Per-component expand distance = area*ratio/perimeter, indexed by
+  // PRE-filter compact_id. kMaxExpand is the global cutoff; it also bounds the
+  // JFA jump range below — keep them equal.
   constexpr float kMaxExpand = 24.0f;
   turbo_ocr::kernels::cuda_compute_expand_per_comp(
-      d_ccl_bboxes_.get(), num_slots, unclip_ratio_ * unclip_scale_, /*min*/ 2.0f, kMaxExpand,
+      d_ccl_bboxes_.get(), d_perim_per_comp_.get(), num_slots,
+      unclip_ratio_ * unclip_scale_, /*min*/ 2.0f, kMaxExpand,
       box_thresh_, d_expand_per_comp_.get(), stream);
 
   // Step 3: JFA + per-component label expansion (variable cutoff per component).
   // Pass kMaxExpand so JFA bounds its jump range to it (no pixel beyond it survives).
   turbo_ocr::kernels::cuda_jfa_expand_labels(
-      cur_bitmap_, d_ccl_compact_ids_.get(), d_expand_per_comp_.get(),
+      d_bitmap, d_ccl_compact_ids_.get(), d_expand_per_comp_.get(),
       d_jfa_labels_.get(), resize_w, resize_h, kMaxExpand,
       d_jfa_seeds_.get(), d_jfa_seeds_alt_.get(), stream);
 
-  // Step 4: GPU bbox extraction over expanded region. Launcher inits sentinels
-  // for atomic scatter, so no pre-memset needed.
+  // Step 4: GPU extraction over expanded region — axis-aligned bbox (for the
+  // score/size filters) AND the PCA-oriented min-area-rect corners, matching
+  // the CPU minAreaRect geometry so skewed lines get a tight rotated quad.
+  // Launcher inits sentinels for atomic scatter, so no pre-memset needed.
   GpuDetBox *exp_bboxes = d_ccl_bboxes_.get() + kMaxGpuComponents;
-  turbo_ocr::kernels::cuda_jfa_extract_bboxes(
+  turbo_ocr::kernels::cuda_jfa_extract_oriented(
       d_jfa_labels_.get(), resize_w, resize_h,
-      exp_bboxes, num_slots, stream);
+      exp_bboxes, num_slots,
+      d_ccl_moments_.get(), d_ccl_orient_.get(), stream);
 
   // Step 5: Copy expanded bboxes to host via the pre-allocated pinned buffer.
   CUDA_CHECK(cudaMemcpyAsync(h_exp_boxes_.get(), exp_bboxes,
@@ -301,16 +335,26 @@ PaddleDet::run_gpu_ccl_fast(int resize_h, int resize_w,
     int bw = eb.xmax - eb.xmin + 1, bh = eb.ymax - eb.ymin + 1;
     if (bw < kMinUnclippedSide || bh < kMinUnclippedSide) continue;
 
+    // Order the GPU oriented-rect corners as [tl, tr, br, bl] via the SAME
+    // shared helper get_mini_boxes uses (mode 0/1) — one convention, no drift.
+    float px[4], py[4];
+    for (int k = 0; k < 4; ++k) { px[k] = eb.ox[k]; py[k] = eb.oy[k]; }
+    order_quad_tl_tr_br_bl(px, py);
+
     Box box;
-    box[0] = {std::clamp(static_cast<int>(std::round(eb.xmin / ratio_w)), 0, orig_w - 1),
-              std::clamp(static_cast<int>(std::round(eb.ymin / ratio_h)), 0, orig_h - 1)};
-    box[1] = {std::clamp(static_cast<int>(std::round(eb.xmax / ratio_w)), 0, orig_w - 1),
-              std::clamp(static_cast<int>(std::round(eb.ymin / ratio_h)), 0, orig_h - 1)};
-    box[2] = {std::clamp(static_cast<int>(std::round(eb.xmax / ratio_w)), 0, orig_w - 1),
-              std::clamp(static_cast<int>(std::round(eb.ymax / ratio_h)), 0, orig_h - 1)};
-    box[3] = {std::clamp(static_cast<int>(std::round(eb.xmin / ratio_w)), 0, orig_w - 1),
-              std::clamp(static_cast<int>(std::round(eb.ymax / ratio_h)), 0, orig_h - 1)};
-    if (std::abs(box[1][0]-box[0][0]) <= 3 || std::abs(box[3][1]-box[0][1]) <= 3) continue;
+    for (int k = 0; k < 4; ++k) {
+      box[k] = {std::clamp(static_cast<int>(std::round(px[k] / ratio_w)), 0, orig_w - 1),
+                std::clamp(static_cast<int>(std::round(py[k] / ratio_h)), 0, orig_h - 1)};
+    }
+
+    // Tiny-box reject on the oriented edge lengths (mirrors mode 1).
+    int rw = static_cast<int>(std::sqrt(
+        double((box[0][0]-box[1][0])*(box[0][0]-box[1][0]) +
+               (box[0][1]-box[1][1])*(box[0][1]-box[1][1]))));
+    int rh = static_cast<int>(std::sqrt(
+        double((box[0][0]-box[3][0])*(box[0][0]-box[3][0]) +
+               (box[0][1]-box[3][1])*(box[0][1]-box[3][1]))));
+    if (rw <= 3 || rh <= 3) continue;
     boxes.push_back(box);
   }
   return boxes;
@@ -318,17 +362,20 @@ PaddleDet::run_gpu_ccl_fast(int resize_h, int resize_w,
 
 // CPU fallback path (original findContours)
 std::vector<Box>
-PaddleDet::run_cpu_contours(int resize_h, int resize_w,
+PaddleDet::run_cpu_contours(const float *d_pred, const uint8_t *d_bitmap,
+                             int resize_h, int resize_w,
                              int orig_h, int orig_w,
                              cudaStream_t stream) {
-  // Download raw probability map for score filtering
+  // Download raw probability map for score filtering. Both D2H copies are queued
+  // async and covered by a single stream sync — the minimal, and required, sync
+  // for the host-side findContours below.
   cv::Mat pred_map(resize_h, resize_w, CV_32F);
-  CUDA_CHECK(cudaMemcpyAsync(pred_map.data, cur_output_,
+  CUDA_CHECK(cudaMemcpyAsync(pred_map.data, d_pred,
                               resize_h * resize_w * sizeof(float),
                               cudaMemcpyDeviceToHost, stream));
 
   cv::Mat bitmap(resize_h, resize_w, CV_8UC1);
-  CUDA_CHECK(cudaMemcpyAsync(bitmap.data, cur_bitmap_, resize_w * resize_h,
+  CUDA_CHECK(cudaMemcpyAsync(bitmap.data, d_bitmap, resize_w * resize_h,
                               cudaMemcpyDeviceToHost, stream));
 
   CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -344,9 +391,8 @@ PaddleDet::run(const GpuImage &gpu_img, int orig_h, int orig_w,
                cudaStream_t stream) {
   auto [resize_h, resize_w] = compute_det_resize(orig_h, orig_w, resize_);
 
-  // Reset working pointers to single-image buffers (in case batch mode changed them)
-  cur_output_ = d_output_.get();
-  cur_bitmap_ = d_bitmap_buf_.get();
+  float *d_pred = d_output_.get();
+  uint8_t *d_bitmap = d_bitmap_buf_.get();
 
   // 1+2. Fused resize + normalize + CHW (single kernel, no intermediate buffer)
   turbo_ocr::kernels::cuda_fused_resize_normalize_det(gpu_img, d_input_.get(), resize_w,
@@ -359,16 +405,16 @@ PaddleDet::run(const GpuImage &gpu_img, int orig_h, int orig_w,
   }
 
   // 4. Threshold on GPU for bitmap
-  turbo_ocr::kernels::cuda_threshold_to_u8(cur_output_, cur_bitmap_, resize_w, resize_h, db_thresh_,
+  turbo_ocr::kernels::cuda_threshold_to_u8(d_pred, d_bitmap, resize_w, resize_h, db_thresh_,
                                            stream);
 
   // 5. Choose contour extraction path
   if (gpu_ccl_mode_ == 2) {
-    return run_gpu_ccl_fast(resize_h, resize_w, orig_h, orig_w, stream);
+    return run_gpu_ccl_fast(d_pred, d_bitmap, resize_h, resize_w, orig_h, orig_w, stream);
   } else if (gpu_ccl_mode_ == 1) {
-    return run_gpu_ccl(resize_h, resize_w, orig_h, orig_w, stream);
+    return run_gpu_ccl(d_pred, d_bitmap, resize_h, resize_w, orig_h, orig_w, stream);
   } else {
-    return run_cpu_contours(resize_h, resize_w, orig_h, orig_w, stream);
+    return run_cpu_contours(d_pred, d_bitmap, resize_h, resize_w, orig_h, orig_w, stream);
   }
 }
 
@@ -422,19 +468,13 @@ PaddleDet::run_batch(const std::vector<GpuImage> &gpu_imgs,
   const int pixels_per_image = resize_h * resize_w;
 
   // --- 1. Upload per-image metadata to device ---
-  // Use pre-allocated pinned buffers for truly async transfers.
+  // Use pre-allocated pinned buffers for truly async transfers. batch_size ==
+  // min(n, kMaxBatchSize) <= n and gpu_imgs.size() == n, so i is always in range.
   for (int i = 0; i < batch_size; i++) {
-    // batch_size == min(n, kMaxBatchSize) <= n, so i is always in [0, n);
-    // gpu_imgs has size n == orig_dims.size() (caller builds both in lockstep).
-    int src = (i < n) ? i : 0;
-    // cppcheck-suppress negativeContainerIndex // src in [0,n), see above
-    h_batch_src_ptrs_.get()[i]    = gpu_imgs[src].data;
-    // cppcheck-suppress negativeContainerIndex // src in [0,n), see above
-    h_batch_src_steps_.get()[i]   = static_cast<int>(gpu_imgs[src].step);
-    // cppcheck-suppress negativeContainerIndex // src in [0,n), see above
-    h_batch_src_heights_.get()[i] = gpu_imgs[src].rows;
-    // cppcheck-suppress negativeContainerIndex // src in [0,n), see above
-    h_batch_src_widths_.get()[i]  = gpu_imgs[src].cols;
+    h_batch_src_ptrs_.get()[i]    = gpu_imgs[i].data;
+    h_batch_src_steps_.get()[i]   = static_cast<int>(gpu_imgs[i].step);
+    h_batch_src_heights_.get()[i] = gpu_imgs[i].rows;
+    h_batch_src_widths_.get()[i]  = gpu_imgs[i].cols;
   }
 
   CUDA_CHECK(cudaMemcpyAsync(d_batch_src_ptrs_.get(), h_batch_src_ptrs_.get(),
@@ -476,9 +516,8 @@ PaddleDet::run_batch(const std::vector<GpuImage> &gpu_imgs,
                                                  stream);
 
   // --- 5. Per-image post-processing (GPU CCL fast / CPU contours) ---
-  // For each image slice in the batch output, run the appropriate path.
-  // We temporarily alias cur_output_ / cur_bitmap_ to point at each image's
-  // slice. Scope guard ensures they are restored even if an exception is thrown.
+  // Each image's probability map + bitmap slice is passed to the post-process
+  // helper explicitly — no shared mutable member state to save/restore.
   const int real_n = batch_size;
   std::vector<std::vector<Box>> all_boxes(real_n);
 
@@ -486,24 +525,16 @@ PaddleDet::run_batch(const std::vector<GpuImage> &gpu_imgs,
     const int orig_h = infos[i].orig_h;
     const int orig_w = infos[i].orig_w;
 
-    // Alias working pointers to this image's slice.
-    auto saved_out = cur_output_;
-    auto saved_bmp = cur_bitmap_;
-    auto restore = [&, saved_out, saved_bmp]() {
-      cur_output_ = saved_out;
-      cur_bitmap_ = saved_bmp;
-    };
-    struct ScopeGuard { decltype(restore) fn; ~ScopeGuard() noexcept { fn(); } } guard{restore};
-
-    cur_output_ = d_batch_output_.get() + static_cast<size_t>(i) * pixels_per_image;
-    cur_bitmap_ = d_batch_bitmap_.get() + static_cast<size_t>(i) * pixels_per_image;
+    const size_t off = static_cast<size_t>(i) * pixels_per_image;
+    const float *d_pred = d_batch_output_.get() + off;
+    const uint8_t *d_bitmap = d_batch_bitmap_.get() + off;
 
     if (gpu_ccl_mode_ == 2) {
-      all_boxes[i] = run_gpu_ccl_fast(resize_h, resize_w, orig_h, orig_w, stream);
+      all_boxes[i] = run_gpu_ccl_fast(d_pred, d_bitmap, resize_h, resize_w, orig_h, orig_w, stream);
     } else if (gpu_ccl_mode_ == 1) {
-      all_boxes[i] = run_gpu_ccl(resize_h, resize_w, orig_h, orig_w, stream);
+      all_boxes[i] = run_gpu_ccl(d_pred, d_bitmap, resize_h, resize_w, orig_h, orig_w, stream);
     } else {
-      all_boxes[i] = run_cpu_contours(resize_h, resize_w, orig_h, orig_w, stream);
+      all_boxes[i] = run_cpu_contours(d_pred, d_bitmap, resize_h, resize_w, orig_h, orig_w, stream);
     }
   }
 

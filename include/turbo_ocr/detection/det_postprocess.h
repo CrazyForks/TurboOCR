@@ -20,6 +20,13 @@ namespace turbo_ocr::detection {
 [[nodiscard]] std::vector<cv::Point> unclip(const std::vector<cv::Point> &polygon,
                                              float unclip_ratio);
 
+// Order 4 quad corners in place as [tl, tr, br, bl] — PaddleOCR's convention:
+// stable sort by x (ties keep original order, mirroring Python sorted()), the
+// left pair splits {tl,bl} by y, the right pair {tr,br} by y. SINGLE source of
+// truth shared by get_mini_boxes and the GPU oriented-rect path (paddle_det
+// mode 2) so the two orderings can never drift apart.
+void order_quad_tl_tr_br_bl(float xs[4], float ys[4]) noexcept;
+
 // Extract ordered [tl, tr, br, bl] from min-area rotated rect.
 [[nodiscard]] Box get_mini_boxes(const std::vector<cv::Point> &contour, float &min_side);
 

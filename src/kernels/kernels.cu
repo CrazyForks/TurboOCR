@@ -237,9 +237,12 @@ void cuda_batch_fused_resize_normalize_det(
 }
 
 // --- Fused Batched ROI Warp + Normalize ---
-// block(32,8) for better memory coalescing: 32 threads along x maps to
-// contiguous dst memory, and src row access via pitched pointer benefits
-// from full-warp coalesced reads.
+// block(32,8): 32 threads along x map to contiguous dst memory, so the CHW
+// plane WRITES are fully coalesced. The source READS are not — the perspective
+// map plus the 3-byte pixel stride makes them gathers by nature; they are
+// served through __ldg / the read-only cache, whose 2D spatial locality (the
+// warp's samples cluster in a small source region) is what actually absorbs
+// the scatter, not coalescing.
 
 __global__ __launch_bounds__(256)
 void batch_roi_warp_kernel(
@@ -247,7 +250,10 @@ void batch_roi_warp_kernel(
     const float * __restrict__ M_invs,    // [batch_size * 9] inverse perspective matrices
     const int * __restrict__ crop_widths, // [batch_size] per-crop actual width
     float * __restrict__ dst_batch,       // [batch_size, 3, dst_h, dst_w]
-    int dst_h, int dst_w) {
+    int dst_h, int dst_w,
+    float mean0, float mean1, float mean2,       // per-channel (RGB) mean
+    float inv_std0, float inv_std1, float inv_std2, // per-channel 1/std
+    float inv_scale) {                            // pixel scale (1/255)
   // Load M_invs and crop_width into shared memory (read once, used by all 256 threads)
   __shared__ float s_M[9];
   __shared__ int s_crop_w;
@@ -338,17 +344,21 @@ void batch_roi_warp_kernel(
   res.y = w00 * p00.y + w10 * p10.y + w01 * p01.y + w11 * p11.y;
   res.z = w00 * p00.z + w10 * p10.z + w01 * p01.z + w11 * p11.z;
 
-  // Normalize: (pixel/255 - 0.5) / 0.5  =>  pixel/127.5 - 1.0
-  float inv_127_5 = 1.0f / 127.5f;
-  dst_batch[batch_offset + 0 * plane_size + pixel_idx] = res.x * inv_127_5 - 1.0f;
-  dst_batch[batch_offset + 1 * plane_size + pixel_idx] = res.y * inv_127_5 - 1.0f;
-  dst_batch[batch_offset + 2 * plane_size + pixel_idx] = res.z * inv_127_5 - 1.0f;
+  // Per-channel normalize: (pixel*inv_scale - mean) * inv_std. res is RGB.
+  // Rec passes mean=0.5,inv_std=2,inv_scale=1/255 (== the old pixel/127.5-1);
+  // cls passes ImageNet mean/std so PP-LCNet textline-ori gets in-distribution input.
+  dst_batch[batch_offset + 0 * plane_size + pixel_idx] = (res.x * inv_scale - mean0) * inv_std0;
+  dst_batch[batch_offset + 1 * plane_size + pixel_idx] = (res.y * inv_scale - mean1) * inv_std1;
+  dst_batch[batch_offset + 2 * plane_size + pixel_idx] = (res.z * inv_scale - mean2) * inv_std2;
 }
 
 void cuda_batch_roi_warp(const GpuImage &src, const float *d_M_invs,
                          const int *d_crop_widths, float *d_dst_batch,
                          int batch_size, int dst_h, int dst_w,
-                         cudaStream_t stream) {
+                         cudaStream_t stream,
+                         float mean0, float mean1, float mean2,
+                         float inv_std0, float inv_std1, float inv_std2,
+                         float inv_scale) {
   if (batch_size == 0)
     return;
 
@@ -360,7 +370,8 @@ void cuda_batch_roi_warp(const GpuImage &src, const float *d_M_invs,
 
   batch_roi_warp_kernel<<<grid, block, 0, stream>>>(
       (const uchar3 *)src.data, src.rows, src.cols, (int)src.step, d_M_invs,
-      d_crop_widths, d_dst_batch, dst_h, dst_w);
+      d_crop_widths, d_dst_batch, dst_h, dst_w,
+      mean0, mean1, mean2, inv_std0, inv_std1, inv_std2, inv_scale);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -496,221 +507,228 @@ void cuda_batch_threshold_to_u8(const float *src, uint8_t *dst, int w, int h,
 // GPU Connected Component Labeling (CCL) for text detection
 // ==========================================================================
 //
-// Tile-based CCL algorithm (optimized for OCR text detection):
-// 1. Tile-local merge: 32x32 tiles do union-find in shared memory (fast)
-// 2. Global boundary merge: merge labels across tile boundaries (x2)
-// 3. Flatten: path compression
-// 4. Compact: assign dense IDs, propagate to all pixels
-// 5. Fused extract+score: accumulate bbox + pred_map sum in one pass
-// 6. Filter: score threshold, output valid boxes
+// Block-based Union-Find (BUF) — the Allegretti-Bolelli-Grana GPU-CCL state of
+// the art, an evolution of the Komura-Aharoni equivalence and Playne-Russell
+// union-find lineage. The image is tiled into independent 2x2 blocks: under
+// 8-connectivity every foreground pixel inside a 2x2 block is mutually adjacent,
+// so the whole block collapses to a single node in the union-find forest. That
+// quarters the node count and the atomic/union traffic versus per-pixel CCL.
 //
-// HEURISTIC TRADE-OFFS (documented for correctness awareness):
-// - Tile-local union-find runs 4 iterations (not until convergence).
-//   Sufficient for rectangular text regions. Complex spiral shapes
-//   may remain fractured — acceptable for OCR where text is linear.
-// - Boundary merge runs exactly 2 passes. Components crossing 3+
-//   tile boundaries in a zigzag pattern may not fully merge.
-//   For typical document text (horizontal/vertical lines), 2 passes
-//   resolves all merges.
+// Labeling is ONE lock-free hooking pass (no iterate-to-convergence, no
+// whole-grid barrier loop) followed by ONE path-compression pass — the property
+// that makes union-find CCL near-optimal against older iterated label-
+// equivalence propagation. Each block examines only its 4 backward neighbours
+// {NW, N, NE, W}; the forward duals are covered when those blocks run, so every
+// block adjacency is unioned exactly once with no redundant passes.
+//
+// Pipeline:
+//   1. init:     one node per 2x2 block, self-labelled if it holds any fg pixel
+//   2. merge:    hook adjacent fg blocks via atomic union-find (single pass)
+//   3. compress: path-compress each block node to its component root
+//   4. compact:  dense component ids over root blocks (cooperative barrier),
+//                then scatter to the per-pixel compact_ids map (fg only)
+//   5. extract:  fused bbox + pred_map score accumulation
+//   6. filter:   score/size threshold -> output boxes
+//
+// A block node is addressed by its top-left pixel's raster index, so find/union
+// run on the shared int[w*h] label buffer exactly as a per-pixel forest would.
+// The resulting component partition is identical to what a correct per-pixel
+// 8-connected labeller produces — only the compact-id ordering differs, and no
+// downstream consumer depends on that ordering (bbox = min/max, score = sum).
 //
 // MEMORY SAFETY:
 // - ALL buffers pre-allocated by caller (no cudaMallocAsync)
+// - d_labels / d_compact_ids are int[w*h] scratch; only fg pixels of
+//   compact_ids end up >= 0 (bg = -1), as the JFA expand path requires
 // - d_bboxes must be allocated for kMaxGpuComponents * 2 GpuDetBox
 //   (first half for extraction, second half for filtered output)
 // - float4 loads in threshold kernel require 16-byte alignment
 //   (guaranteed by cudaMalloc which returns 256-byte aligned ptrs)
-// - Only ONE cudaStreamSynchronize at the very end
-// - No mid-pipeline host reads
+// - Only ONE cudaStreamSynchronize at the very end; no mid-pipeline host reads
 // ==========================================================================
 
 // --- Device helpers ---
 
-__device__ int ccl_find_root(const int *labels, int idx) {
+__device__ __forceinline__ int ccl_find_root(const int *labels, int idx) {
   while (labels[idx] != idx)
     idx = labels[idx];
   return idx;
 }
 
-__device__ void ccl_union(int *labels, int a, int b) {
-  a = ccl_find_root(labels, a);
-  b = ccl_find_root(labels, b);
+// Find with path-halving (ECL-CC's in-find compression): every hop rewrites
+// idx's parent to its grandparent, so concurrent and subsequent traversals of
+// the same chain get exponentially shorter. Lock-free safe: the store only
+// ever replaces a parent with one of idx's current ANCESTORS (gp was reached
+// by following parent pointers, and union-find only merges, never splits), so
+// root-reachability is preserved under any interleaving; racing halvers may
+// store different ancestors, all of them valid. Roots are never written here
+// (p == idx returns first), so this cannot race the hooking CAS in ccl_union,
+// which only targets labels[b] while labels[b] == b.
+__device__ __forceinline__ int ccl_find_root_halve(int *labels, int idx) {
+  while (true) {
+    int p = labels[idx];
+    if (p == idx) return idx;
+    int gp = labels[p];
+    if (p == gp) return p;
+    labels[idx] = gp;  // path-halving
+    idx = gp;
+  }
+}
+
+// Lock-free union: hook the higher-index root onto the lower one, retrying the
+// find on a CAS race. Standard concurrent union-find (Komura / ECL-CC style).
+// Single-pass correctness: this call only returns after its two endpoints
+// share a root — the loop exits either via a successful hook (CAS observed
+// labels[b] == b and linked it) or via a == b (already connected), and a
+// failed CAS retries with the freshly hooked target (b = find(old)). Since
+// union-find connectivity is monotone (merges are never undone), one pass over
+// every edge yields the transitive closure. This invariant is enforced
+// empirically by the pathological-shape partition test in
+// tests/cpp/test_gpu_safety.cpp (spirals, staircases, dense fuzz vs OpenCV).
+__device__ __forceinline__ void ccl_union(int *labels, int a, int b) {
+  a = ccl_find_root_halve(labels, a);
+  b = ccl_find_root_halve(labels, b);
   while (a != b) {
     if (a > b) { int t = a; a = b; b = t; }
     int old = atomicCAS(&labels[b], b, a);
     if (old == b) break;
-    a = ccl_find_root(labels, a);
-    b = ccl_find_root(labels, old);
+    a = ccl_find_root_halve(labels, a);
+    b = ccl_find_root_halve(labels, old);
   }
 }
 
-// --- Tile-based CCL kernels ---
-
-static constexpr int kTileW = 32;
-static constexpr int kTileH = 32;
-
-// Step 1: Tile-local CCL in shared memory (32x32 tiles, 1024 threads/block)
-__global__ __launch_bounds__(1024)
-void ccl_tile_local_kernel(const uint8_t * __restrict__ bitmap,
-                           int * __restrict__ labels,
-                           int w, int h) {
-  int tile_x0 = blockIdx.x * kTileW;
-  int tile_y0 = blockIdx.y * kTileH;
-  int lx = threadIdx.x;
-  int ly = threadIdx.y;
-  int gx = tile_x0 + lx;
-  int gy = tile_y0 + ly;
-
-  __shared__ int s_labels[kTileW * kTileH];
-  int lid = ly * kTileW + lx;
-
-  bool is_fg = (gx < w && gy < h) ? (bitmap[gy * w + gx] != 0) : false;
-  s_labels[lid] = is_fg ? lid : -1;
-  __syncthreads();
-
-  // Local union-find iterations in shared memory
-  for (int iter = 0; iter < 4; iter++) {
-    if (is_fg) {
-      int r = lid;
-      while (s_labels[r] >= 0 && s_labels[r] != r) r = s_labels[r];
-
-      // 8-connectivity: union with R, B, BR, BL forward neighbors
-      // (matches OpenCV findContours which uses 8-conn — without this, italic
-      // strokes and diagonal text fragments split into separate components)
-      auto try_union = [&](int nid) {
-        if (s_labels[nid] >= 0) {
-          int nr = nid;
-          while (s_labels[nr] >= 0 && s_labels[nr] != nr) nr = s_labels[nr];
-          if (r != nr) {
-            int mn = min(r, nr), mx = max(r, nr);
-            atomicMin(&s_labels[mx], mn);
-          }
-        }
-      };
-      if (lx + 1 < kTileW) try_union(ly * kTileW + (lx + 1));
-      if (ly + 1 < kTileH) try_union((ly + 1) * kTileW + lx);
-      if (lx + 1 < kTileW && ly + 1 < kTileH)
-        try_union((ly + 1) * kTileW + (lx + 1));
-      if (lx - 1 >= 0 && ly + 1 < kTileH)
-        try_union((ly + 1) * kTileW + (lx - 1));
-    }
-    __syncthreads();
-  }
-
-  // Flatten local labels
-  if (is_fg) {
-    int r = lid;
-    while (s_labels[r] >= 0 && s_labels[r] != r) r = s_labels[r];
-    int cur = lid;
-    while (s_labels[cur] != r) {
-      int next = s_labels[cur];
-      s_labels[cur] = r;
-      cur = next;
-    }
-  }
-  __syncthreads();
-
-  // Write back to global memory
-  if (gx < w && gy < h) {
-    int gidx = gy * w + gx;
-    if (!is_fg) {
-      labels[gidx] = -1;
-    } else {
-      int local_root = s_labels[lid];
-      int root_lx = local_root % kTileW;
-      int root_ly = local_root / kTileW;
-      int root_gidx = (tile_y0 + root_ly) * w + (tile_x0 + root_lx);
-      labels[gidx] = root_gidx;
-      if (lid == local_root)
-        labels[gidx] = gidx;
-    }
-  }
+__device__ __forceinline__ bool ccl_fg(const uint8_t *bitmap, int w,
+                                        int x, int y) {
+  return bitmap[y * w + x] != 0;
 }
 
-// Step 2: Merge across tile boundaries
+// --- Block-based Union-Find (BUF) kernels ---
+// A 2x2 block at grid coord (bx, by) is addressed by the raster index of its
+// top-left pixel: (2*by)*w + 2*bx. That top-left pixel is always in bounds
+// because nbx = ceil(w/2), nby = ceil(h/2).
+
+// Step 1: init one union-find node per 2x2 block (self if any fg pixel, else bg)
 __global__ __launch_bounds__(256)
-void ccl_boundary_merge_kernel(const uint8_t * __restrict__ bitmap,
-                                int * __restrict__ labels,
-                                int w, int h) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = w * h;
-  if (idx >= total) return;
-  if (bitmap[idx] == 0) return;
-
-  int x = idx % w;
-  int y = idx / w;
-
-  bool on_right = ((x % kTileW) == kTileW - 1) && (x + 1 < w);
-  bool on_bottom = ((y % kTileH) == kTileH - 1) && (y + 1 < h);
-  bool on_left = ((x % kTileW) == 0) && (x > 0);
-
-  // 4-conn cross-tile (R, B)
-  if (on_right && bitmap[idx + 1] != 0)
-    ccl_union(labels, idx, idx + 1);
-  if (on_bottom && bitmap[idx + w] != 0)
-    ccl_union(labels, idx, idx + w);
-  // 8-conn cross-tile diagonals (BR, BL)
-  if ((on_right || on_bottom) && (x + 1 < w) && (y + 1 < h) &&
-      bitmap[idx + w + 1] != 0)
-    ccl_union(labels, idx, idx + w + 1);
-  if ((on_left || on_bottom) && (x > 0) && (y + 1 < h) &&
-      bitmap[idx + w - 1] != 0)
-    ccl_union(labels, idx, idx + w - 1);
+void ccl_buf_init_kernel(const uint8_t * __restrict__ bitmap,
+                         int * __restrict__ labels,
+                         int w, int h, int nbx, int nby) {
+  int bx = blockIdx.x * blockDim.x + threadIdx.x;
+  int by = blockIdx.y * blockDim.y + threadIdx.y;
+  if (bx >= nbx || by >= nby) return;
+  int x0 = 2 * bx, y0 = 2 * by;
+  bool has_fg = ccl_fg(bitmap, w, x0, y0)
+      || ((x0 + 1 < w) && ccl_fg(bitmap, w, x0 + 1, y0))
+      || ((y0 + 1 < h) && ccl_fg(bitmap, w, x0, y0 + 1))
+      || ((x0 + 1 < w) && (y0 + 1 < h) && ccl_fg(bitmap, w, x0 + 1, y0 + 1));
+  int rep = y0 * w + x0;
+  labels[rep] = has_fg ? rep : -1;
 }
 
-// Step 3: Flatten (path compression)
+// Step 2: single hooking pass. Union this fg block with its backward fg
+// neighbours over the exact 8-connected block adjacencies. Pixels of a block:
+//   P0 P1     at (x0,y0) (x0+1,y0)
+//   P2 P3        (x0,y0+1) (x0+1,y0+1)
 __global__ __launch_bounds__(256)
-void ccl_flatten_kernel(int * __restrict__ labels, int total) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= total) return;
-  if (labels[idx] < 0) return;
-  int root = idx;
-  while (labels[root] != root)
-    root = labels[root];
-  while (labels[idx] != root) {
-    int next = labels[idx];
-    labels[idx] = root;
-    idx = next;
+void ccl_buf_merge_kernel(const uint8_t * __restrict__ bitmap,
+                          int * __restrict__ labels,
+                          int w, int h, int nbx, int nby) {
+  int bx = blockIdx.x * blockDim.x + threadIdx.x;
+  int by = blockIdx.y * blockDim.y + threadIdx.y;
+  if (bx >= nbx || by >= nby) return;
+  int x0 = 2 * bx, y0 = 2 * by;
+  int rep = y0 * w + x0;
+  if (labels[rep] < 0) return;  // background block
+
+  bool p0 = ccl_fg(bitmap, w, x0, y0);
+  bool p1 = (x0 + 1 < w) && ccl_fg(bitmap, w, x0 + 1, y0);
+  bool p2 = (y0 + 1 < h) && ccl_fg(bitmap, w, x0, y0 + 1);
+
+  if (by > 0) {
+    // N block: X top row (P0,P1) vs N bottom row — all four pairs 8-adjacent.
+    bool n2 = ccl_fg(bitmap, w, x0, y0 - 1);
+    bool n3 = (x0 + 1 < w) && ccl_fg(bitmap, w, x0 + 1, y0 - 1);
+    if ((p0 || p1) && (n2 || n3))
+      ccl_union(labels, rep, (y0 - 2) * w + x0);
+    // NW block: only the X.P0 ~ NW.P3 corner touches.
+    if (bx > 0 && p0 && ccl_fg(bitmap, w, x0 - 1, y0 - 1))
+      ccl_union(labels, rep, (y0 - 2) * w + (x0 - 2));
+    // NE block: only the X.P1 ~ NE.P2 corner touches.
+    if (bx + 1 < nbx && p1 && (x0 + 2 < w) && ccl_fg(bitmap, w, x0 + 2, y0 - 1))
+      ccl_union(labels, rep, (y0 - 2) * w + (x0 + 2));
+  }
+  if (bx > 0) {
+    // W block: X left col (P0,P2) vs W right col — all four pairs 8-adjacent.
+    bool w1 = ccl_fg(bitmap, w, x0 - 1, y0);
+    bool w3 = (y0 + 1 < h) && ccl_fg(bitmap, w, x0 - 1, y0 + 1);
+    if ((p0 || p2) && (w1 || w3))
+      ccl_union(labels, rep, y0 * w + (x0 - 2));
   }
 }
 
-// Step 4: Fused assign + propagate compact IDs (cooperative groups grid sync)
-//
-// Uses cooperative groups grid.sync() to replace two separate kernels with one.
-// Phase 1: root pixels (labels[idx]==idx) get unique IDs via atomicAdd,
-//          non-root/background pixels get -1.
-// grid.sync(): global barrier ensures all root assignments are visible.
-// Phase 2: non-root foreground pixels read their root's compact_id.
-//
-// The grid size is limited to the cooperative maximum (blocks_per_SM * num_SMs).
-// Each thread processes multiple pixels via a stride loop to cover all pixels.
+// Step 3: path-compress each fg block node to its component root.
 __global__ __launch_bounds__(256)
-void ccl_fused_compact_ids_kernel(const int * __restrict__ labels,
+void ccl_buf_compress_kernel(int * __restrict__ labels,
+                             int w, int nbx, int nby) {
+  int bx = blockIdx.x * blockDim.x + threadIdx.x;
+  int by = blockIdx.y * blockDim.y + threadIdx.y;
+  if (bx >= nbx || by >= nby) return;
+  int rep = (2 * by) * w + (2 * bx);
+  if (labels[rep] < 0) return;
+  labels[rep] = ccl_find_root(labels, rep);
+}
+
+// Step 4a: dense component ids over root blocks, then propagate to non-root
+// blocks. Cooperative grid.sync() keeps the two phases device-resident.
+// Grid is limited to the cooperative maximum; a stride loop covers all blocks.
+__global__ __launch_bounds__(256)
+void ccl_buf_compact_assign_kernel(const int * __restrict__ labels,
                                    int * __restrict__ compact_ids,
                                    int * __restrict__ id_counter,
-                                   int total, int max_components) {
+                                   int w, int nbx, int nby,
+                                   int max_components) {
   auto grid = cg::this_grid();
+  int nblocks = nbx * nby;
   int stride = gridDim.x * blockDim.x;
 
-  // Phase 1: assign compact IDs to root pixels, -1 to all others
-  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += stride) {
-    if (labels[idx] == idx) {
+  for (int bi = blockIdx.x * blockDim.x + threadIdx.x; bi < nblocks;
+       bi += stride) {
+    int rep = (2 * (bi / nbx)) * w + 2 * (bi % nbx);
+    if (labels[rep] == rep) {  // root of a foreground component
       int cid = atomicAdd(id_counter, 1);
-      compact_ids[idx] = (cid < max_components) ? cid : -1;
-    } else {
-      compact_ids[idx] = -1;
+      compact_ids[rep] = (cid < max_components) ? cid : -1;
     }
   }
-
-  // Global barrier: all root compact_ids are now visible to every thread
   grid.sync();
-
-  // Phase 2: non-root foreground pixels copy their root's compact_id
-  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += stride) {
-    int root = labels[idx];
-    if (root >= 0 && root != idx) {
-      compact_ids[idx] = compact_ids[root];
-    }
+  for (int bi = blockIdx.x * blockDim.x + threadIdx.x; bi < nblocks;
+       bi += stride) {
+    int rep = (2 * (bi / nbx)) * w + 2 * (bi % nbx);
+    int root = labels[rep];
+    if (root >= 0 && root != rep)
+      compact_ids[rep] = compact_ids[root];
   }
+}
+
+// Step 4b: expand block-level ids to the per-pixel compact_ids map. Foreground
+// pixels get their block's component id; every other pixel (incl. bg pixels
+// inside a fg block) gets -1, so extract counts only true foreground.
+__global__ __launch_bounds__(256)
+void ccl_buf_scatter_kernel(const uint8_t * __restrict__ bitmap,
+                            const int * __restrict__ labels,
+                            int * __restrict__ compact_ids,
+                            int w, int h, int nbx, int nby) {
+  int bx = blockIdx.x * blockDim.x + threadIdx.x;
+  int by = blockIdx.y * blockDim.y + threadIdx.y;
+  if (bx >= nbx || by >= nby) return;
+  int x0 = 2 * bx, y0 = 2 * by;
+  int rep = y0 * w + x0;
+  int cid = (labels[rep] >= 0) ? compact_ids[rep] : -1;  // read before overwrite
+  compact_ids[rep] = ccl_fg(bitmap, w, x0, y0) ? cid : -1;
+  if (x0 + 1 < w)
+    compact_ids[rep + 1] = ccl_fg(bitmap, w, x0 + 1, y0) ? cid : -1;
+  if (y0 + 1 < h)
+    compact_ids[rep + w] = ccl_fg(bitmap, w, x0, y0 + 1) ? cid : -1;
+  if (x0 + 1 < w && y0 + 1 < h)
+    compact_ids[rep + w + 1] = ccl_fg(bitmap, w, x0 + 1, y0 + 1) ? cid : -1;
 }
 
 // Step 5: Init bboxes on GPU (kernel, not host memcpy -- no sync needed)
@@ -878,48 +896,50 @@ int cuda_gpu_ccl_detect(
   int threads = 256;
   int blocks = (total + threads - 1) / threads;
 
-  // Step 1: Tile-local CCL (32x32 tiles in shared memory)
-  {
-    dim3 tile_grid((w + kTileW - 1) / kTileW, (h + kTileH - 1) / kTileH);
-    dim3 tile_block(kTileW, kTileH);
-    ccl_tile_local_kernel<<<tile_grid, tile_block, 0, stream>>>(
-        d_bitmap, d_labels, w, h);
-    CUDA_CHECK(cudaGetLastError());
-  }
+  // 2x2-block grid for the BUF core (nbx * nby = ceil(w/2) * ceil(h/2) nodes).
+  int nbx = (w + 1) / 2;
+  int nby = (h + 1) / 2;
+  dim3 bblock(32, 8);
+  dim3 bgrid((nbx + bblock.x - 1) / bblock.x,
+             (nby + bblock.y - 1) / bblock.y);
 
-  // Step 2: Merge across tile boundaries.
-  // 8 iterations: long thin text lines span many tile boundaries; 2 passes
-  // can leave splits that drop F1 in downstream JFA. 8 passes converge for
-  // typical document text. Cost is small — each pass touches only fg pixels
-  // on tile borders.
-  for (int i = 0; i < 8; i++) {
-    ccl_boundary_merge_kernel<<<blocks, threads, 0, stream>>>(
-        d_bitmap, d_labels, w, h);
-  }
+  // Step 1: init one union-find node per 2x2 block.
+  ccl_buf_init_kernel<<<bgrid, bblock, 0, stream>>>(
+      d_bitmap, d_labels, w, h, nbx, nby);
   CUDA_CHECK(cudaGetLastError());
 
-  // Step 3: Flatten
-  ccl_flatten_kernel<<<blocks, threads, 0, stream>>>(d_labels, total);
+  // Step 2: single lock-free hooking pass over the 8-connected block
+  // adjacencies. No iterate-to-convergence, no whole-grid barrier loop.
+  ccl_buf_merge_kernel<<<bgrid, bblock, 0, stream>>>(
+      d_bitmap, d_labels, w, h, nbx, nby);
   CUDA_CHECK(cudaGetLastError());
 
-  // Step 4: Fused assign + propagate compact IDs (cooperative kernel)
-  //
-  // Cooperative grid.sync() requires the grid to fit within the GPU's
-  // concurrent block capacity. We query the max via occupancy API and
-  // use a stride loop in the kernel to cover all pixels.
+  // Step 3: path-compress block nodes to their component roots.
+  ccl_buf_compress_kernel<<<bgrid, bblock, 0, stream>>>(d_labels, w, nbx, nby);
+  CUDA_CHECK(cudaGetLastError());
+
+  // Step 4: dense component ids over root blocks (cooperative grid.sync between
+  // assign and propagate), then scatter block ids to the per-pixel map.
   CUDA_CHECK(cudaMemsetAsync(d_id_counter, 0, sizeof(int), stream));
   {
-    int coop_grid = coop_grid_for(ccl_fused_compact_ids_kernel, threads);
-    if (coop_grid > blocks) coop_grid = blocks;
+    int nblocks = nbx * nby;
+    int need = (nblocks + threads - 1) / threads;
+    int coop_grid = coop_grid_for(ccl_buf_compact_assign_kernel, threads);
+    if (coop_grid > need) coop_grid = need;
+    if (coop_grid < 1) coop_grid = 1;
 
     int max_comp = kMaxGpuComponents;
-    void *args[] = { (void*)&d_labels, (void*)&d_compact_ids, (void*)&d_id_counter,
-                     (void*)&total, (void*)&max_comp };
+    void *args[] = { (void*)&d_labels, (void*)&d_compact_ids,
+                     (void*)&d_id_counter, (void*)&w, (void*)&nbx,
+                     (void*)&nby, (void*)&max_comp };
     CUDA_CHECK(cudaLaunchCooperativeKernel(
-        (void*)ccl_fused_compact_ids_kernel, dim3(coop_grid), dim3(threads),
+        (void*)ccl_buf_compact_assign_kernel, dim3(coop_grid), dim3(threads),
         args, 0, stream));
     CUDA_CHECK(cudaGetLastError());
   }
+  ccl_buf_scatter_kernel<<<bgrid, bblock, 0, stream>>>(
+      d_bitmap, d_labels, d_compact_ids, w, h, nbx, nby);
+  CUDA_CHECK(cudaGetLastError());
 
   // Step 5: Init bboxes via GPU kernel (not host memcpy -- no contention)
   {

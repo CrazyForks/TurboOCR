@@ -197,6 +197,7 @@ endif()
 # --- Shared library: turbo_ocr_common ---
 add_library(turbo_ocr_common STATIC
     src/detection/det_postprocess.cpp
+    src/formula/cjk_stats.cpp
     src/recognition/crop_utils.cpp
     src/recognition/ctc_decode.cpp
     src/decode/fast_png_decoder.cpp
@@ -224,6 +225,7 @@ add_library(turbo_ocr::common ALIAS turbo_ocr_common)
 # --- C++ unit tests (Catch2, always built) ---
 add_executable(turbo_ocr_tests
     tests/cpp/test_box.cpp
+    tests/cpp/test_cjk_stats.cpp
     tests/cpp/test_encoding.cpp
     tests/cpp/test_serialization.cpp
     tests/cpp/test_language_paths.cpp

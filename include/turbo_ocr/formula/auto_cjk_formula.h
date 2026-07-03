@@ -5,23 +5,12 @@
 #include <string_view>
 #include <vector>
 
+#include "turbo_ocr/formula/cjk_stats.h"
 #include "turbo_ocr/formula/formula_recognizer.h"
 
 namespace turbo_ocr::formula {
 
 class PPFormulaNetOrt;
-
-// True once `s` (UTF-8) contains a CJK ideograph codepoint. Used by the
-// composite to scan a single formula crop's -S output. No allocation.
-[[nodiscard]] bool text_has_cjk(std::string_view s) noexcept;
-
-// CJK-vs-total codepoint counts for `s` (UTF-8). The pipeline accumulates these
-// across a page's recognized text to decide the per-page routing hint with a
-// THRESHOLD — a single stray CJK glyph from an OCR misrecognition on a
-// math-heavy EN page (measured: 1 CJK in 1700 chars) must NOT escalate the
-// whole page, while a genuine Chinese page (measured: 23–88% CJK) must.
-struct CjkStat { int cjk = 0; int total = 0; };
-[[nodiscard]] CjkStat cjk_stats(std::string_view s) noexcept;
 
 // Opt-in composite formula backend (FORMULA_BACKEND=auto). Runs the fast
 // EN/Latin PP-FormulaNet-S over every crop, then RE-RUNS only the crops whose

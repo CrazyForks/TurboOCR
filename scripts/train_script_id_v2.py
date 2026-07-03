@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""v2 SOTA training for the 7-class script_id classifier.
+"""v2 training for the 7-class script_id classifier.
 
 Recipe (locked-in contract):
     Input  [N,3,32,128] RGB
@@ -346,7 +346,7 @@ def main():
     final_per_class_canon = {name_remap.get(k, k): v for k, v in final_per_class.items()}
 
     meta = {
-        "model": "MobileNetV3-Small (torchvision, EMA, v2 SOTA recipe)",
+        "model": "MobileNetV3-Small (torchvision, EMA, v2 recipe)",
         "task": "text-line crop script classifier (7-class)",
         "input_layout": "NCHW",
         "input_shape": [1, 3, H, W],

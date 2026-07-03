@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
-#include <unordered_set>
+#include <vector>
 
 #include "turbo_ocr/common/box.h"
 
@@ -118,33 +118,48 @@ inline bool horizontally_overlaps(const AABB &a, const AABB &b,
   return small > 0 && float(inter) / float(small) > thresh;
 }
 
+// Membership set for claimed/child indices. `std::vector<char>` keyed by
+// layout index beats a hashed set here: O(1) branch-free probe, contiguous
+// (cache-friendly), and no per-page allocator churn. Only membership is ever
+// queried, so ordering is irrelevant.
+using IndexSet = std::vector<char>;
+inline bool contains(const IndexSet &s, int idx) noexcept {
+  return idx >= 0 && static_cast<size_t>(idx) < s.size() &&
+         s[static_cast<size_t>(idx)] != 0;
+}
+inline void mark(IndexSet &s, int idx) noexcept {
+  if (idx >= 0 && static_cast<size_t>(idx) < s.size())
+    s[static_cast<size_t>(idx)] = 1;
+}
+
 // Return indices into `candidates` of blocks that sit ABOVE `parent`
 // (sorted by descending y2 — closest first) and BELOW `parent`
 // (sorted by ascending y0 — closest first), restricted to those that
 // horizontally overlap parent.
+//
+// `boxes` holds the page's AABBs computed once up front, so neither the
+// filter nor the two sorts ever reconstruct a box from its 4 corners.
 struct PrevPost {
   std::vector<int> prev;
   std::vector<int> post;
 };
 
 PrevPost get_nearest_neighbours(const AABB &parent,
-                                const std::vector<LayoutBox> &layout,
+                                const std::vector<AABB> &boxes,
                                 const std::vector<int> &candidates) {
   PrevPost out;
   for (int idx : candidates) {
-    const AABB cand = aabb_of(layout[idx]);
+    const AABB &cand = boxes[static_cast<size_t>(idx)];
     if (!horizontally_overlaps(parent, cand)) continue;
     if (cand.y1 <= parent.y0) out.prev.push_back(idx);
     else if (cand.y0 >= parent.y1) out.post.push_back(idx);
   }
-  std::sort(out.prev.begin(), out.prev.end(),
-            [&](int a, int b) {
-              return aabb_of(layout[a]).y1 > aabb_of(layout[b]).y1;
-            });
-  std::sort(out.post.begin(), out.post.end(),
-            [&](int a, int b) {
-              return aabb_of(layout[a]).y0 < aabb_of(layout[b]).y0;
-            });
+  std::sort(out.prev.begin(), out.prev.end(), [&](int a, int b) {
+    return boxes[static_cast<size_t>(a)].y1 > boxes[static_cast<size_t>(b)].y1;
+  });
+  std::sort(out.post.begin(), out.post.end(), [&](int a, int b) {
+    return boxes[static_cast<size_t>(a)].y0 < boxes[static_cast<size_t>(b)].y0;
+  });
   return out;
 }
 
@@ -152,19 +167,20 @@ PrevPost get_nearest_neighbours(const AABB &parent,
 // blocks (sub-titles, author lines) and any text fully overlapping the
 // title bbox.
 void detect_doc_title_children(int parent_idx,
-                                const std::vector<LayoutBox> &layout,
-                                const std::vector<int> &text_indices,
-                                int page_text_line_height,
-                                std::vector<int> &children,
-                                std::unordered_set<int> &claimed) {
-  const AABB parent = aabb_of(layout[parent_idx]);
+                               const std::vector<LayoutBox> &layout,
+                               const std::vector<AABB> &boxes,
+                               const std::vector<int> &text_indices,
+                               int page_text_line_height,
+                               std::vector<int> &children,
+                               IndexSet &claimed) {
+  const AABB parent = boxes[static_cast<size_t>(parent_idx)];
   const int parent_short = short_side(parent);
   const int parent_long = long_side(parent);
-  PrevPost neigh = get_nearest_neighbours(parent, layout, text_indices);
+  PrevPost neigh = get_nearest_neighbours(parent, boxes, text_indices);
 
   auto try_attach = [&](int idx) {
-    if (claimed.count(idx)) return;
-    const AABB cand = aabb_of(layout[idx]);
+    if (contains(claimed, idx)) return;
+    const AABB &cand = boxes[static_cast<size_t>(idx)];
     const int short_s = short_side(cand);
     const int long_s = long_side(cand);
     if (short_s >= parent_short * 4 / 5) return;
@@ -173,17 +189,16 @@ void detect_doc_title_children(int parent_idx,
     const int tlh = line_height_for(layout[idx], page_text_line_height);
     if (nearest_edge_distance(parent, cand) >= tlh * 2) return;
     children.push_back(idx);
-    claimed.insert(idx);
+    mark(claimed, idx);
   };
   if (!neigh.prev.empty()) try_attach(neigh.prev.front());
   if (!neigh.post.empty()) try_attach(neigh.post.front());
 
   for (int idx : text_indices) {
-    if (claimed.count(idx)) continue;
-    const AABB cand = aabb_of(layout[idx]);
-    if (overlap_small(parent, cand) > 0.9f) {
+    if (contains(claimed, idx)) continue;
+    if (overlap_small(parent, boxes[static_cast<size_t>(idx)]) > 0.9f) {
       children.push_back(idx);
-      claimed.insert(idx);
+      mark(claimed, idx);
     }
   }
 }
@@ -194,28 +209,29 @@ void detect_doc_title_children(int parent_idx,
 // does (`min_text_line_height` in the reference) so a tall caption
 // next to a short subtitle still passes the proximity gate.
 void detect_paragraph_title_children(int parent_idx,
-                                      const std::vector<LayoutBox> &layout,
-                                      const std::vector<int> &paragraph_title_indices,
-                                      int page_text_line_height,
-                                      std::vector<int> &children,
-                                      std::unordered_set<int> &claimed) {
-  const AABB parent = aabb_of(layout[parent_idx]);
+                                     const std::vector<LayoutBox> &layout,
+                                     const std::vector<AABB> &boxes,
+                                     const std::vector<int> &paragraph_title_indices,
+                                     int page_text_line_height,
+                                     std::vector<int> &children,
+                                     IndexSet &claimed) {
+  const AABB parent = boxes[static_cast<size_t>(parent_idx)];
   const int parent_tlh = line_height_for(layout[parent_idx],
                                           page_text_line_height);
-  PrevPost neigh = get_nearest_neighbours(parent, layout, paragraph_title_indices);
+  PrevPost neigh =
+      get_nearest_neighbours(parent, boxes, paragraph_title_indices);
 
   auto try_attach_run = [&](const std::vector<int> &run) {
     for (int idx : run) {
       if (idx == parent_idx) continue;
-      if (claimed.count(idx)) break;
-      const AABB cand = aabb_of(layout[idx]);
-      const int min_tlh = std::min(parent_tlh,
-                                    line_height_for(layout[idx],
-                                                    page_text_line_height));
+      if (contains(claimed, idx)) break;
+      const AABB &cand = boxes[static_cast<size_t>(idx)];
+      const int min_tlh = std::min(
+          parent_tlh, line_height_for(layout[idx], page_text_line_height));
       if (std::abs(cand.x0 - parent.x0) >= min_tlh * 2) break;
       if (nearest_edge_distance(parent, cand) > min_tlh * 3 / 2) break;
       children.push_back(idx);
-      claimed.insert(idx);
+      mark(claimed, idx);
     }
   };
   try_attach_run(neigh.prev);
@@ -225,13 +241,14 @@ void detect_paragraph_title_children(int parent_idx,
 // Mirrors update_vision_child_blocks. Children: nearby vision_title
 // blocks and small adjacent text caption blocks (vision_footnote).
 void detect_vision_children(int parent_idx,
-                             const std::vector<LayoutBox> &layout,
-                             const std::vector<int> &text_indices,
-                             const std::vector<int> &vision_title_indices,
-                             int page_text_line_height,
-                             std::vector<int> &children,
-                             std::unordered_set<int> &claimed) {
-  const AABB parent = aabb_of(layout[parent_idx]);
+                            const std::vector<LayoutBox> &layout,
+                            const std::vector<AABB> &boxes,
+                            const std::vector<int> &text_indices,
+                            const std::vector<int> &vision_title_indices,
+                            int page_text_line_height,
+                            std::vector<int> &children,
+                            IndexSet &claimed) {
+  const AABB parent = boxes[static_cast<size_t>(parent_idx)];
   const int parent_short = short_side(parent);
   const int parent_long = long_side(parent);
   const auto parent_c = centroid(parent);
@@ -242,19 +259,19 @@ void detect_vision_children(int parent_idx,
   ref_indices.reserve(text_indices.size() + vision_title_indices.size());
   ref_indices.insert(ref_indices.end(), text_indices.begin(), text_indices.end());
   ref_indices.insert(ref_indices.end(), vision_title_indices.begin(),
-                      vision_title_indices.end());
+                     vision_title_indices.end());
 
-  PrevPost neigh = get_nearest_neighbours(parent, layout, ref_indices);
+  PrevPost neigh = get_nearest_neighbours(parent, boxes, ref_indices);
 
   auto consider = [&](int idx) {
-    if (claimed.count(idx)) return false;
-    const AABB cand = aabb_of(layout[idx]);
+    if (contains(claimed, idx)) return false;
+    const AABB &cand = boxes[static_cast<size_t>(idx)];
     const int dist = nearest_edge_distance(parent, cand);
     const int cls = layout[idx].class_id;
     const int cand_tlh = line_height_for(layout[idx], page_text_line_height);
     if (is_vision_title(cls) && dist <= cand_tlh * 2) {
       children.push_back(idx);
-      claimed.insert(idx);
+      mark(claimed, idx);
       return true;
     }
     if (is_text(cls) && !has_vision_footnote &&
@@ -273,7 +290,7 @@ void detect_vision_children(int parent_idx,
       if (tight_caption || aligned_left || aligned_right) {
         has_vision_footnote = true;
         children.push_back(idx);
-        claimed.insert(idx);
+        mark(claimed, idx);
         return true;
       }
     }
@@ -285,11 +302,10 @@ void detect_vision_children(int parent_idx,
 
   // Fully-overlapping text ⇒ vision_footnote unconditionally.
   for (int idx : text_indices) {
-    if (claimed.count(idx)) continue;
-    const AABB cand = aabb_of(layout[idx]);
-    if (overlap_small(parent, cand) > 0.9f) {
+    if (contains(claimed, idx)) continue;
+    if (overlap_small(parent, boxes[static_cast<size_t>(idx)]) > 0.9f) {
       children.push_back(idx);
-      claimed.insert(idx);
+      mark(claimed, idx);
     }
   }
 }
@@ -302,6 +318,12 @@ detect_child_blocks(const std::vector<LayoutBox> &layout,
   std::vector<ChildLinks> out(layout.size());
   if (layout.empty() || text_line_height <= 0) return out;
 
+  // Hoist every region's AABB once. Detection then indexes this table in
+  // the O(k log k) neighbour sorts and every proximity/overlap test instead
+  // of rebuilding a box from its 4 corners on each comparison.
+  std::vector<AABB> boxes(layout.size());
+  for (size_t i = 0; i < layout.size(); ++i) boxes[i] = aabb_of(layout[i]);
+
   std::vector<int> text_indices, paragraph_title_indices,
                    vision_title_indices, vision_indices, doc_title_indices;
   for (size_t i = 0; i < layout.size(); ++i) {
@@ -313,14 +335,15 @@ detect_child_blocks(const std::vector<LayoutBox> &layout,
     else if (cls == kClassDocTitle) doc_title_indices.push_back(int(i));
   }
 
-  std::unordered_set<int> claimed;
+  IndexSet claimed(layout.size(), 0);
 
   // Vision parents claim children first — vision_footnote text/captions
   // are the most consequential gluing case in PaddleX's pipeline.
   for (int idx : vision_indices) {
-    if (claimed.count(idx)) continue;
-    detect_vision_children(idx, layout, text_indices, vision_title_indices,
-                           text_line_height, out[idx].child_indices, claimed);
+    if (contains(claimed, idx)) continue;
+    detect_vision_children(idx, layout, boxes, text_indices,
+                           vision_title_indices, text_line_height,
+                           out[idx].child_indices, claimed);
   }
   // Paragraph titles next — they may pull other paragraph_titles as
   // sub-headings. A paragraph_title that has already been claimed (e.g.
@@ -328,16 +351,17 @@ detect_child_blocks(const std::vector<LayoutBox> &layout,
   // mirrors PaddleX's order_label == "sub_paragraph_title" early
   // return.
   for (int idx : paragraph_title_indices) {
-    if (claimed.count(idx)) continue;
-    detect_paragraph_title_children(idx, layout, paragraph_title_indices,
+    if (contains(claimed, idx)) continue;
+    detect_paragraph_title_children(idx, layout, boxes, paragraph_title_indices,
                                     text_line_height, out[idx].child_indices,
                                     claimed);
   }
   // Doc title last — accrues remaining adjacent text (subtitle / author).
   for (int idx : doc_title_indices) {
-    if (claimed.count(idx)) continue;
-    detect_doc_title_children(idx, layout, text_indices, text_line_height,
-                              out[idx].child_indices, claimed);
+    if (contains(claimed, idx)) continue;
+    detect_doc_title_children(idx, layout, boxes, text_indices,
+                              text_line_height, out[idx].child_indices,
+                              claimed);
   }
 
   return out;
@@ -351,51 +375,62 @@ flatten_descendants(int parent_idx,
   if (parent_idx < 0 || static_cast<size_t>(parent_idx) >= layout.size())
     return out;
   if (links.size() != layout.size()) return out;
-  std::unordered_set<int> visited;
-  visited.insert(parent_idx);
-  // Iterative DFS keyed off a worklist of (idx, child_position) pairs.
-  // Each frame remembers its sorted children so we can resume after
-  // descending into a child. depth_limit equal to layout.size() is
-  // enough for any acyclic tree; anything deeper means a cycle that
-  // visited didn't catch (defence in depth).
+
+  // O(1) membership keyed by layout index — no hashing, no rehash growth.
+  std::vector<char> visited(layout.size(), 0);
+  visited[static_cast<size_t>(parent_idx)] = 1;
+
+  // Iterative DFS: each frame keeps its top-then-left sorted children and a
+  // resume cursor so a child's whole sub-tree emits before the next sibling.
   struct Frame {
     int idx = 0;
     std::vector<int> kids;
     size_t cursor = 0;
   };
-  std::vector<Frame> stack;
   auto sorted_kids = [&](int idx) {
+    // Decorate each child with its AABB top-left ONCE, then sort the small
+    // decorated array. The sort never reconstructs a box in its comparator,
+    // and invalid indices are dropped up front so layout[k] is never read
+    // out of bounds (the walk below still bounds-checks every child).
+    struct Kid { int y0, x0, idx; };
+    std::vector<Kid> decorated;
+    if (idx >= 0 && static_cast<size_t>(idx) < links.size()) {
+      const auto &ci = links[static_cast<size_t>(idx)].child_indices;
+      decorated.reserve(ci.size());
+      for (int k : ci) {
+        if (k < 0 || static_cast<size_t>(k) >= layout.size()) continue;
+        auto [x0, y0, x1, y1] = turbo_ocr::aabb(layout[k].box);
+        decorated.push_back({y0, x0, k});
+      }
+    }
+    std::sort(decorated.begin(), decorated.end(),
+              [](const Kid &a, const Kid &b) {
+                if (a.y0 != b.y0) return a.y0 < b.y0;
+                return a.x0 < b.x0;
+              });
     std::vector<int> kids;
-    if (idx < 0 || static_cast<size_t>(idx) >= links.size()) return kids;
-    kids = links[static_cast<size_t>(idx)].child_indices;
-    // child_indices can carry stale/out-of-range entries; drop them before the
-    // comparator dereferences layout[k] — otherwise an invalid index reads a
-    // 16-byte box past the layout vector (caught by valgrind). The walk below
-    // already bounds-checks each child, so this only removes entries that would
-    // have been skipped anyway.
-    std::erase_if(kids, [&](int k) {
-      return k < 0 || static_cast<size_t>(k) >= layout.size();
-    });
-    std::sort(kids.begin(), kids.end(), [&](int a, int b) {
-      auto [ax0, ay0, ax1, ay1] = turbo_ocr::aabb(layout[a].box);
-      auto [bx0, by0, bx1, by1] = turbo_ocr::aabb(layout[b].box);
-      if (ay0 != by0) return ay0 < by0;
-      return ax0 < bx0;
-    });
+    kids.reserve(decorated.size());
+    for (const Kid &k : decorated) kids.push_back(k.idx);
     return kids;
   };
+
+  std::vector<Frame> stack;
   stack.push_back({parent_idx, sorted_kids(parent_idx), 0});
+  // A valid acyclic walk never stacks more than one frame per region;
+  // `visited` already breaks cycles, so this only backstops a bug where it
+  // somehow doesn't.
   const size_t depth_limit = layout.size() + 1;
   while (!stack.empty()) {
-    if (stack.size() > depth_limit) break;  // pathological cycle guard
-    auto &top = stack.back();
+    if (stack.size() > depth_limit) break;
+    Frame &top = stack.back();
     if (top.cursor >= top.kids.size()) {
       stack.pop_back();
       continue;
     }
     const int ci = top.kids[top.cursor++];
     if (ci < 0 || static_cast<size_t>(ci) >= layout.size()) continue;
-    if (!visited.insert(ci).second) continue;  // skip if already seen
+    if (visited[static_cast<size_t>(ci)]) continue;
+    visited[static_cast<size_t>(ci)] = 1;
     out.push_back(ci);
     stack.push_back({ci, sorted_kids(ci), 0});
   }
@@ -407,39 +442,47 @@ void splice_child_blocks(std::vector<UnsortedBlock> &sorted,
                          const std::vector<LayoutBox> &layout) {
   if (sorted.empty() || links.empty()) return;
 
-  // 1. Build a set of indices that are children of some parent — these
-  //    must NOT emit standalone in `sorted`. Walk every parent's
-  //    children to populate.
-  std::unordered_set<int> child_layout_idxs;
+  // 1. Mark every index that is a child of some parent — these must NOT
+  //    emit standalone in `sorted`. Keyed by layout index for O(1) tests.
+  std::vector<char> is_child(layout.size(), 0);
   for (const auto &cl : links) {
-    for (int ci : cl.child_indices) child_layout_idxs.insert(ci);
+    for (int ci : cl.child_indices) {
+      if (ci >= 0 && static_cast<size_t>(ci) < is_child.size())
+        is_child[static_cast<size_t>(ci)] = 1;
+    }
   }
 
-  // 2. Filter `sorted` removing standalone child entries.
-  std::vector<UnsortedBlock> filtered;
-  filtered.reserve(sorted.size());
-  for (const auto &b : sorted) {
-    if (b.layout_idx >= 0 && child_layout_idxs.count(b.layout_idx)) continue;
-    filtered.push_back(b);
-  }
-
-  // 3. For each parent that has descendants (anywhere in the
-  //    sub-tree), splice (parent, descendants…) into `filtered` at
-  //    the parent's position. Descendants come right after the parent
-  //    in DFS order, each level sorted top-then-left — matching
-  //    flatten_descendants' walk.
+  // 2/3. Emit each surviving (non-child) entry followed by its whole
+  //      descendant sub-tree in DFS order (each level top-then-left),
+  //      matching flatten_descendants and PaddleX's insert_child_blocks.
   std::vector<UnsortedBlock> out;
-  out.reserve(filtered.size() + child_layout_idxs.size());
-  for (const auto &b : filtered) {
+  out.reserve(sorted.size());
+  std::vector<char> emitted(layout.size(), 0);
+  for (const auto &b : sorted) {
+    if (b.layout_idx >= 0 && static_cast<size_t>(b.layout_idx) < is_child.size() &&
+        is_child[static_cast<size_t>(b.layout_idx)])
+      continue;  // standalone child slot — re-emitted under its parent below
     out.push_back(b);
+    if (b.layout_idx >= 0 && static_cast<size_t>(b.layout_idx) < layout.size())
+      emitted[static_cast<size_t>(b.layout_idx)] = 1;
     if (b.layout_idx < 0 ||
         static_cast<size_t>(b.layout_idx) >= links.size()) continue;
-    const auto descendants = flatten_descendants(b.layout_idx, links, layout);
-    for (int ci : descendants) {
+    for (int ci : flatten_descendants(b.layout_idx, links, layout)) {
       auto [x0, y0, x1, y1] = turbo_ocr::aabb(layout[ci].box);
       out.push_back({ci, {x0, y0, x1, y1}, OrderLabel::kBody,
                      layout[ci].class_id});
+      emitted[static_cast<size_t>(ci)] = 1;
     }
+  }
+
+  // Safety net (H1 data-loss): a child removed in step 2 whose parent slot
+  // was absent from `sorted` would otherwise silently VANISH. Emit any
+  // still-unaccounted child standalone rather than dropping detected content.
+  for (size_t ci = 0; ci < is_child.size(); ++ci) {
+    if (!is_child[ci] || emitted[ci]) continue;
+    auto [x0, y0, x1, y1] = turbo_ocr::aabb(layout[ci].box);
+    out.push_back({static_cast<int>(ci), {x0, y0, x1, y1}, OrderLabel::kBody,
+                   layout[ci].class_id});
   }
   sorted = std::move(out);
 }

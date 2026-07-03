@@ -18,6 +18,20 @@ namespace turbo_ocr::vlm {
 
 namespace {
 
+// Own libcurl's process-global init here so this shared pool never depends on
+// another translation unit (e.g. vlm_formula) being linked in to initialize
+// curl before the worker thread runs — a build linking table+pool without
+// formula would otherwise fall back to libcurl's lazy, non-thread-safe init
+// from the worker. curl_global_init is refcounted, so the sibling guard in
+// vlm_formula is redundant-but-safe. This namespace-scope object is fully
+// constructed during startup dynamic init, hence before the singleton's worker
+// thread (started lazily on first instance()) touches any curl handle.
+struct CurlGlobalInit {
+    CurlGlobalInit() { curl_global_init(CURL_GLOBAL_DEFAULT); }
+    ~CurlGlobalInit() { curl_global_cleanup(); }
+};
+CurlGlobalInit g_curl_init;
+
 int get_env_int(const char *k, int dflt) {
     const char *v = std::getenv(k);
     if (!v || !v[0]) return dflt;
@@ -109,7 +123,14 @@ std::string parse_content(const std::string &body) {
         auto j = nlohmann::json::parse(body);
         return j.at("choices").at(0).at("message").at("content")
                  .get<std::string>();
-    } catch (...) {
+    } catch (const std::exception &e) {
+        // A 200-OK with an unexpected shape must not vanish silently: this pool
+        // is the default VLM backend, so log loudly with a truncated body (as
+        // the non-pool vlm_formula/vlm_table paths do). Caller derives failure
+        // from the empty return; this only makes the cause visible.
+        std::cerr << "[VLMCropPool] response parse failed: " << e.what()
+                  << " body="
+                  << body.substr(0, std::min<size_t>(body.size(), 200)) << '\n';
         return {};
     }
 }
@@ -221,6 +242,14 @@ std::future<std::string> VLMCropPool::submit(std::vector<uint8_t> png_bytes,
     req->deadline_ms = steady_now_ms() + 1000L * std::max(1, timeout_s);
     auto fut = req->result.get_future();
 
+    if (stop_.load()) {
+        // Pool is shutting down (incl. static-destruction teardown): no worker
+        // will ever drain this, so resolve NOW instead of hanging the caller's
+        // future forever (H1). Empty == degraded, surfaced upstream.
+        req->result.set_value(std::string());
+        return fut;
+    }
+
     {
         std::lock_guard<std::mutex> lk(queue_mu_);
         queue_.push(std::move(req));
@@ -252,6 +281,12 @@ VLMCropPool::submit_with_status(std::vector<uint8_t> png_bytes,
     req->want_status    = true;
     req->status_result  = std::make_shared<std::promise<CropOutcome>>();
     auto fut = req->status_result->get_future();
+
+    if (stop_.load()) {
+        // Shutting down: resolve now (degraded) so the future never hangs (H1).
+        req->status_result->set_value(CropOutcome{std::string(), false});
+        return fut;
+    }
 
     {
         std::lock_guard<std::mutex> lk(queue_mu_);

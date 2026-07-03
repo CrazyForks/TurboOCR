@@ -390,12 +390,11 @@ assign_reading_order_for_results(const std::vector<OCRResultItem> &results,
   out.reserve(results.size());
   if (results.empty()) return out;
 
-  // Layout-empty fast path: text-line detection boxes are line-level,
-  // not paragraph-level. Running XY-cut on raw detection boxes can
-  // over-split a one-column document into spurious "columns" the moment
-  // there's a horizontal gap between two short lines. Without any layout
-  // signal there's nothing better than y-then-x.
-  if (layout.empty()) {
+  // Shared "no usable layout signal" exit: sort every result by
+  // (y_center, x_center) and emit. Decorate-sort-undecorate keeps the key
+  // a pure per-result computation instead of recomputing it inside the
+  // comparator. Used by both fall-back branches below.
+  const auto emit_yx_fallback = [&results, &out]() {
     struct K { int y4, x4, idx; };
     std::vector<K> keys;
     keys.reserve(results.size());
@@ -412,6 +411,15 @@ assign_reading_order_for_results(const std::vector<OCRResultItem> &results,
       return a.x4 < b.x4;
     });
     for (const auto &k : keys) out.push_back(k.idx);
+  };
+
+  // Layout-empty fast path: text-line detection boxes are line-level,
+  // not paragraph-level. Running XY-cut on raw detection boxes can
+  // over-split a one-column document into spurious "columns" the moment
+  // there's a horizontal gap between two short lines. Without any layout
+  // signal there's nothing better than y-then-x.
+  if (layout.empty()) {
+    emit_yx_fallback();
     return out;
   }
 
@@ -488,20 +496,34 @@ assign_reading_order_for_results(const std::vector<OCRResultItem> &results,
     int median_h = *mid;
     group_row_tol[li] = std::max(4, median_h / 3);
   }
+  // Decorate-sort-undecorate: the (row, x) key is a pure function of each
+  // result, so materialise it once per element rather than recomputing 8
+  // corner sums per comparison. Keys are built in ascending result-index
+  // order and stable_sort preserves that on ties, so the emitted
+  // permutation is byte-identical to the in-comparator version. Groups of
+  // size < 2 need no sort. The key buffer is reused across groups.
+  struct RowKey { int row, xsum, ri; };
+  std::vector<RowKey> row_keys;
   for (size_t li = 0; li < by_layout.size(); ++li) {
     auto &v = by_layout[li];
-    int tol = group_row_tol[li];
-    std::stable_sort(v.begin(), v.end(), [&, tol](int a, int b) {
-      int ay = 0, by_ = 0, ax = 0, bx = 0;
+    if (v.size() < 2) continue;
+    const int tol = group_row_tol[li];
+    row_keys.clear();
+    row_keys.reserve(v.size());
+    for (int ri : v) {
+      int sy = 0, sx = 0;
       for (int k = 0; k < 4; ++k) {
-        ay  += results[a].box[k][1]; by_ += results[b].box[k][1];
-        ax  += results[a].box[k][0]; bx  += results[b].box[k][0];
+        sy += results[ri].box[k][1];
+        sx += results[ri].box[k][0];
       }
-      int row_a = (ay / 4) / tol;
-      int row_b = (by_ / 4) / tol;
-      if (row_a != row_b) return row_a < row_b;
-      return ax < bx;
-    });
+      row_keys.push_back({(sy / 4) / tol, sx, ri});
+    }
+    std::stable_sort(row_keys.begin(), row_keys.end(),
+                     [](const RowKey &a, const RowKey &b) {
+                       if (a.row != b.row) return a.row < b.row;
+                       return a.xsum < b.xsum;
+                     });
+    for (size_t i = 0; i < v.size(); ++i) v[i] = row_keys[i].ri;
   }
 
   // Mostly-orphans fast path: if very few results matched a layout box
@@ -525,22 +547,7 @@ assign_reading_order_for_results(const std::vector<OCRResultItem> &results,
   // signal from layout" — better to fall back than risk the regression.
   size_t min_matches = std::max<size_t>(1, (results.size() * 5 + 99) / 100);
   if (matched_count < min_matches) {
-    struct K { int y4, x4, idx; };
-    std::vector<K> keys;
-    keys.reserve(results.size());
-    for (size_t i = 0; i < results.size(); ++i) {
-      int sx = 0, sy = 0;
-      for (int k = 0; k < 4; ++k) {
-        sx += results[i].box[k][0];
-        sy += results[i].box[k][1];
-      }
-      keys.push_back({sy, sx, static_cast<int>(i)});
-    }
-    std::stable_sort(keys.begin(), keys.end(), [](const K &a, const K &b) {
-      if (a.y4 != b.y4) return a.y4 < b.y4;
-      return a.x4 < b.x4;
-    });
-    for (const auto &k : keys) out.push_back(k.idx);
+    emit_yx_fallback();
     return out;
   }
 

@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <format>
 #include <fstream>
+#include <iostream>
 #include <mutex>
 #include <vector>
 
@@ -16,14 +17,16 @@ TrtEngine::TrtEngine(const std::string &model_path) : model_path_(model_path) {}
 TrtEngine::~TrtEngine() noexcept { destroy_graphs(); }
 
 bool TrtEngine::graphs_enabled() {
-  // Default OFF: on this GPU-compute-bound OCR stack a clean A/B showed baked
-  // graphs are neutral even at concurrency 1 (the eliminated launch overhead
-  // is lost under GPU-compute + sync time) and cost ~0.5 GiB/pipeline. Kept
-  // as an opt-in (TURBO_OCR_CUDA_GRAPHS=1) — they pay off only if the pipeline
-  // ever becomes launch-bound (e.g. after a compute cut that frees the GPU).
+  // Default ON: a clean free-GPU A/B (FUNSD, tiny tier, 2026-07-01) measured baked
+  // graphs at +14% throughput (515.7 -> 586.4 img/s) and lower p50 (13 -> 11 ms),
+  // F1 unchanged (85.38 -> 85.37) — the many small rec crops are launch-bound, so
+  // replaying a graph beats re-issuing ~100-300 kernels per crop. Cost is
+  // ~0.5 GiB/pipeline of VRAM; opt OUT with TURBO_OCR_CUDA_GRAPHS=0 on
+  // VRAM-constrained cards. (The earlier "graphs neutral" note measured under GPU
+  // contention / on the compute-bound det path — not the rec launch-bound reality.)
   static const bool v = [] {
     const char *env = std::getenv("TURBO_OCR_CUDA_GRAPHS");
-    return env && std::atoi(env) != 0;
+    return !(env && std::atoi(env) == 0); // on unless explicitly disabled
   }();
   return v;
 }
@@ -43,8 +46,15 @@ int TrtEngine::bake_graph(int profile_idx, const nvinfer1::Dims &dims,
                           void *input, void *output, cudaStream_t stream) {
   if (!engine_ || !graphs_enabled())
     return -1;
-  // Pipelines warm up concurrently; captures are globally serialized so no
-  // other CUDA activity from this process interleaves with a recording.
+  // Pipelines warm up concurrently. bake_mu serializes CAPTURES against each
+  // other only — it does not (and must not) stop other pipelines' warmup
+  // enqueues/allocs, which is why the capture runs in ThreadLocal mode:
+  // Global mode would make those legitimate concurrent cudaMallocs fail
+  // spuriously. The safety invariant is weaker but sufficient: every pipeline
+  // owns a private engine/context/stream, so foreign work can never be
+  // recorded into this capture; the only cross-thread hazard is an implicit
+  // legacy-stream dependency invalidating the capture, which surfaces as a
+  // DETECTED EndCapture error below and falls back to plain enqueue.
   static std::mutex bake_mu;
   std::lock_guard<std::mutex> lock(bake_mu);
 
@@ -54,8 +64,13 @@ int TrtEngine::bake_graph(int profile_idx, const nvinfer1::Dims &dims,
   if (!ctx)
     return -1;
   if (profile_idx != 0) {
-    ctx->setOptimizationProfileAsync(profile_idx, stream);
-    cudaStreamSynchronize(stream);
+    // A failed profile switch must not bake a graph bound to the wrong
+    // profile — that would silently serve wrong-shape inference forever.
+    if (!ctx->setOptimizationProfileAsync(profile_idx, stream) ||
+        cudaStreamSynchronize(stream) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return -1;
+    }
   }
   ctx->setTensorAddress(input_name_.c_str(), input);
   ctx->setTensorAddress(output_name_.c_str(), output);
@@ -80,9 +95,10 @@ int TrtEngine::bake_graph(int profile_idx, const nvinfer1::Dims &dims,
     return -1;
   };
 
-  // Two real executions then a synced capture — the trtexec recipe. Myelin
-  // finalizes per-context device state during the first runs; capturing any
-  // earlier records a graph bound to unfinalized state.
+  // Two real executions then a synced capture. TRT's documented contract is
+  // "at least one enqueue before capturing" (the first phase flushes deferred
+  // shape/profile updates and is not capturable); trtexec does exactly one,
+  // two is a strict superset kept for Myelin state finalization headroom.
   for (int k = 0; k < 2; ++k)
     if (!ctx->enqueueV3(stream))
       return fail();
@@ -228,9 +244,17 @@ void TrtEngine::select_profile(int profile_idx, cudaStream_t stream) {
   // Invalidate cached dims — new profile requires setInputShape again
   last_input_dims_ = {};
 
-  // Re-bind I/O addresses for the new profile (TRT clears them on profile switch)
+  // Conservatively re-bind ALL tensor addresses after a profile switch. NVIDIA
+  // does not document whether addresses survive one (shapes are profile-scoped
+  // and must be re-set; addresses appear context-level), and a stale address on
+  // a multi-input model would mean garbage reads or faults with no error from
+  // allInputDimensionsSpecified (which guards SHAPES, not addresses). Re-binding
+  // is a few setTensorAddress calls — cheap insurance against undocumented
+  // behavior changing across TRT versions.
   if (bound_input_) context_->setTensorAddress(input_name_.c_str(), bound_input_);
   if (bound_output_) context_->setTensorAddress(output_name_.c_str(), bound_output_);
+  for (const auto &[name, ptr] : extra_addrs_)
+    if (ptr) context_->setTensorAddress(name.c_str(), ptr);
 }
 
 int TrtEngine::num_profiles() const noexcept {
@@ -247,6 +271,7 @@ void TrtEngine::set_tensor_address(const std::string &name, void *ptr) {
   if (!context_) [[unlikely]]
     return;
   context_->setTensorAddress(name.c_str(), ptr);
+  extra_addrs_[name] = ptr; // remembered so select_profile() can restore it
 }
 
 bool TrtEngine::set_input_shape(const std::string &name,

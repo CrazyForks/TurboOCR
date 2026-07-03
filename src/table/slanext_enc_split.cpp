@@ -72,6 +72,43 @@ inline void mv_oi(const float* __restrict__ x, const float* __restrict__ W,
 
 inline float sigmoidf(float z) { return 1.0f / (1.0f + std::exp(-z)); }
 
+// Fixed-shape decode workspaces, reused across table regions via a thread_local
+// instance: after the first infer() every buffer already holds its capacity, so
+// the steady-state host decode allocates nothing (kills the per-region heap
+// churn that plain locals incurred on every region). Only buffer LIFETIME
+// differs from the inline arithmetic below — the values written are identical,
+// so the token/bbox stream stays bit-faithful. Mirror of the CPU sibling's
+// DecodeScratch (slanext_host_decode.cpp) so the two paths stay in lockstep.
+// thread_local (not an instance member): the decode buffers are pure host
+// scratch, so a per-thread copy is race-free even if a pool ran infer()
+// concurrently, and it costs one steady-state instance per worker thread.
+struct DecodeScratch {
+  using S = SlanextEncSplit;
+  std::vector<float> bHp;  // [kTenc, kHidden] = feat @ lin0 (attention keys)
+  std::vector<float> h, hp, a, ctx, gin, ghn, s1, st, l1, l8;
+  std::vector<float> logits;  // [steps, kVocab] RAW structure logits
+  std::vector<float> locs;    // [steps, kLoc]
+  std::vector<float> probs;   // [steps, kVocab] softmax of logits
+
+  void prepare() {
+    bHp.resize(static_cast<std::size_t>(S::kTenc) * S::kHidden);
+    h.assign(S::kHidden, 0.0f);  // GRU hidden state starts at zero each call
+    hp.resize(S::kHidden);
+    a.resize(S::kTenc);
+    ctx.resize(S::kCtx);
+    gin.resize(3 * S::kHidden);
+    ghn.resize(3 * S::kHidden);
+    s1.resize(S::kHidden);
+    st.resize(S::kVocab);
+    l1.resize(S::kHidden);
+    l8.resize(S::kLoc);
+    logits.clear();  // keeps capacity; the reserves below are no-ops after call 1
+    locs.clear();
+    logits.reserve(static_cast<std::size_t>(S::kMaxTokens) * S::kVocab);
+    locs.reserve(static_cast<std::size_t>(S::kMaxTokens) * S::kLoc);
+  }
+};
+
 }  // namespace
 
 SlanextEncSplit::~SlanextEncSplit() noexcept {
@@ -197,20 +234,29 @@ StructureResult SlanextEncSplit::infer(const GpuImage& page, const Box& region,
   const float* feat = h_feat_.get();  // [T_enc=256, C=96] row-major
   const int eos = static_cast<int>(dict_.eos_idx());
 
+  // Reused-across-regions scratch (steady-state zero-alloc); only lifetimes
+  // differ from plain locals, the written values are identical.
+  thread_local DecodeScratch scr;
+  scr.prepare();
+  auto& bHp = scr.bHp;
+  auto& h = scr.h;
+  auto& hp = scr.hp;
+  auto& a = scr.a;
+  auto& ctx = scr.ctx;
+  auto& gin = scr.gin;
+  auto& ghn = scr.ghn;
+  auto& s1 = scr.s1;
+  auto& st = scr.st;
+  auto& l1 = scr.l1;
+  auto& l8 = scr.l8;
+  auto& logits = scr.logits;  // [T,50] RAW structure logits (softmaxed post-loop)
+  auto& locs = scr.locs;      // [T,8]
+
   // bHp[T_enc][hidden] = feat @ linear_0 (i2h, 96->256, no bias)
-  std::vector<float> bHp(static_cast<std::size_t>(kTenc) * kHidden);
   for (int i = 0; i < kTenc; ++i)
     mv_io(feat + static_cast<std::size_t>(i) * kCtx, lin0_.data(), kCtx, kHidden,
           nullptr, bHp.data() + static_cast<std::size_t>(i) * kHidden);
 
-  std::vector<float> logits;  // [T,50] RAW structure logits (softmaxed post-loop)
-  std::vector<float> locs;    // [T,8]
-  logits.reserve(static_cast<std::size_t>(kMaxTokens) * kVocab);
-  locs.reserve(static_cast<std::size_t>(kMaxTokens) * kLoc);
-
-  std::vector<float> h(kHidden, 0.0f), hp(kHidden), a(kTenc), ctx(kCtx),
-      gin(3 * kHidden), ghn(3 * kHidden), s1(kHidden), st(kVocab), l1(kHidden),
-      l8(kLoc);
   constexpr int kGruIn = kCtx + kVocab;  // GRU input width (ctx + onehot)
   // Degenerate-decode guard: cap how many times one structure token may repeat
   // back-to-back. Legit runs (a wide row of <td></td>) top out near max table
@@ -289,7 +335,8 @@ StructureResult SlanextEncSplit::infer(const GpuImage& page, const Box& region,
 
   // Softmax the stored logits once (off the per-step critical path) so
   // decode_structure keeps an identical per-token confidence score.
-  std::vector<float> probs(logits.size());
+  auto& probs = scr.probs;
+  probs.resize(logits.size());
   for (int t = 0; t < steps; ++t) {
     const float* lr = logits.data() + static_cast<std::size_t>(t) * kVocab;
     float* pr = probs.data() + static_cast<std::size_t>(t) * kVocab;

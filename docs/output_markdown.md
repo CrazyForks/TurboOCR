@@ -1,6 +1,6 @@
 # Faithful Markdown export
 
-Native, in-process Markdown serializer for a parsed page — the SOTA-faithful
+Native, in-process Markdown serializer for a parsed page — the faithful
 counterpart of PP-StructureV3 `save_to_markdown` / MinerU / Marker / docling.
 Markdown is the primary export format (the HTML page-view already exists
 separately).

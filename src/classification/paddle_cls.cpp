@@ -64,6 +64,11 @@ void PaddleCls::run(const GpuImage &img, std::vector<Box> &boxes,
     CUDA_CHECK(cudaMemcpyAsync(d_crop_widths_.get(), h_crop_widths_.get(), cur_batch * sizeof(int),
                                 cudaMemcpyHostToDevice, stream));
 
+    // MEASURED: the shipped textline-ori ONNX scores higher with rec's
+    // (x/255-0.5)/0.5 (85.37% FUNSD) than with ImageNet mean/std (85.30%), so the
+    // "should be ImageNet" review claim does NOT hold for this exported model.
+    // Uses the default (rec) normalization. (Warp kernel is now parameterized for
+    // per-stage norm if a future model needs it.)
     turbo_ocr::kernels::cuda_batch_roi_warp(img, d_M_invs_.get(), d_crop_widths_.get(),
                                      d_batch_input_.get(), cur_batch, kClsImageH,
                                      kClsImageW, stream);

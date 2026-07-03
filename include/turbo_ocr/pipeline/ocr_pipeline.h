@@ -27,6 +27,14 @@ namespace turbo_ocr::formula { class IFormulaRecognizer; }
 
 namespace turbo_ocr::pipeline {
 
+// THREADING CONTRACT (was undocumented): ONE OcrPipeline instance is driven by
+// exactly ONE thread at a time. The double-buffered upload (cur_img_buf_,
+// h_pinned_buf_), the per-modality streams/events, and the grow-only device
+// buffers are all unsynchronized instance state — concurrency is achieved by a
+// POOL of instances (one per worker thread), never by sharing one instance
+// across threads. Driving a single instance from two threads torns cur_img_buf_
+// and corrupts device memory. `in_use_` below is a debug reentrancy tripwire that
+// aborts loudly on a contended entry instead of corrupting silently.
 class OcrPipeline : public IOcrPipeline {
 public:
   OcrPipeline();
@@ -324,6 +332,20 @@ private:
   // Set by dispatch_router_ on a recoverable CUDA fault in the table/formula
   // stage; consumed by the dispatcher worker to trigger an entry rebuild.
   std::atomic<bool> recycle_requested_{false};
+  // Debug reentrancy tripwire for the single-thread-per-instance contract above.
+  std::atomic<int> in_use_{0};
+  // RAII tripwire scope: aborts loudly on contended entry (ctor out-of-line to
+  // keep <iostream> out of this header). Acquired once per EXTERNAL call at the
+  // real entry bodies only — pure-delegation wrappers (run -> run_with_layout,
+  // run_batch -> run_batch_with_layout -> n==1 run_with_layout) must NOT
+  // acquire it or the nested self-call would trip its own guard.
+  struct UseGuard {
+    std::atomic<int> &c;
+    UseGuard(std::atomic<int> &counter, const char *entry);
+    ~UseGuard() { c.fetch_sub(1, std::memory_order_release); }
+    UseGuard(const UseGuard &) = delete;
+    UseGuard &operator=(const UseGuard &) = delete;
+  };
 
   // Lazily create the table/formula stream + done-event on first use. The
   // pipeline owns and destroys these CUDA resources; the recognizer-registry

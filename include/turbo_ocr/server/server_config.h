@@ -367,6 +367,19 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
   // model's max_side_limit (1280) with DET_LIMIT_*/DET_MAX_SIDE_LIMIT overrides
   // folded in, then DET_MAX_SIDE winning, clamped to [32, 4096].
   (void)env_int_strict("DET_MAX_SIDE", 1280, 32, 4096, c.errors);
+  // Validate the rest of the detection-knob family the same way: these are
+  // consumed leniently in det_config.h/paddle_det.cpp (shared with CLI/tools),
+  // so the server is where a typo must fail fast instead of silently zeroing
+  // a threshold or thumbnailing every image (the GitHub #23 failure class).
+  (void)env_choice_strict("DET_LIMIT_TYPE", "min", {"min", "max"}, c.errors);
+  (void)env_int_strict("DET_LIMIT_SIDE_LEN", 64, 32, 4096, c.errors);
+  (void)env_int_strict("DET_MAX_SIDE_LIMIT", 1280, 32, 4096, c.errors);
+  (void)env_float_strict("DET_DB_THRESH", 0.2f, 0.001f, 1.0f, c.errors);
+  (void)env_float_strict("DET_BOX_THRESH", 0.45f, 0.001f, 1.0f, c.errors);
+  (void)env_float_strict("DET_UNCLIP", 1.4f, 0.1f, 10.0f, c.errors);
+  (void)env_int_strict("GPU_CCL", 1, 0, 2, c.errors);
+  (void)env_float_strict("GPU_BOX_THRESH", 0.45f, 0.001f, 1.0f, c.errors);
+  (void)env_float_strict("GPU_UNCLIP_SCALE", 1.0f, 0.1f, 10.0f, c.errors);
   c.det_max_side = detection::effective_det_max_side(detection::read_det_resize(c.det_cfg.resize));
   c.trt_opt_level      = env_int_strict("TRT_OPT_LEVEL", 5,     0,  5,     c.errors);
   c.trt_engine_cache   = env_or("TRT_ENGINE_CACHE", "");

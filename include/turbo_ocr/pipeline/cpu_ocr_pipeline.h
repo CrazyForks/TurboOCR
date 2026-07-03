@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <vector>
 
@@ -72,6 +73,13 @@ private:
   // is set AND its backend is loaded AND a matching layout region exists.
   void run_structure_stages(const cv::Mat &img, OcrPipelineResult &out,
                             bool want_tables, bool want_formulas);
+
+  // Core det -> sort -> (cls) -> rec -> combine, shared by run() and
+  // run_with_layout(). Reports the detected box count via `num_boxes` so the
+  // caller can apply the no-silent-failure text_degraded guard (parity with the
+  // GPU pipeline's detail::flag_text_degraded). Public run() discards the count.
+  [[nodiscard]] std::vector<OCRResultItem> run_core_(const cv::Mat &img,
+                                                     std::size_t &num_boxes);
 
   std::unique_ptr<detection::CpuPaddleDet> det_;
   std::unique_ptr<classification::CpuPaddleCls> cls_;

@@ -1,6 +1,7 @@
 #include "infer_one.h"
 
 #include <functional>
+#include <iostream>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -13,6 +14,42 @@
 
 namespace turbo_ocr::pipeline {
 
+namespace {
+
+// Resolve the recognizer for one /infer region, uniformly for either modality:
+//   - inline_spec != nullptr -> build a TRANSIENT backend from the spec and load
+//     it HERE (on the worker thread, so any TRT build binds to this CUDA
+//     context). Ownership stays in `owner`, kept alive for the caller's run();
+//     `backend_name` is ignored. A null from the factory (unknown engine) or a
+//     failed load surfaces as unavailable below — never dereferenced.
+//   - inline_spec == nullptr -> borrow the NAMED registry backend (route default
+//     when `backend_name` is empty); not owned.
+// Throws BackendUnavailableError (identical message to the per-modality callers)
+// when the resolved backend is null or not ready, so a mis-routed request fails
+// loud rather than silently producing nothing. Any factory exception (e.g. an
+// invalid engine for the modality) propagates unchanged.
+template <class Rec, class MakeInline, class LoadInline, class PickNamed>
+Rec *resolve_recognizer(const routing::BackendSpec *inline_spec,
+                        const std::string &backend_name,
+                        const std::string &modality,
+                        std::unique_ptr<Rec> &owner, const MakeInline &make,
+                        const LoadInline &load, const PickNamed &pick) {
+  Rec *rec = nullptr;
+  if (inline_spec) {
+    owner = make(*inline_spec);
+    if (owner && load(*owner)) rec = owner.get();
+  } else {
+    rec = pick(backend_name);
+  }
+  if (!rec || !rec->is_ready())
+    throw turbo_ocr::BackendUnavailableError(
+        modality + " backend '" + (inline_spec ? "<inline>" : backend_name) +
+        "' is unavailable (not loaded/ready)");
+  return rec;
+}
+
+}  // namespace
+
 std::string infer_one_region(
     const GpuImage &gpu_img, int img_w, int img_h, cudaStream_t stream,
     const std::string &modality, const std::string &backend_name,
@@ -23,46 +60,42 @@ std::string infer_one_region(
         &pick_formula) {
   using turbo_ocr::Box;
 
-  Box full{};  // tl, tr, br, bl over the whole crop
-  full[0] = {0, 0};        full[1] = {img_w, 0};
-  full[2] = {img_w, img_h}; full[3] = {0, img_h};
-  std::vector<Box> regions{ full };
+  // The whole crop is the single region: corners [tl, tr, br, bl].
+  const std::vector<Box> regions{
+      Box{{{{0, 0}, {img_w, 0}, {img_w, img_h}, {0, img_h}}}}};
 
   if (modality == "table") {
-    // Transient inline backend (built + loaded here, on the worker thread/
-    // context) or the named registry backend.
     std::unique_ptr<table::ITableRecognizer> transient;
-    table::ITableRecognizer *rec = nullptr;
-    if (inline_spec) {
-      transient = table::make_table_recognizer(*inline_spec);  // nullptr on unknown engine -> handled as unavailable below
-      if (transient && transient->load()) rec = transient.get();
-    } else {
-      rec = pick_table(backend_name);
-    }
-    if (!rec || !rec->is_ready())
-      throw turbo_ocr::BackendUnavailableError(
-          modality + " backend '" + (inline_spec ? "<inline>" : backend_name) +
-          "' is unavailable (not loaded/ready)");
+    auto *const rec = resolve_recognizer<table::ITableRecognizer>(
+        inline_spec, backend_name, modality, transient,
+        [](const routing::BackendSpec &s) {
+          return table::make_table_recognizer(s);
+        },
+        [](table::ITableRecognizer &r) { return r.load(); }, pick_table);
     cudaStreamSynchronize(stream);
     auto r = rec->run(gpu_img, regions, /*page_ocr=*/{}, stream);
     return r.empty() ? std::string() : std::move(r[0].html);
   }
   if (modality == "formula") {
     std::unique_ptr<formula::IFormulaRecognizer> transient;
-    formula::IFormulaRecognizer *rec = nullptr;
-    if (inline_spec) {
-      transient = formula::make_formula_recognizer(*inline_spec);  // nullptr on unknown engine -> handled as unavailable below
-      if (transient && transient->load_model_dir(inline_spec->model_path) &&
-          transient->load_tokenizer("")) rec = transient.get();
-    } else {
-      rec = pick_formula(backend_name);
-    }
-    if (!rec || !rec->is_ready())
-      throw turbo_ocr::BackendUnavailableError(
-          modality + " backend '" + (inline_spec ? "<inline>" : backend_name) +
-          "' is unavailable (not loaded/ready)");
+    auto *const rec = resolve_recognizer<formula::IFormulaRecognizer>(
+        inline_spec, backend_name, modality, transient,
+        [](const routing::BackendSpec &s) {
+          return formula::make_formula_recognizer(s);
+        },
+        [inline_spec](formula::IFormulaRecognizer &r) {
+          return r.load_model_dir(inline_spec->model_path) &&
+                 r.load_tokenizer("");
+        },
+        pick_formula);
     cudaStreamSynchronize(stream);
     auto r = rec->run(gpu_img, regions, stream);
+    if (!r.empty() && !r[0].ok)
+      // Degraded (transport/timeout), not a legitimately-empty formula. /infer
+      // returns bare LaTeX, so at least log it (no-silent-failure) rather than let
+      // a VLM timeout look identical to an empty input.
+      std::cerr << "[infer_one] formula backend degraded for /infer region "
+                   "(transport/parse failure, not empty input)\n";
     return r.empty() ? std::string() : std::move(r[0].latex);
   }
   return "";

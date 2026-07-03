@@ -87,6 +87,19 @@ public:
   [[nodiscard]] virtual bool is_ready() const noexcept = 0;
 
   [[nodiscard]] virtual std::string_view backend_name() const noexcept = 0;
+
+  // Optional per-page routing hint set by the pipeline right before run().
+  // `page_has_cjk` is true when the page's recognized TEXT contains CJK — a
+  // signal that a composite backend should route this page's formulas to a
+  // Chinese-capable model even when a given crop is pure math. Default no-op;
+  // only the auto composite consumes it.
+  virtual void set_context_hint(bool /*page_has_cjk*/) noexcept {}
+
+  // True only for backends that actually consume set_context_hint(). The
+  // pipeline skips its O(page-text) CJK scan for every backend that returns
+  // false (all single-model engines), so the hint is computed only when it can
+  // change routing. Only the auto composite overrides this.
+  [[nodiscard]] virtual bool wants_context_hint() const noexcept { return false; }
 };
 
 // Factory. `backend` is the key used to select the implementation

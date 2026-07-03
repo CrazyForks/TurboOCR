@@ -1,17 +1,15 @@
 build/
 build_cpu/
-.git/
-.claude/
+# No dot-prefixed file or dir is ever COPYed by either Dockerfile; excluding
+# them wholesale keeps editor/VCS/tooling state out of the build context.
+.*
 __pycache__/
-.pytest_cache/
 *.pyc
-.DS_Store
 bench_docs/
 test_images/
 tests/test_data/
 benchmark/data/
 benchmark/results/
-.venv*/
 # Models are fetched from the GitHub Release at build time (RUN
 # fetch_release_models.sh) — neither Dockerfile COPYs models/, so excluding the
 # whole tree just keeps the build context small (no GB of unused .onnx shipped).
@@ -20,7 +18,6 @@ models/
 *.trt
 LICENSE
 README.md
-.clang-format
 tests/benchmark/
 tests/integration/
 tests/regression/
@@ -29,8 +26,6 @@ tests/fixtures/
 # Local artifacts never COPYed by docker/Dockerfile.{gpu,cpu} (models are fetched
 # at build time, not copied). Excluding them keeps the build context lean.
 models.bak/
-.trt_cache/
-.trt_cache.bak/
 model.cache
 model.cache.bak
 build-cpu/
@@ -39,3 +34,5 @@ predeploy/
 sdk/
 uploads/
 custom_models/
+webui/
+build-coverage/

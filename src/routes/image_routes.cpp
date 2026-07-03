@@ -207,9 +207,12 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
                                                      /*defer_external=*/true,
                                                      opts.want_tables,
                                                      opts.want_formulas);
-                } catch (const std::exception &) {
-                  // GPU fast path failed (e.g. layout/pipeline error); fall
-                  // through to the CPU decode + standard path below.
+                } catch (const std::exception &ex) {
+                  // Don't silently re-run the whole request on CPU (~2x work
+                  // invisibly): rate-limited log so a persistent GPU-path fault
+                  // is visible. Falls through to CPU decode + standard path below.
+                  TOCR_LOG_ERROR_RL("nvJPEG GPU fast-path failed; CPU fallback",
+                                    "error", ex.what());
                 }
               }
             }

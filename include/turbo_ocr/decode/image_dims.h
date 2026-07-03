@@ -14,7 +14,7 @@
 // "decompression bomb" before the decoder allocates anything, we parse the
 // width/height directly from the file header.
 //
-// This is the SOTA pattern used by every public image API (AWS Rekognition,
+// This is the standard pattern used by every public image API (AWS Rekognition,
 // Google Vision, Cloudinary, ImageMagick MAGICK_AREA_LIMIT). We sniff every
 // *compressible* container (PNG, JPEG, WebP, TIFF, GIF) so the aggregate
 // batch-pixel budget can bound a batch of decompression bombs before any are

@@ -1,3 +1,4 @@
+#include <iostream>
 #include "turbo_ocr/pipeline/ocr_pipeline.h"
 #include <unordered_map>
 #include "infer_one.h"
@@ -101,8 +102,12 @@ bool OcrPipeline::init(const std::string &det_model,
 
   // Pre-allocate double-buffered GPU upload buffers for a typical image
   // (1920x1080). Grow-only: reused for smaller images, reallocated only if a
-  // larger image arrives. Two buffers allow recognition on rec_stream_ to read
-  // the previous image while the next image is uploaded on the caller's stream.
+  // larger image arrives. Two device buffers let recognition on rec_stream_
+  // read the previous image while the next uploads on the caller's stream —
+  // NOTE: today that overlap is mostly latent, because upload_image host-waits
+  // on the LATEST rec_event_ and stages through ONE shared pinned buffer; a
+  // pinned ring matched to img_bufs_ (waiting only on the OLDER buffer's rec)
+  // is the known follow-up that would realize it.
   constexpr int kDefaultRows = 1080;
   constexpr int kDefaultCols = 1920;
   for (auto &buf : img_bufs_) {
@@ -258,19 +263,30 @@ void OcrPipeline::warmup_gpu(cudaStream_t stream) {
     // Create a white dummy image wide enough for this bucket
     cv::Mat dummy_wide(48, w, CV_8UC3, cv::Scalar(255, 255, 255));
 
-    // Upload to GPU (reuses the grow-only buffer)
+    // Upload to GPU (reuses the grow-only buffer). Grow BOTH dims to the max
+    // of current and needed: sizing to the dummy alone (48 rows x 4000 cols)
+    // would SHRINK the row cap and force a realloc on the first real page
+    // after warmup — a grow-only violation.
     if (dummy_wide.rows > buf.cap_rows || dummy_wide.cols > buf.cap_cols) {
+      const int want_rows = std::max(buf.cap_rows, dummy_wide.rows);
+      const int want_cols = std::max(buf.cap_cols, dummy_wide.cols);
       cudaFree(buf.d_buf);
       buf.d_buf = nullptr;
+      // Zero the cap BEFORE the alloc (matches upload_image/ensure_gpu_buf): an
+      // OOM throw must leave {nullptr, cap 0}, never a null buffer with a stale
+      // non-zero cap that a later request would skip re-allocating.
+      buf.cap_rows = 0;
+      buf.cap_cols = 0;
       CUDA_CHECK(cudaMallocPitch(&buf.d_buf, &buf.pitch,
-                                  dummy_wide.cols * 3, dummy_wide.rows));
-      buf.cap_rows = dummy_wide.rows;
-      buf.cap_cols = dummy_wide.cols;
+                                  static_cast<size_t>(want_cols) * 3, want_rows));
+      buf.cap_rows = want_rows;
+      buf.cap_cols = want_cols;
     }
     auto needed = static_cast<size_t>(dummy_wide.rows) * dummy_wide.step;
     if (needed > h_pinned_size_) {
       cudaFreeHost(h_pinned_buf_);
       h_pinned_buf_ = nullptr;
+      h_pinned_size_ = 0;  // zero before alloc — see cap reset above
       // Upload-only pinned buffer: CPU writes (memcpy) once and the GPU DMAs
       // it. Write-combined uncached memory is ~10-15% faster for this access
       // pattern (no read-back from CPU).
@@ -300,6 +316,12 @@ void OcrPipeline::warmup_gpu(cudaStream_t stream) {
 
 GpuImage OcrPipeline::upload_image(const cv::Mat &img, cudaStream_t stream,
                                    PipelineTimer &timer) {
+  // LOAD-BEARING INVARIANT: reusing h_pinned_buf_ below is safe only because
+  // rec_event_ is recorded AFTER rec_->run() returns (ocr_pipeline_run.cpp),
+  // and rec_->run() itself synchronizes past the crop kernels that consume
+  // this buffer's H2D DMA. If rec ever becomes fully async with the event
+  // recorded at issue time (not consumption), the memcpy below could clobber
+  // the pinned source mid-DMA — torn image, silent garbage recognition.
   CUDA_CHECK(cudaEventSynchronize(rec_event_));
   cur_img_buf_ ^= 1;
   auto &buf = img_bufs_[cur_img_buf_];
@@ -378,10 +400,23 @@ OcrPipeline::pick_formula_recognizer_(const std::string &name) const {
   return formula_;  // route default (may be nullptr if formulas disabled)
 }
 
+OcrPipeline::UseGuard::UseGuard(std::atomic<int> &counter, const char *entry)
+    : c(counter) {
+  // Two threads driving one instance = torn buffers / device corruption.
+  // Abort loudly rather than corrupt silently (single-thread contract).
+  if (c.fetch_add(1, std::memory_order_acq_rel) != 0) {
+    std::cerr << "[OcrPipeline] FATAL: concurrent use of one pipeline instance ("
+              << entry << ") — it is single-thread-per-instance; use a "
+                          "pipeline pool\n";
+    std::abort();
+  }
+}
+
 std::string OcrPipeline::infer_one(const cv::Mat &img, cudaStream_t stream,
                                    const std::string &modality,
                                    const std::string &backend_name,
                                    const routing::BackendSpec *inline_spec) {
+  UseGuard _ug{in_use_, "infer_one"};
   if (img.empty()) return "";
   // Upload the crop once; the whole image is the single region.
   PipelineTimer timer;

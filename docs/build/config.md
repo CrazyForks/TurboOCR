@@ -100,7 +100,7 @@ the `*_ONNX` overrides below are only needed for a non-default location.
 |---|---|---|
 | `TABLE_BACKEND` | *(unset)* | `slanext` enables SLANet-Plus table → HTML; auto-resolves the baked encoder. (`vlm` routes to a VL endpoint.) |
 | `TABLE_SLANEXT_ENCODER_ONNX` | `models/table/slanext_encoder/SLANeXt_wired_encoder.onnx` | Override the table encoder path; decoder `.bin` + dict are derived next to it. |
-| `FORMULA_BACKEND` | *(unset)* | `ppformulanet_s` (English/Latin, default engine) or `ppformulanet_plus_m` (Chinese-capable, GPU only) enables formula → LaTeX; auto-resolves the baked weights. |
+| `FORMULA_BACKEND` | *(unset)* | `ppformulanet_s` (English/Latin, default engine), `ppformulanet_plus_m` (Chinese-capable, GPU only), or `auto` (GPU only; runs -S then re-runs plus-M on CJK-context crops — EN pages keep -S speed, CJK pages get plus-M accuracy) enables formula → LaTeX; auto-resolves the baked weights. |
 | `FORMULA_ONNX` | `models/formula/<engine>` | Override the formula model dir/file. Only needed for a non-baked location. |
 | `FORMULA_TOKENIZER` | `models/formula/<engine>/tokenizer.json` | Override the formula tokenizer path. |
 
@@ -125,6 +125,7 @@ the `*_ONNX` overrides below are only needed for a non-default location.
 |---|---|---|
 | `TRT_OPT_LEVEL` | `5` | TensorRT builder optimization level. `0` = fastest build, `5` = fastest runtime (`3` builds ~3–5× faster with <5% runtime regression). Part of the engine cache key. Bounds `[0, 5]`. CLI: `--trt-opt-level`. |
 | `TRT_ENGINE_CACHE` | `~/.cache/turbo-ocr` | Directory for cached TensorRT engines (empty value resolves to the default). Mount it to share engines across restarts. CLI: `--trt-engine-cache`. |
+| `TURBO_OCR_CUDA_GRAPHS` | `1` (on) | Bake CUDA graphs for the recognition batch shapes at warmup. **Default changed to ON in v3.1.0**: +10–16% throughput and lower p50 latency (recognition is launch-bound), identical accuracy, at ~0.5 GiB extra VRAM per pipeline. Set `0` to opt out on VRAM-constrained cards (or lower `PIPELINE_POOL_SIZE`). |
 
 ## Performance / threading
 

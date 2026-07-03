@@ -459,7 +459,7 @@ void register_pdf_route(server::WorkPool &pool,
       pdf_buf->assign(pdf_ptr, pdf_len);
 
     server::submit_work(pool, std::move(callback),
-        [pdf_buf, req, &dispatcher, &pdf_renderer,
+        [pdf_buf, &dispatcher, &pdf_renderer, // req dropped: unused, kept the full request (raw body) resident alongside pdf_buf
          layout_enabled, want_reading_order, want_blocks, want_tables, want_formulas,
          dpi, req_mode, image_mode,
          encode_opts, max_pdf_pages, autorotate](server::DrogonCallback &cb) {

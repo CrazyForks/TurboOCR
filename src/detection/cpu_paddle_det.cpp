@@ -3,10 +3,7 @@
 #include "turbo_ocr/detection/det_postprocess.h"
 #include "turbo_ocr/common/stage_profiler.h"
 
-#include <algorithm>
-#include <cmath>
 #include <cstdlib>
-#include <cstring>
 #include <opencv2/imgproc.hpp>
 
 using namespace turbo_ocr;
@@ -41,9 +38,15 @@ bool CpuPaddleDet::load_model(const std::string &model_path,
 }
 
 std::vector<Box> CpuPaddleDet::run(const cv::Mat &img) {
-  int h = img.rows;
-  int w = img.cols;
-  auto [resize_h, resize_w] = compute_det_resize(h, w, resize_);
+  // Fail LOUD on an unexpected channel count. The split-into-planes preprocess
+  // below assumes BGR CV_8UC3 (callers expand grayscale upstream); a non-3-channel
+  // input would otherwise leave the r/g planes with stale bytes and normalize a
+  // silently-wrong tensor. The old memcpy path crashed here — keep the fail-loud
+  // contract rather than silently corrupt OCR.
+  CV_Assert(img.type() == CV_8UC3);
+  const int h = img.rows;
+  const int w = img.cols;
+  const auto [resize_h, resize_w] = compute_det_resize(h, w, resize_);
 
   const int plane_size = resize_h * resize_w;
   input_data_buf_.resize(3 * plane_size);
@@ -65,22 +68,29 @@ std::vector<Box> CpuPaddleDet::run(const cv::Mat &img) {
       bgr_[1].convertTo(g_plane, CV_32F, 1.0 / (255.0 * 0.224), -0.456 / 0.224);
       bgr_[0].convertTo(b_plane, CV_32F, 1.0 / (255.0 * 0.225), -0.406 / 0.225);
     } else {
-      // Default path (bit-identical to the original): convert, split, normalize
-      // per channel, pack RGB. resized_/float_img_ reused to avoid big allocs.
+      // Default path: same two-step normalize as the original (u8/255, then the
+      // folded (x-mean)/std convert), but cv::split writes straight into the
+      // NCHW buffer planes and the per-channel normalize runs in place -- no
+      // split temporaries, no MatExpr temporaries, no final memcpy. The output
+      // is byte-identical to the original convert/split/MatExpr/memcpy sequence
+      // (OpenCV folds `(x-mean)/std` into exactly this convertTo, verified).
       resized_.convertTo(float_img_, CV_32F, 1.0 / 255.0);
-      cv::Mat channels[3];
-      cv::split(float_img_, channels);
-      channels[0] = (channels[0] - 0.406f) / 0.225f; // B
-      channels[1] = (channels[1] - 0.456f) / 0.224f; // G
-      channels[2] = (channels[2] - 0.485f) / 0.229f; // R
+      cv::Mat r_plane(resize_h, resize_w, CV_32F, input_data_buf_.data());
+      cv::Mat g_plane(resize_h, resize_w, CV_32F,
+                      input_data_buf_.data() + plane_size);
+      cv::Mat b_plane(resize_h, resize_w, CV_32F,
+                      input_data_buf_.data() + 2 * plane_size);
 
-      // NCHW, RGB order (PaddleOCR convention)
-      std::memcpy(input_data_buf_.data(), channels[2].data,
-                  plane_size * sizeof(float));
-      std::memcpy(input_data_buf_.data() + plane_size, channels[1].data,
-                  plane_size * sizeof(float));
-      std::memcpy(input_data_buf_.data() + 2 * plane_size, channels[0].data,
-                  plane_size * sizeof(float));
+      // NCHW, RGB order (PaddleOCR convention): route the BGR split so
+      // ch0(B)->plane2, ch1(G)->plane1, ch2(R)->plane0.
+      cv::Mat planes[3] = {b_plane, g_plane, r_plane};
+      cv::split(float_img_, planes);
+
+      constexpr float kMeanB = 0.406f, kMeanG = 0.456f, kMeanR = 0.485f;
+      constexpr float kStdB = 0.225f, kStdG = 0.224f, kStdR = 0.229f;
+      b_plane.convertTo(b_plane, CV_32F, 1.0 / kStdB, -1.0 * kMeanB / kStdB);
+      g_plane.convertTo(g_plane, CV_32F, 1.0 / kStdG, -1.0 * kMeanG / kStdG);
+      r_plane.convertTo(r_plane, CV_32F, 1.0 / kStdR, -1.0 * kMeanR / kStdR);
     }
     input_shape_buf_ = {1, 3, static_cast<int64_t>(resize_h),
                         static_cast<int64_t>(resize_w)};

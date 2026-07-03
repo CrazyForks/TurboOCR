@@ -1,4 +1,4 @@
-"""60s soak on /ocr/pdf?mode=ocr at c=32. SOTA PDF throughput target."""
+"""60s soak on /ocr/pdf?mode=ocr at c=32."""
 
 import pytest
 

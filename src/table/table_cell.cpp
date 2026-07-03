@@ -1,6 +1,7 @@
 #include "turbo_ocr/table/table_cell.h"
 
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 
 #include "turbo_ocr/common/cuda_check.h"
@@ -102,6 +103,12 @@ bool TableCellDet::enqueue(const GpuImage& page,
                            int rect_x, int rect_y,
                            int rect_w, int rect_h,
                            cudaStream_t stream) {
+  // Cleared up front; only re-armed on full success (final step below).
+  // collect() treats a null pending_stream_ as "the last enqueue failed" and
+  // bails, rather than draining the stream and decoding a stale buffer left by
+  // a previous successful enqueue. Mirrors PaddleLayout's contract.
+  pending_stream_ = nullptr;
+
   if (!engine_) return false;
   if (rect_w <= 0 || rect_h <= 0) return false;
 
@@ -157,6 +164,13 @@ TableCellDet::collect(float score_threshold, float nms_iou) {
   std::vector<CellDetBox> out;
   if (!engine_ || !d2h_event_) return out;
 
+  // A null pending_stream_ means the matching enqueue() bailed (bad rect,
+  // execute() failure, ...). d2h_event_ would still hold a prior successful
+  // recording, so synchronizing on it and decoding h_out0_/d_out0_ here would
+  // silently serve the previous request's detections. Bail instead.
+  const cudaStream_t stream = pending_stream_;
+  if (!stream) return out;
+
   CUDA_CHECK(cudaEventSynchronize(d2h_event_));
 
   auto dims = engine_->tensor_shape(name_out0_);
@@ -166,8 +180,8 @@ TableCellDet::collect(float score_threshold, float nms_iou) {
 
   CUDA_CHECK(cudaMemcpyAsync(h_out0_.get(), d_out0_.get(),
                               sizeof(float) * static_cast<std::size_t>(n_rows) * 6,
-                              cudaMemcpyDeviceToHost, pending_stream_));
-  CUDA_CHECK(cudaStreamSynchronize(pending_stream_));
+                              cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
 
   const int rx = pending_rect_x_;
   const int ry = pending_rect_y_;
@@ -186,10 +200,12 @@ TableCellDet::collect(float score_threshold, float nms_iou) {
     // Sub-rect-local coords from the model (rt-detr postproc projects with
     // scale_factor → coords are in pixels of the input image, which is the
     // sub-rect at its native size).
-    int x0 = static_cast<int>(row[2]);
-    int y0 = static_cast<int>(row[3]);
-    int x1 = static_cast<int>(row[4]);
-    int y1 = static_cast<int>(row[5]);
+    // std::lround, not truncation-toward-zero: static_cast<int> bakes a ~1px
+    // downward bias into every cell box that can flip borderline cell<->OCR IoU.
+    int x0 = static_cast<int>(std::lround(row[2]));
+    int y0 = static_cast<int>(std::lround(row[3]));
+    int x1 = static_cast<int>(std::lround(row[4]));
+    int y1 = static_cast<int>(std::lround(row[5]));
     if (x1 <= x0 || y1 <= y0) continue;
 
     // Clamp to sub-rect bounds before projecting.
@@ -215,7 +231,19 @@ TableCellDet::collect(float score_threshold, float nms_iou) {
               return a.score > b.score;
             });
 
-  auto box_iou = [](const CellDetBox& a, const CellDetBox& b) -> float {
+  // Precompute each box's area once. The PaddleX (x2-x1+1)*(y2-y1+1) area is a
+  // property of a single box, so recomputing it per candidate pair inside the
+  // O(n^2) loop is pure redundancy; hoisting it is byte-identical (same
+  // operands, same float rounding) and cuts area work from O(n^2) to O(n).
+  std::vector<float> area(kept.size());
+  for (std::size_t i = 0; i < kept.size(); ++i) {
+    const auto& b = kept[i].aabb;
+    area[i] = static_cast<float>(b[2] - b[0] + 1) *
+              static_cast<float>(b[3] - b[1] + 1);
+  }
+
+  const auto box_iou = [](const CellDetBox& a, const CellDetBox& b,
+                          float area_a, float area_b) -> float {
     const int ix1 = std::max(a.aabb[0], b.aabb[0]);
     const int iy1 = std::max(a.aabb[1], b.aabb[1]);
     const int ix2 = std::min(a.aabb[2], b.aabb[2]);
@@ -223,17 +251,13 @@ TableCellDet::collect(float score_threshold, float nms_iou) {
     const int iw = std::max(0, ix2 - ix1 + 1);
     const int ih = std::max(0, iy2 - iy1 + 1);
     const float inter = static_cast<float>(iw) * static_cast<float>(ih);
-    const float area_a =
-        static_cast<float>(a.aabb[2] - a.aabb[0] + 1) *
-        static_cast<float>(a.aabb[3] - a.aabb[1] + 1);
-    const float area_b =
-        static_cast<float>(b.aabb[2] - b.aabb[0] + 1) *
-        static_cast<float>(b.aabb[3] - b.aabb[1] + 1);
     const float uni = area_a + area_b - inter;
     return uni > 0.0f ? inter / uni : 0.0f;
   };
 
-  std::vector<bool> suppressed(kept.size(), false);
+  // char, not vector<bool>: avoids the bit-proxy indexing overhead; identical
+  // semantics.
+  std::vector<char> suppressed(kept.size(), 0);
   out.reserve(kept.size());
   for (std::size_t i = 0; i < kept.size(); ++i) {
     if (suppressed[i]) continue;
@@ -241,7 +265,9 @@ TableCellDet::collect(float score_threshold, float nms_iou) {
     for (std::size_t j = i + 1; j < kept.size(); ++j) {
       if (suppressed[j]) continue;
       if (kept[i].cls != kept[j].cls) continue;
-      if (box_iou(kept[i], kept[j]) > nms_iou) suppressed[j] = true;
+      if (box_iou(kept[i], kept[j], area[i], area[j]) > nms_iou) {
+        suppressed[j] = 1;
+      }
     }
   }
 

@@ -9,6 +9,7 @@
 #include "turbo_ocr/common/timing.h"
 #include "turbo_ocr/decode/gpu_image.h"
 #include "turbo_ocr/common/serialization.h"
+#include "turbo_ocr/formula/auto_cjk_formula.h"
 #include "turbo_ocr/formula/formula_recognizer.h"
 #include "turbo_ocr/layout/reading_order.h"
 #include "turbo_ocr/router/cua_router.h"
@@ -129,12 +130,18 @@ void OcrPipeline::dispatch_router_(OcrPipelineResult &out,
         out.tables[i].layout_id = tlids[i];
         if (out.tables[i].html.empty()) ++degraded_tables;  // decode produced nothing
       }
+      // Backend under-return: regions past out.tables.size() got NO result at
+      // all — count them too, or a short return is a silent drop (the async
+      // table path and the sync formula path already guard exactly this).
+      if (out.tables.size() < tlids.size())
+        degraded_tables += tlids.size() - out.tables.size();
       if (degraded_tables > 0) {
         out.table_degraded = true;
         out.table_warning =
             "table stage degraded: " + std::to_string(degraded_tables) + " of " +
-            std::to_string(out.tables.size()) +
-            " region(s) produced no HTML (structure decode failed, not empty input)";
+            std::to_string(tlids.size()) +
+            " region(s) produced no HTML (structure decode failed or backend "
+            "under-returned, not empty input)";
       }
     }
     timer.gpu_stop();
@@ -146,6 +153,25 @@ void OcrPipeline::dispatch_router_(OcrPipelineResult &out,
   // before dispatch so gpu_img is safe to read.
   if (has_formula) {
     CUDA_CHECK(cudaStreamWaitEvent(formula_stream_, det_only_event_, 0));
+
+    // Per-page routing hint for a composite (auto) formula backend: is the
+    // page's recognized TEXT substantially CJK? A CJK page routes all its
+    // formulas to the Chinese-capable model. THRESHOLDED (>=3 CJK chars AND
+    // >=1% of text) so a single stray CJK glyph from an OCR misrecognition on a
+    // math-heavy EN page does NOT escalate the whole page — measured: EN
+    // false-positives have 1 CJK in ~1700 chars (0.06%), real Chinese pages
+    // 23-88%. Gated on wants_context_hint(): single-model backends discard the
+    // hint, so we skip the O(page-text) scan for them entirely.
+    if (formula_rec->wants_context_hint()) {
+      int cjk = 0, total = 0;
+      for (const auto &r : out.results) {
+        const auto st = formula::cjk_stats(r.text);
+        cjk += st.cjk;
+        total += st.total;
+      }
+      const bool page_has_cjk = cjk >= 3 && total > 0 && cjk * 100 >= total;
+      formula_rec->set_context_hint(page_has_cjk);
+    }
 
     std::vector<Box> fboxes;
     std::vector<int> flids;
@@ -244,6 +270,7 @@ OcrPipelineResult OcrPipeline::run_with_layout(const cv::Mat &img,
                                                bool defer_external,
                                                bool want_tables,
                                                bool want_formulas) {
+  UseGuard _ug{in_use_, "run_with_layout"};
   const bool layout_active = use_layout_ && want_layout;
   if (img.empty()) [[unlikely]] return OcrPipelineResult{};
 
@@ -407,6 +434,7 @@ OcrPipelineResult OcrPipeline::run_with_layout(const cv::Mat &img,
 
 OcrPipelineResult OcrPipeline::run_layout_only(const cv::Mat &img,
                                                 cudaStream_t stream) {
+  UseGuard _ug{in_use_, "run_layout_only"};
   OcrPipelineResult out;
   // Fast no-op if layout isn't loaded: skip the upload entirely. Callers
   // in /ocr/pdf geometric/auto modes never need OCR text here — they fill
@@ -455,6 +483,7 @@ OcrPipelineResult OcrPipeline::run_with_layout(GpuImage gpu_img,
                                                bool defer_external,
                                                bool want_tables,
                                                bool want_formulas) {
+  UseGuard _ug{in_use_, "run_with_layout(GpuImage)"};
   const bool layout_active = use_layout_ && want_layout;
   PipelineTimer timer;
   timer.init(stream);
@@ -590,6 +619,10 @@ std::vector<OcrPipelineResult> OcrPipeline::run_batch_with_layout(
                                      want_tables, want_formulas));
     return single;
   }
+
+  // Guard AFTER the n==1 delegation above — run_with_layout self-guards, and a
+  // guard here would trip on that nested call.
+  UseGuard _ug{in_use_, "run_batch_with_layout"};
 
   const int n = static_cast<int>(imgs.size());
 

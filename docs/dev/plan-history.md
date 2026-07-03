@@ -86,14 +86,13 @@
 - **`formula_standalone_debug.md`** — standalone fp16 reproducer.
 - **`formula_trt_engine_probe.md`** — TRT engine probe results.
 
-## Script-ID (script_id_*, sota_*, cjk_push)
+## Script-ID (script_id_*, language-router sweeps, cjk_push)
 
 - **`script_id_recon.md`** — initial CJK script-id model recon.
 - **`script_id_data_v2.md`** — synthetic data generation V2.
 - **`script_id_bench_v2.md`** — V2 model bench results.
-- **`sota_brief.md`**, **`sota_result.md`**, **`sota_result_v2.md`**,
-  **`sota_result_v3.md`**, **`sota_result_lang_only.md`** — language
-  router SOTA sweeps.
+- language-router sweep briefs + result rounds (v1–v3, lang-only) —
+  accuracy sweeps for the script-id router.
 - **`cjk_push.md`** — Chinese / Japanese / Korean accuracy push.
 
 ## Surgery + re-exports (onnx_*, opset17, v26_*, v30_*, revert_and_det)

@@ -83,6 +83,13 @@ inline void maybe_load_router_models(OcrPipeline &pipeline) {
     formula_onnx = std::string("models/formula/") + fb;
     if (formula_tok.empty()) formula_tok = formula_onnx + "/tokenizer.json";
   }
+  // FORMULA_BACKEND=auto (composite): point at the -S bundle so the load's
+  // existence check passes; AutoCjkFormula resolves the plus-M sibling itself.
+  if (const char *fb = std::getenv("FORMULA_BACKEND");
+      fb && std::string(fb) == "auto" && formula_onnx.empty()) {
+    formula_onnx = "models/formula/ppformulanet_s";
+    if (formula_tok.empty()) formula_tok = formula_onnx + "/tokenizer.json";
+  }
   // Router (CuaRouter) + formula stage. A
   // CONFIGURED backend that fails to load (out-of-memory / bad model) ABORTS
   // boot — we never start a server that silently produces no formulas/tables.

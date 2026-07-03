@@ -2,6 +2,8 @@
 
 #include <filesystem>
 #include <iostream>
+#include <string_view>
+#include <utility>
 
 #include "turbo_ocr/formula/formula_recognizer.h"
 #include "turbo_ocr/table/table_recognizer.h"
@@ -19,19 +21,29 @@ bool load_formula_into_registry(FormulaRegistry &registry,
   // env `vlm` engine (kind:Local engine="vlm" -> the VLMFormula HTTP client).
   const bool formula_is_remote =
       fspec && (fspec->kind == routing::Kind::Openai || fspec->engine == "vlm");
-  const std::string formula_backend =
-      !fspec ? std::string()
-             : (formula_is_remote ? std::string("openai") : fspec->engine);
+  // Non-owning view into the routing table (outlives this call) or a literal;
+  // used only for diagnostics, so no std::string copy is warranted.
+  const std::string_view formula_backend =
+      !fspec ? std::string_view{}
+             : (formula_is_remote ? std::string_view{"openai"}
+                                   : std::string_view{fspec->engine});
   const bool want_formula =
       formula_is_remote ||
       (!formula_onnx.empty() && !formula_tokenizer_json.empty() &&
        std::filesystem::exists(formula_onnx) &&
        std::filesystem::exists(formula_tokenizer_json));
   if (!want_formula) {
+    // A LOCAL bundle that isn't on disk yet is a tolerated skip (the server
+    // still boots while upstream re-exports the ONNX), but it must never be
+    // SILENT: announce every skip of a routed backend so an operator can never
+    // mistake a missing bundle for a working formula stage.
     if (!formula_onnx.empty())
       std::cout << "[Pipeline] Formula engine skipped (path missing): "
                 << formula_onnx << '\n';
-    return true;  // nothing configured to load — not a failure
+    else if (fspec)
+      std::cout << "[Pipeline] Formula engine skipped (backend '" << fspec->name
+                << "' routed but no local model bundle configured)\n";
+    return true;  // nothing loadable — tolerated, but announced above
   }
   auto eng = fspec ? formula::make_formula_recognizer(*fspec) : nullptr;
   if (!eng) {
@@ -50,12 +62,14 @@ bool load_formula_into_registry(FormulaRegistry &registry,
                  "start with formulas silently disabled\n";
     return false;
   }
-  const auto bname = eng->backend_name();
-  // Registry owns the recognizer; default_out is a non-owning pointer to this
-  // route-default entry, keyed by the config backend NAME so a per-request
-  // override can address it; the hot path uses default_out.
-  registry[fspec->name] = std::move(eng);
-  default_out = registry[fspec->name].get();
+  // Registry OWNS the recognizer (unique_ptr moved in); default_out is a
+  // non-owning pointer to this route-default entry, keyed by the config backend
+  // NAME so a per-request override can address it; the hot path uses default_out.
+  // insert_or_assign hands back the slot iterator in one lookup, so ownership
+  // transfer and the pointer we hand out are read from the same owned object.
+  auto &slot = registry.insert_or_assign(fspec->name, std::move(eng)).first->second;
+  default_out = slot.get();
+  const std::string_view bname = slot->backend_name();
   ensure_formula_stream();
   if (loaded) {
     std::cout << "[Pipeline] Formula stage enabled (backend=" << bname
@@ -92,10 +106,12 @@ bool load_table_into_registry(TableRegistry &registry,
                  "start with tables silently disabled\n";
     return false;
   }
-  // Registry owns; default_out is a non-owning pointer to the route default.
-  // Keyed by config NAME so a per-request override can address it.
-  registry[tspec->name] = std::move(t);
-  default_out = registry[tspec->name].get();
+  // Registry OWNS (unique_ptr moved in); default_out is a non-owning pointer to
+  // the route default, keyed by config NAME so a per-request override can address
+  // it. Single-lookup insert_or_assign: the pointer we hand out comes straight
+  // from the owned slot.
+  auto &slot = registry.insert_or_assign(tspec->name, std::move(t)).first->second;
+  default_out = slot.get();
   ensure_table_stream();
   if (!loaded)
     std::cerr << "[Pipeline] ERROR: remote table backend '" << tspec->name

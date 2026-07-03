@@ -28,24 +28,58 @@ constexpr int H = 16, Dh = 24, CTX = 144, VOCAB = 50000, MAXLEN = 1056, MAXIT = 
 static_assert(MAXIT * 3 <= MAXLEN,
               "decode writes 3 KV slots per step at pos=it*3; MAXIT*3 must fit MAXLEN");
 
-// argmax over VOCAB per FP32 logit row. The strided per-thread scan + strict-greater
-// tree reduction biases toward lower indices on exact ties, but does not guarantee the
-// strict lowest-index tie-break a serial torch/ORT argmax gives; exact FP32 ties are
-// vanishingly rare here, so the distinction is immaterial in practice.
+// Reduce (val,idx) across a warp keeping the LOWEST lane index on exact-value ties
+// (strict-greater replaces, so the lower lane survives). __shfl_down_sync keeps the
+// whole reduction in registers — no shared traffic, no per-level __syncthreads.
+__device__ __forceinline__ void warp_argmax(float &v, int &i) {
+#pragma unroll
+  for (int s = 16; s > 0; s >>= 1) {
+    float ov = __shfl_down_sync(0xffffffffu, v, s);
+    int oi = __shfl_down_sync(0xffffffffu, i, s);
+    if (ov > v) { v = ov; i = oi; }
+  }
+}
+// argmax over VOCAB per FP32 logit row. Coalesced strided scan (consecutive lanes read
+// consecutive logits) -> per-lane max, then a two-level warp-shuffle reduction (intra-warp,
+// then across the <=32 warp winners in warp 0). For every input with a STRICT row max
+// (i.e. real model logits) this returns exactly that max's index. Tie-break caveat: on
+// an EXACT FP32 tie the survivor is the tied index with the lowest THREAD id (lowest
+// i % 256), NOT the lowest vocab index a serial numpy/paddle argmax returns — e.g. a
+// tie between logits[100] and logits[257] emits 257 (thread 1), not 100. Exact cross-
+// stripe FP32 ties do not occur in real logits, so decoded output is unchanged in
+// practice (empirically bit-identical formula CDM) — but "bit-exact to reference
+// argmax" is guaranteed only for strict maxima.
 __global__ void argmax_kernel(const float *lg, int64_t *out, int rows, int V) {
   int row = blockIdx.x; if (row >= rows) return;
   const float *p = lg + static_cast<size_t>(row) * V;
-  __shared__ float sm[256]; __shared__ int si[256];
   float m = -1e30f; int mi = 0;
   for (int i = threadIdx.x; i < V; i += blockDim.x) { float v = p[i]; if (v > m) { m = v; mi = i; } }
-  sm[threadIdx.x] = m; si[threadIdx.x] = mi; __syncthreads();
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (threadIdx.x < s && sm[threadIdx.x + s] > sm[threadIdx.x]) {
-      sm[threadIdx.x] = sm[threadIdx.x + s]; si[threadIdx.x] = si[threadIdx.x + s];
-    }
-    __syncthreads();
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  warp_argmax(m, mi);  // lane 0 of each warp now holds that warp's winner
+  __shared__ float sm[32]; __shared__ int si[32];
+  if (lane == 0) { sm[warp] = m; si[warp] = mi; }
+  __syncthreads();
+  if (warp == 0) {
+    const int nwarps = (blockDim.x + 31) >> 5;
+    m = lane < nwarps ? sm[lane] : -1e30f;
+    mi = lane < nwarps ? si[lane] : 0;
+    warp_argmax(m, mi);
+    if (lane == 0) out[row] = mi;
   }
-  if (threadIdx.x == 0) out[row] = si[0];
+}
+// On-device EOS termination: scan the newly-decoded steps [s0,s1) of the flat token
+// history (all[step*B*Ks + b*Ks + j]) and set a STICKY per-row done flag when any of the
+// row's Ks slots equals EOS. The host then D2Hs only the B flags (not the growing token
+// history) and does no per-token rescan — it just reads the flags to decide termination.
+__global__ void scan_eos_range(const int64_t *all, unsigned char *done, int B, int Ks,
+                               int64_t EOS, int s0, int s1) {
+  int b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= B || done[b]) return;
+  for (int s = s0; s < s1; ++s) {
+    const int64_t *row = all + ((size_t)s * B + b) * Ks;
+    for (int j = 0; j < Ks; ++j)
+      if (row[j] == EOS) { done[b] = 1; return; }
+  }
 }
 __global__ void fill_pos(int64_t *p, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -115,7 +149,8 @@ bool PPFormulaNetOrt::alloc_buffers() {
         && m((void **)&d_tok_, (size_t)MAX_B * 3 * sizeof(int64_t))
         && m((void **)&d_next_, (size_t)MAX_B * 3 * sizeof(int64_t))
         && m((void **)&d_pos_, (size_t)std::max(MAXIT, MAX_B) * sizeof(int64_t))
-        && m((void **)&d_all_, (size_t)MIT * MAX_B * KS * sizeof(int64_t));
+        && m((void **)&d_all_, (size_t)MIT * MAX_B * KS * sizeof(int64_t))
+        && m((void **)&d_done_, (size_t)MAX_B * sizeof(unsigned char));
     if (!ok) return false;
     if (plusm_) {  // continuous-batch: all-crop encoder memory + pre-computed cross-KV
       size_t cra = (size_t)LY * PM_MAX_N * H * CTX * DH;
@@ -127,17 +162,24 @@ bool PPFormulaNetOrt::alloc_buffers() {
           || !m((void **)&vA384_, kvs * sizeof(float)) || !m((void **)&vB384_, kvs * sizeof(float)))
         return false;
     } else {  // -S precomputes pos=it*3; plus-M fills pos=it per step in-loop
-      fill_pos<<<(MAXIT + 63) / 64, 64>>>(d_pos_, MAXIT);
+      fill_pos<<<(MAXIT + 63) / 64, 64, 0, stream_>>>(d_pos_, MAXIT);
       if (cudaGetLastError() != cudaSuccess) return false;
     }
   }
-  return cudaDeviceSynchronize() == cudaSuccess;
+  // Sync OUR stream only. cudaDeviceSynchronize would be illegal while any
+  // other pipeline's CUDA-graph capture is in flight (device-wide sync against
+  // an active capture fails regardless of capture mode) — and pipelines warm up
+  // concurrently, so a formula load racing another pipeline's rec-graph bake
+  // would spuriously fail. Launching fill_pos on stream_ (not the legacy
+  // stream) likewise avoids invalidating a concurrent capture through an
+  // implicit legacy-stream dependency.
+  return cudaStreamSynchronize(stream_) == cudaSuccess;
 }
 
 void PPFormulaNetOrt::free_buffers() noexcept {
   for (void *p : {(void *)d_x_, (void *)d_mem_, (void *)d_ck_, (void *)d_cv_, (void *)d_log_,
                   (void *)kA_, (void *)kB_, (void *)vA_, (void *)vB_,
-                  (void *)d_tok_, (void *)d_next_, (void *)d_pos_, (void *)d_all_,
+                  (void *)d_tok_, (void *)d_next_, (void *)d_pos_, (void *)d_all_, (void *)d_done_,
                   (void *)d_mem_all_, (void *)ck_all_, (void *)cv_all_,
                   (void *)kA384_, (void *)kB384_, (void *)vA384_, (void *)vB384_})
     if (p) cudaFree(p);
@@ -237,7 +279,9 @@ bool PPFormulaNetOrt::decode_chunk(int B, std::vector<std::vector<int64_t>> &out
   // call. On either error break only steps 0..it-1 are valid -> set last=it; the
   // clean all-done break sets last=it+1. ok=false on any error so the caller can
   // mark the chunk's crops failed instead of decoding stale tokens as success.
+  cudaMemsetAsync(d_done_, 0, (size_t)B, stream_);
   std::vector<char> done(B, 0); std::vector<int64_t> hall; int last = MAXIT; bool ok = true;
+  int checked = 0;  // steps already scanned for EOS on device (sticky d_done_)
   for (int it = 0; it < MAXIT; ++it) {
     ins[1].data = d_pos_ + it; ins[2].data = kin; ins[3].data = vin;
     outs[1].data = kout; outs[2].data = vout;
@@ -254,22 +298,18 @@ bool PPFormulaNetOrt::decode_chunk(int B, std::vector<std::vector<int64_t>> &out
     cudaMemcpyAsync(d_tok_, d_next_, (size_t)B * 3 * sizeof(int64_t), cudaMemcpyDeviceToDevice, stream_);
     std::swap(kin, kout); std::swap(vin, vout);
     if ((it + 1) % CHECK == 0) {
+      // On-device EOS scan of the new steps sets sticky per-row flags; only B bytes cross
+      // the bus (vs the whole growing token history) and the host does no per-token rescan.
+      scan_eos_range<<<(B + 63) / 64, 64, 0, stream_>>>(d_all_, d_done_, B, 3, EOS, checked, it + 1);
       cudaStreamSynchronize(stream_);
-      size_t n = (size_t)(it + 1) * B * 3; hall.resize(n);
-      if (cudaError_t e = cudaMemcpy(hall.data(), d_all_, n * sizeof(int64_t),
-                                     cudaMemcpyDeviceToHost); e != cudaSuccess) {
-        std::cerr << "[PPFormulaNetOrt] periodic D2H copy failed it=" << it
+      if (cudaError_t e = cudaMemcpy(done.data(), d_done_, (size_t)B, cudaMemcpyDeviceToHost);
+          e != cudaSuccess) {
+        std::cerr << "[PPFormulaNetOrt] periodic done D2H failed it=" << it
                   << ": " << cudaGetErrorString(e) << '\n';
         last = it + 1; ok = false; break;  // don't early-stop on stale tokens
       }
-      int nd = 0;
-      for (int b = 0; b < B; ++b) {
-        if (done[b]) { ++nd; continue; }
-        bool e = false;
-        for (int s = 0; s <= it && !e; ++s)
-          for (int j = 0; j < 3; ++j) if (hall[(size_t)s * B * 3 + (size_t)b * 3 + j] == EOS) { e = true; break; }
-        if (e) { done[b] = 1; ++nd; }
-      }
+      checked = it + 1;
+      int nd = 0; for (int b = 0; b < B; ++b) nd += done[b] ? 1 : 0;
       if (nd == B) { last = it + 1; break; }
     }
   }
@@ -322,7 +362,9 @@ bool PPFormulaNetOrt::decode_chunk_plusm(int B, std::vector<std::vector<int64_t>
   std::vector<OrtTensor> outs = {
       {"logits", d_log_, {Bi, 1, VOCAB}, false}, {"next_token", d_next_, {Bi, 1}, true},
       {"kb_out", kout, {LY, Bi, H, MAXLEN, DH}, false}, {"vb_out", vout, {LY, Bi, H, MAXLEN, DH}, false}};
+  cudaMemsetAsync(d_done_, 0, (size_t)B, stream_);
   std::vector<char> done(B, 0); std::vector<int64_t> hall; int last = PM_MAXIT; bool ok = true;
+  int checked = 0;  // steps already scanned for EOS on device (sticky d_done_)
   for (int it = 0; it < PM_MAXIT; ++it) {
     fill_val<<<(B + 63) / 64, 64, 0, stream_>>>(d_pos_, it, B);  // lockstep: all rows at pos=it
     ins[2].data = kin; ins[3].data = vin; outs[2].data = kout; outs[3].data = vout;
@@ -334,17 +376,14 @@ bool PPFormulaNetOrt::decode_chunk_plusm(int B, std::vector<std::vector<int64_t>
     cudaMemcpyAsync(d_tok_, d_next_, (size_t)B * sizeof(int64_t), cudaMemcpyDeviceToDevice, stream_);
     std::swap(kin, kout); std::swap(vin, vout);
     if ((it + 1) % CHECK == 0) {
+      // On-device EOS scan (see decode_chunk): D2H only the B sticky flags, no host rescan.
+      scan_eos_range<<<(B + 63) / 64, 64, 0, stream_>>>(d_all_, d_done_, B, 1, EOS, checked, it + 1);
       cudaStreamSynchronize(stream_);
-      size_t n = (size_t)(it + 1) * B; hall.resize(n);
-      if (cudaMemcpy(hall.data(), d_all_, n * sizeof(int64_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
+      if (cudaMemcpy(done.data(), d_done_, (size_t)B, cudaMemcpyDeviceToHost) != cudaSuccess) {
         last = it + 1; ok = false; break;
       }
-      int nd = 0;
-      for (int b = 0; b < B; ++b) {
-        if (done[b]) { ++nd; continue; }
-        for (int s = 0; s <= it; ++s)
-          if (hall[(size_t)s * B + b] == EOS) { done[b] = 1; ++nd; break; }
-      }
+      checked = it + 1;
+      int nd = 0; for (int b = 0; b < B; ++b) nd += done[b] ? 1 : 0;
       if (nd == B) { last = it + 1; break; }
     }
   }
@@ -404,6 +443,13 @@ bool PPFormulaNetOrt::decode_continuous_plusm(OrtSession &step, float *kA, float
 
   // Fixed KV addresses (no ping-pong): the step reads kb=kA/vb=vA and writes the full KV to
   // kb_out=kB/vb_out=vB; accum_kv_slot copies ONLY the new pos slot back into kA/vA.
+  //
+  // LOAD-BEARING INVARIANT (slot reuse): when a finished crop is evicted and a new one
+  // starts in the same slot (hpos=0), the slot's self-KV is NOT cleared — positions
+  // beyond the new crop's hpos still hold the PREVIOUS crop's K/V. This is correct only
+  // because the exported step masks self-attention causally to [0, pos]: freshly written
+  // slots shadow the stale ones before they can ever be attended. If a future export
+  // attends the full maxlen window, slot refill MUST memset the slot's KV first.
   step.reset_graph();  // re-bind: Bslots + maxlen (shapes) differ across calls/buckets
   std::vector<OrtTensor> ins = {
       {"tokens", d_tok_, {Bi, 1}, true}, {"pos", d_pos_, {Bi}, true},
@@ -448,6 +494,13 @@ bool PPFormulaNetOrt::decode_continuous_plusm(OrtSession &step, float *kA, float
   }
   cudaStreamSynchronize(stream_);
   if (cudaPeekAtLastError() != cudaSuccess) ok = false;
+  if (active > 0) {
+    // Guard tripped with crops still decoding: their outputs are truncated.
+    // Never report that as success (no-silent-failure).
+    std::cerr << "[plusm-cont] iteration guard tripped with " << active
+              << " crop(s) still active — output truncated\n";
+    ok = false;
+  }
   return ok;
 }
 

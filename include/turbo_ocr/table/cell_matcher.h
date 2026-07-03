@@ -35,9 +35,8 @@ struct MatchedCell {
 // 0.5→0.7737. Env-tunable via TABLE_MATCH_INTER.
 inline constexpr float MATCH_INTER_THRESHOLD = 0.5f;
 
-// PaddleX-equivalent intersect ratio: inter_area / box_b_area.
-// +1 byte-equal preservation: PaddleX uses `(x_right - x_left + 1)` style
-// width/height inclusive arithmetic.
+// PaddleX-equivalent intersect ratio: inter_area / box_b_area, using exclusive
+// (x_right - x_left) width/height arithmetic.
 float compute_inter(const std::array<float, 4>& a, const std::array<float, 4>& b);
 
 // Quad → axis-aligned bbox over the 8 coords laid out as

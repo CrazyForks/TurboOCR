@@ -111,6 +111,7 @@ private:
   // plus-M length-bucket: 384-KV-window self-attention buffers (the common-case fast path).
   float *kA384_ = nullptr, *kB384_ = nullptr, *vA384_ = nullptr, *vB384_ = nullptr;
   int64_t *d_tok_ = nullptr, *d_next_ = nullptr, *d_pos_ = nullptr, *d_all_ = nullptr;
+  unsigned char *d_done_ = nullptr;  // sticky per-row EOS flags (on-device termination)
   // plus-M continuous-batch scratch: all-crop encoder memory + pre-computed cross-KV.
   float *d_mem_all_ = nullptr, *ck_all_ = nullptr, *cv_all_ = nullptr;
   std::vector<uint8_t> host_page_;   // page D2H scratch

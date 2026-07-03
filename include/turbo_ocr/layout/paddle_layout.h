@@ -18,21 +18,24 @@ namespace turbo_ocr::layout {
 // middle of OcrPipeline::run():
 //
 //   1. enqueue(gpu_img, H, W, stream)  — async: preprocess kernel + H2D
-//      of im_shape/scale_factor + TRT execute + D2H of the detection
-//      tensor, all on `stream`. Records d2h_event_ at the tail of the D2H.
-//      Returns immediately without any stream sync.
+//      of im_shape/scale_factor + TRT execute, all on `stream`. Returns
+//      immediately without any stream sync (no readback here).
 //
-//   2. collect(threshold) — blocks on d2h_event_ (usually a no-op because
-//      the main pipeline's rec step already synced `stream` through the
-//      det_event_ handoff). Then CPU-decodes h_out0_ into LayoutBox
-//      vectors.
+//   2. collect(threshold) — issues both D2H copies (count tensor out1 +
+//      the fixed-size detection buffer out0) back-to-back on the enqueue
+//      stream and drains them with a single cudaStreamSynchronize (stream
+//      ordering places the D2H copies strictly after the TRT execute), then
+//      CPU-decodes h_out0_ into LayoutBox vectors (the model already ran NMS
+//      on-GPU; the host step is decode + postfilter, not NMS).
 //
 // Splitting like this means the pipeline overlap between det_N and rec_{N-1}
 // is preserved — layout adds zero wall-clock in the common case.
 class PaddleLayout {
 public:
   PaddleLayout() = default;
-  ~PaddleLayout() noexcept;
+  // All device/host/engine resources are RAII members (CudaPtr / CudaHostPtr /
+  // unique_ptr), so no hand-written teardown is needed.
+  ~PaddleLayout() noexcept = default;
 
   // Load the TensorRT engine and allocate GPU + pinned-host buffers for
   // batch=1 inference. The engine itself supports batches up to 8.
@@ -49,8 +52,8 @@ public:
   enqueue(const GpuImage &gpu_img, int orig_h, int orig_w,
           cudaStream_t stream);
 
-  // Block on d2h_event_, query output shape, D2H, then decode into LayoutBox
-  // vectors. Must be called exactly once after enqueue().
+  // Drain the enqueue stream, D2H the detection + count tensors, then decode
+  // into LayoutBox vectors. Must be called exactly once after enqueue().
   [[nodiscard]] std::vector<LayoutBox>
   collect(float score_threshold = 0.3f);
 
@@ -64,12 +67,9 @@ public:
 private:
   std::unique_ptr<engine::TrtEngine> engine_;
 
-  // Event recorded right after the async D2H of the detection tensor.
-  // collect() waits on this before reading h_out0_. In the common path
-  // (rec_->run() has already drained `stream`), the wait is a no-op.
-  cudaEvent_t d2h_event_ = nullptr;
-
-  // Per-enqueue state that collect() needs.
+  // Per-enqueue state that collect() needs. pending_stream_ doubles as the
+  // "enqueue succeeded" flag: collect() bails when it is null so a failed
+  // enqueue can never decode a previous request's stale buffers.
   int pending_orig_h_ = 0;
   int pending_orig_w_ = 0;
   cudaStream_t pending_stream_ = nullptr;

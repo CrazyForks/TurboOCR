@@ -24,7 +24,9 @@ interface Caret {
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
-function caretFromPoint(x: number, y: number): Caret | null {
+// Browser hit-test only — the reading-order `line` index is attached by the
+// caller (caretInLine), so this returns a Caret minus `line`.
+function caretFromPoint(x: number, y: number): Omit<Caret, "line"> | null {
   const d = document as Document & {
     caretRangeFromPoint?: (x: number, y: number) => Range | null;
     caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;

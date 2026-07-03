@@ -106,7 +106,7 @@ export async function runOcrPdf(
   if (!r.ok) return fail(r);
   const data = (await r.json()) as { pages?: Array<Record<string, unknown>> };
   const pages: PdfPage[] = (data.pages ?? []).map((p) => {
-    const { image_b64, image_content_type, ...resp } = p as {
+    const { image_b64, image_content_type, ...resp } = p as unknown as {
       image_b64?: string;
       image_content_type?: string;
       page?: number;
@@ -118,8 +118,13 @@ export async function runOcrPdf(
     let buf: ArrayBuffer | null = null;
     if (image_b64) {
       const u8 = base64ToBytes(image_b64);
-      buf = u8.buffer;
-      url = URL.createObjectURL(new Blob([u8], { type: image_content_type || "image/jpeg" }));
+      // Copy into a plain ArrayBuffer: u8.buffer is typed ArrayBufferLike
+      // (could be a SharedArrayBuffer as of TS 5.7's typed-array generics),
+      // which neither PdfPage.bytes nor BlobPart accepts.
+      const ab = new ArrayBuffer(u8.byteLength);
+      new Uint8Array(ab).set(u8);
+      buf = ab;
+      url = URL.createObjectURL(new Blob([ab], { type: image_content_type || "image/jpeg" }));
     }
     return {
       index: resp.page_index ?? (resp.page ? resp.page - 1 : 0),

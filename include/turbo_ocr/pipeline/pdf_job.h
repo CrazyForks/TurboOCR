@@ -100,6 +100,10 @@ struct PdfJobOptions {
   bool want_blocks = false;
   bool want_tables = false;
   bool want_formulas = false;
+  // ?text=0 — skip det/rec on every page: geometric pages drop their
+  // text-layer text, OCR pages run layout-only (or nothing). Combine with
+  // images=inline for a fast pdf->page-images path with no GPU OCR cost.
+  bool want_text = true;
   bool autorotate = false;
   PdfImageMode image_mode = PdfImageMode::None;
   pdf::EncodeOptions encode_opts{};
@@ -322,6 +326,7 @@ struct PdfPageSink {
   // the request asked (?tables=1 / ?formulas=1). Default off.
   bool want_tables = false;
   bool want_formulas = false;
+  bool want_text = true;
   // Rendered pages whose PPM could not be read back (a server-side fault).
   std::atomic<int> decode_failures{0};
   // Pages whose OCR/inference threw — counted by the true page count (the whole
@@ -450,10 +455,14 @@ inline void ocr_single_page(GpuPipelineEntry &e, PdfPageSink &sink,
           ? e.pipeline->detect_orientation(img, e.stream) : 0;
       if (orient) classification::rotate_upright(img, orient);
       auto encoded = maybe_encode_page(sink, img);
-      auto out = e.pipeline->run_with_layout(img, e.stream, layout_enabled,
-                                             want_reading_order, /*routing=*/{},
-                                             /*defer_external=*/false,
-                                             sink.want_tables, sink.want_formulas);
+      // ?text=0: layout-only (or image-only when layout is off) — no det/rec.
+      auto out = sink.want_text
+          ? e.pipeline->run_with_layout(img, e.stream, layout_enabled,
+                                        want_reading_order, /*routing=*/{},
+                                        /*defer_external=*/false,
+                                        sink.want_tables, sink.want_formulas)
+          : (layout_enabled ? e.pipeline->run_layout_only(img, e.stream)
+                            : OcrPipelineResult{});
       store_ocr_page(sink, page_idx, std::move(out), img.cols, img.rows,
                      std::move(encoded), orient);
     }
@@ -672,6 +681,7 @@ inline int run_streamed_render_cpu(
   sink->autorotate = opts.autorotate;
   sink->want_tables = opts.want_tables;
   sink->want_formulas = opts.want_formulas;
+  sink->want_text = opts.want_text;
 
   pdf::PdfMode mode = opts.mode;
   open_pdf_for_text_layer(pdf_data, pdf_len, mode, sink->pdf_doc,
@@ -680,10 +690,15 @@ inline int run_streamed_render_cpu(
   std::vector<uint8_t> need_render;
   bool any_need_render = (mode == pdf::PdfMode::Ocr);
 
-  if (mode != pdf::PdfMode::Ocr)
+  if (mode != pdf::PdfMode::Ocr) {
     prepopulate_pages(mode, opts.want_layout, sink->page_text_cache,
                       sink->page_results, need_render, &any_need_render,
                       opts.image_mode == PdfImageMode::Inline);
+    // ?text=0: the caller asked for no text at all — drop what the text
+    // layer prefilled so geometric pages honor the contract too.
+    if (!opts.want_text)
+      for (auto &pg : sink->page_results) pg.results.clear();
+  }
 
   std::vector<int> dropped;
   auto stream_handle = std::make_shared<render::PdfRenderer::StreamHandle>();

@@ -125,7 +125,7 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
       return;
     }
     if (reject_unknown_query_params(
-            req, {"layout", "reading_order", "as_blocks", "tables", "formulas",
+            req, {"layout", "reading_order", "as_blocks", "tables", "formulas", "text",
                   "route_table", "route_formula"}, callback))
       return;
     if (auto r = server::check_structure_backends(opts, table_avail, formula_avail);
@@ -169,8 +169,10 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
           }
         }
 
-        // JPEG with nvJPEG: submit GPU-direct decode + infer as one work item
-        if (nvjpeg_available && NvJpegDecoder::is_jpeg(data, len)) {
+        // JPEG with nvJPEG: submit GPU-direct decode + infer as one work item.
+        // Layout-only requests (?text=0) skip this fast path — the generic
+        // branch below dispatches them to run_layout_only.
+        if (opts.want_text && nvjpeg_available && NvJpegDecoder::is_jpeg(data, len)) {
           // C4: capture `req` by value so the JPEG bytes (data/len point into
           // req->body()) stay alive if the future is abandoned on timeout and
           // the task keeps running after this handler returns.
@@ -278,6 +280,8 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
         pipeline::OcrPipelineResult out;
         try {
           out = dispatcher.submit_for_default([img, opts](auto &e) {
+            if (!opts.want_text)
+              return e.pipeline->run_layout_only(img, e.stream);
             return e.pipeline->run_with_layout(img, e.stream,
                                                 opts.want_layout,
                                                 opts.want_reading_order,
@@ -637,6 +641,15 @@ void register_ocr_batch_route_gpu(server::WorkPool &pool,
     if (reject_unknown_query_params(
             req, {"layout", "reading_order", "as_blocks", "tables", "formulas"}, callback))
       return;
+    // Layout-only (?text=0) is a single-image feature; the batched det/rec
+    // path has no layout-only equivalent. Reject instead of silently running
+    // full OCR against the caller's stated intent.
+    if (!opts.want_text) {
+      callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+          "text=0 is not supported on /ocr/batch; send single images to "
+          "/ocr/raw?text=0 instead"));
+      return;
+    }
     if (auto r = server::check_structure_backends(opts, table_avail, formula_avail);
         !r.error.empty()) {
       callback(server::error_response(drogon::k400BadRequest,
@@ -752,7 +765,7 @@ void register_ocr_pixels_route_gpu(server::WorkPool &pool,
       return;
     }
     if (reject_unknown_query_params(
-            req, {"layout", "reading_order", "as_blocks", "tables", "formulas",
+            req, {"layout", "reading_order", "as_blocks", "tables", "formulas", "text",
                   "width", "height", "channels"}, callback))
       return;
     if (auto r = server::check_structure_backends(opts, table_avail, formula_avail);
@@ -814,6 +827,8 @@ void register_ocr_pixels_route_gpu(server::WorkPool &pool,
         pipeline::OcrPipelineResult out;
         try {
           out = dispatcher.submit_for_default([img, req, opts](auto &e) {
+            if (!opts.want_text)
+              return e.pipeline->run_layout_only(img, e.stream);
             return e.pipeline->run_with_layout(img, e.stream,
                                                 opts.want_layout,
                                                 opts.want_reading_order,

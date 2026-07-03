@@ -388,7 +388,8 @@ void register_pdf_route(server::WorkPool &pool,
       return;
 
     server::InferOptions opts;
-    if (auto r = server::parse_query_options(req, layout_available, &opts);
+    if (auto r = server::parse_query_options(req, layout_available, &opts,
+                                             /*allow_image_only=*/true);
         !r.error.empty()) {
       callback(server::error_response(drogon::k400BadRequest,
                                        r.error_code.c_str(), r.error));
@@ -399,9 +400,10 @@ void register_pdf_route(server::WorkPool &pool,
     const bool want_blocks = opts.want_blocks;
     const bool want_tables = opts.want_tables;
     const bool want_formulas = opts.want_formulas;
+    const bool want_text = opts.want_text;
 
     if (reject_unknown_query_params(
-            req, {"layout", "reading_order", "as_blocks", "tables", "formulas",
+            req, {"layout", "reading_order", "as_blocks", "tables", "formulas", "text",
                   "dpi", "mode",
                   "images", "format", "lossless", "png_compression", "quality",
                   "max_side", "autorotate"}, callback))
@@ -438,6 +440,15 @@ void register_pdf_route(server::WorkPool &pool,
       return;
     }
 
+    // text=0 on /ocr/pdf must produce SOMETHING: a layout-only run or inline
+    // page images (the fast pdf->images path). Bare text=0 returns empty pages.
+    if (!want_text && !layout_enabled && image_mode != PdfImageMode::Inline) {
+      callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+          "text=0 without layout=1 or images=inline would return empty pages; "
+          "add layout=1 (layout-only) and/or images=inline (page images)"));
+      return;
+    }
+
     // autorotate=1: de-rotate each OCR'd page upright using the doc-orientation
     // model. Rejected when the model isn't loaded (parity with LAYOUT_DISABLED).
     bool autorotate = false;
@@ -461,6 +472,7 @@ void register_pdf_route(server::WorkPool &pool,
     server::submit_work(pool, std::move(callback),
         [pdf_buf, &dispatcher, &pdf_renderer, // req dropped: unused, kept the full request (raw body) resident alongside pdf_buf
          layout_enabled, want_reading_order, want_blocks, want_tables, want_formulas,
+         want_text,
          dpi, req_mode, image_mode,
          encode_opts, max_pdf_pages, autorotate](server::DrogonCallback &cb) {
      // Wrap the whole body: post-render work (emit_pdf_response's multi-GB
@@ -481,6 +493,7 @@ void register_pdf_route(server::WorkPool &pool,
       job_opts.want_blocks = want_blocks;
       job_opts.want_tables = want_tables;
       job_opts.want_formulas = want_formulas;
+      job_opts.want_text = want_text;
       job_opts.autorotate = autorotate;
       job_opts.image_mode = image_mode;
       job_opts.encode_opts = encode_opts;
@@ -547,7 +560,7 @@ void register_pdf_route(server::WorkPool &pool,
     const bool want_formulas = opts.want_formulas;
 
     if (reject_unknown_query_params(
-            req, {"layout", "reading_order", "as_blocks", "tables", "formulas",
+            req, {"layout", "reading_order", "as_blocks", "tables", "formulas", "text",
                   "dpi", "mode",
                   "images", "format", "lossless", "png_compression", "quality",
                   "max_side", "autorotate"}, callback))

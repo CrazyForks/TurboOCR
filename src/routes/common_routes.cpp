@@ -242,7 +242,7 @@ void register_ocr_base64_route(server::WorkPool &pool,
           return;
         }
         if (reject_unknown_query_params(
-                req, {"layout", "reading_order", "as_blocks", "tables", "formulas"}, callback))
+                req, {"layout", "reading_order", "as_blocks", "tables", "formulas", "text"}, callback))
           return;
         if (auto r = server::check_structure_backends(opts, table_avail, formula_avail);
             !r.error.empty()) {
@@ -336,7 +336,7 @@ void register_ocr_raw_route(server::WorkPool &pool,
           return;
         }
         if (reject_unknown_query_params(
-                req, {"layout", "reading_order", "as_blocks", "tables", "formulas"}, callback))
+                req, {"layout", "reading_order", "as_blocks", "tables", "formulas", "text"}, callback))
           return;
         if (auto r = server::check_structure_backends(opts, table_avail, formula_avail);
             !r.error.empty()) {

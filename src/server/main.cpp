@@ -285,14 +285,17 @@ int main(int argc, char **argv) try {
     // bools. The dispatcher itself is long-lived and captured by reference.
     // On deadline this throws turbo_ocr::TimeoutError; the route's
     // run_with_error_handling maps it to HTTP 504 (INFERENCE_TIMEOUT).
+    const bool want_text = opts.want_text;
     const bool want_layout = opts.want_layout;
     const bool want_reading_order = opts.want_reading_order;
     const bool want_tables = opts.want_tables;
     const bool want_formulas = opts.want_formulas;
     const auto routing_override = opts.routing_override;  // by-value (timeout-safe)
     auto out = dispatcher->submit_for_default(
-        [img, want_layout, want_reading_order, want_tables, want_formulas,
-         routing_override](auto &e) {
+        [img, want_text, want_layout, want_reading_order, want_tables,
+         want_formulas, routing_override](auto &e) {
+          if (!want_text)
+            return e.pipeline->run_layout_only(img, e.stream);
           return e.pipeline->run_with_layout(img, e.stream, want_layout,
                                              want_reading_order, routing_override,
                                              /*defer_external=*/false,

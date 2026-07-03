@@ -31,6 +31,7 @@ Parsed by `server::parse_query_options()` in
 | `as_blocks` | `0` | Emit paragraph-level `blocks`. Auto-enables `layout` + `reading_order`. |
 | `tables` | `0` | Run the table branch (SLANeXt, or a VLM backend) and emit `tables`. Strict opt-in: `1` requires a table backend configured at startup, else `400 TABLE_BACKEND_DISABLED`. Auto-enables `layout`. |
 | `formulas` | `0` | Run the formula branch (PP-FormulaNet-S, in-process ORT-CUDA-13) and emit `formulas`. Strict opt-in: `1` requires a formula backend configured at startup, else `400 FORMULA_BACKEND_DISABLED`. Auto-enables `layout`. |
+| `text` | `1` | The one opt-OUT flag. `text=0` skips text detection/recognition entirely: with `layout=1` the request is a layout-only pass (`results` comes back empty); on `/ocr/pdf`, `text=0&images=inline` is the fast page-images path with zero OCR cost, and adding `layout=1` yields layout + image per page. Rejected with `tables`/`formulas`/`as_blocks`/`reading_order` (all consume recognized text), on `/ocr/batch`, and on the CPU build. |
 
 !!! note "Optional fields stay byte-identical when empty"
     `layout`, `reading_order`, `blocks`, `tables`, `formulas` are

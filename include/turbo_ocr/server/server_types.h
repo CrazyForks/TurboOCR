@@ -96,6 +96,11 @@ struct InferOptions {
   // PP-StructureV3 parsing_res_list granularity). Auto-enables layout
   // and reading_order since aggregation needs both.
   bool want_blocks = false;
+  // ?text=0 — skip text detection/recognition entirely and run ONLY the
+  // layout model (auto-enables layout; `results` comes back empty). Several
+  // times cheaper than a full OCR pass. Incompatible with tables/formulas/
+  // blocks/reading_order — they all consume recognized text. GPU build only.
+  bool want_text = true;
 
   // Per-request routing override (Tier-A): a backend NAME per modality (empty
   // == use the configured route default). Parsed from /ocr/raw query params
@@ -353,7 +358,8 @@ struct ParseOptionsResult {
 [[nodiscard]] inline ParseOptionsResult
 parse_query_options(const drogon::HttpRequestPtr &req,
                     bool layout_available,
-                    InferOptions *out) {
+                    InferOptions *out,
+                    bool allow_image_only = false) {
   *out = {};
   if (auto err = parse_bool_query(req, "layout", &out->want_layout);
       !err.empty())
@@ -417,6 +423,45 @@ parse_query_options(const drogon::HttpRequestPtr &req,
   }
   if (out->want_tables || out->want_formulas)
     out->want_layout = true;
+
+  // `text` is the one opt-OUT flag (default true); parse_bool_query's
+  // absent->false convention is for opt-in flags, so only parse when present.
+  out->want_text = true;
+  if (!req->getParameter("text").empty()) {
+    if (auto err = parse_bool_query(req, "text", &out->want_text);
+        !err.empty())
+      return {err, "INVALID_PARAMETER"};
+  }
+  if (!out->want_text) {
+#ifdef USE_CPU_ONLY
+    return {"text=0 (layout-only) is not supported on the CPU build",
+            "INVALID_PARAMETER"};
+#endif
+    // Layout-only run: everything text-derived is meaningless without rec.
+    // Fail loud on the combinations instead of returning silently-empty
+    // tables/blocks/order.
+    if (out->want_tables || out->want_formulas)
+      return {"text=0 runs the layout model only; tables=1/formulas=1 need "
+              "the OCR pass. Drop text=0 or the structure flags.",
+              "INVALID_PARAMETER"};
+    if (out->want_blocks)
+      return {"text=0 cannot be combined with as_blocks=1 (blocks aggregate "
+              "recognized text)", "INVALID_PARAMETER"};
+    if (out->want_reading_order)
+      return {"text=0 cannot be combined with reading_order=1 (order is "
+              "computed over recognized text)", "INVALID_PARAMETER"};
+    if (out->want_layout && !layout_available) {
+      return {"text=0&layout=1 requests a layout-only run, which needs the "
+              "layout model: start the server without DISABLE_LAYOUT=1",
+              "LAYOUT_DISABLED"};
+    }
+    // Without layout the response would be empty on the image routes. On
+    // /ocr/pdf (allow_image_only) the route re-checks against images=inline.
+    if (!out->want_layout && !allow_image_only)
+      return {"text=0 without layout=1 returns nothing on this endpoint; add "
+              "layout=1 (layout-only run), or use /ocr/pdf?text=0&images=inline "
+              "for page images", "INVALID_PARAMETER"};
+  }
 
   return {};
 }

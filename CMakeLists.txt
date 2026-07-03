@@ -508,13 +508,34 @@ else()
         HINTS ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/lib /usr/local/lib)
     find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
         HINTS ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/include /usr/local/include)
+    if((NOT ONNXRUNTIME_LIB OR NOT ONNXRUNTIME_INCLUDE_DIR)
+       AND TURBO_ARCH STREQUAL "x64")
+        # Clean-clone fallback: fetch the official CUDA-13 GPU build (the
+        # gpu_cuda13 release asset — the plain tarball is CPU-only and would
+        # break the formula backends at runtime). Same pin as Dockerfile.gpu.
+        include(FetchContent)
+        set(ORT_GPU_VERSION "1.27.0" CACHE STRING "ONNX Runtime (GPU/CUDA-13) version to fetch")
+        set(ORT_GPU_SHA256 "1a3227e1dc2f53d9f877c93278af500b15e26d99aa5ade877692138b3ab7d351"
+            CACHE STRING "onnxruntime-linux-x64-gpu_cuda13 tarball SHA256")
+        message(STATUS "ONNX Runtime not found; fetching v${ORT_GPU_VERSION} (x64, CUDA 13)")
+        FetchContent_Declare(onnxruntime_gpu_prebuilt
+            URL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_GPU_VERSION}/onnxruntime-linux-x64-gpu_cuda13-${ORT_GPU_VERSION}.tgz"
+            URL_HASH SHA256=${ORT_GPU_SHA256}
+            SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/onnxruntime)
+        FetchContent_MakeAvailable(onnxruntime_gpu_prebuilt)
+        find_library(ONNXRUNTIME_LIB onnxruntime
+            HINTS ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/lib)
+        find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+            HINTS ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/include)
+    endif()
     if(NOT ONNXRUNTIME_LIB OR NOT ONNXRUNTIME_INCLUDE_DIR)
         message(FATAL_ERROR
             "ONNX Runtime not found (looked in third_party/onnxruntime and "
             "/usr/local). The GPU build needs a CUDA-enabled ONNX Runtime "
             "(libonnxruntime.so + libonnxruntime_providers_cuda.so + headers); "
             "the plain onnxruntime-linux-<arch>-<ver>.tgz release asset is "
-            "CPU-only and will NOT work. Install a GPU/CUDA ORT package into "
+            "CPU-only and will NOT work. Microsoft publishes no GPU aarch64 "
+            "tarball — install a CUDA-enabled ORT into "
             "third_party/onnxruntime/{include,lib} or /usr/local, matching "
             "your CUDA major version.")
     endif()

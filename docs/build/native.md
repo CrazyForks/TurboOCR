@@ -20,9 +20,14 @@ On Debian/Ubuntu the equivalents include `libcurl4-openssl-dev` and
 VLM table/formula clients use libcurl even though they are runtime-opt-in,
 and inline page-image export uses libjpeg-turbo as the CPU fallback encoder).
 The GPU build additionally needs a **CUDA-enabled** ONNX Runtime (with
-`libonnxruntime_providers_cuda.so`) in `third_party/onnxruntime/{include,lib}`
-or `/usr/local`; the plain `onnxruntime-linux-<arch>-<ver>.tgz` release asset
-is CPU-only and is rejected at configure time with an explanatory error.
+`libonnxruntime_providers_cuda.so`). On x86_64 a clean clone fetches the
+official pinned `onnxruntime-linux-x64-gpu_cuda13` release tarball
+automatically at configure time (same pin as `docker/Dockerfile.gpu`); a
+pre-installed copy in `third_party/onnxruntime/{include,lib}` or `/usr/local`
+is preferred when present. The plain `onnxruntime-linux-<arch>-<ver>.tgz`
+asset is CPU-only and is rejected at configure time with an explanatory
+error; aarch64 has no official GPU tarball and needs a custom CUDA-enabled
+ORT dropped in manually.
 
 !!! warning "CUDA prerequisite"
     The installer refuses to proceed if `nvcc --version` reports a

@@ -36,3 +36,7 @@ uploads/
 custom_models/
 webui/
 build-coverage/
+# Never ship the local vendored ORT into the build context: the Dockerfiles
+# fetch their own pinned CUDA-13 build, and excluding it keeps docker builds
+# byte-equivalent to a clean clone (plus ~275 MB less context).
+third_party/onnxruntime/

@@ -7,7 +7,6 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
-#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -21,7 +20,8 @@
 namespace turbo_ocr::server {
 
 /// Prometheus-compatible metrics with zero external dependencies.
-/// Thread-safe via atomics (counters) and a mutex (histogram buckets).
+/// Thread-safe via atomics only — counters are relaxed RMWs; the histogram
+/// uses the release/acquire protocol documented at record_request().
 class Metrics {
 public:
   // ── Route index (used as label dimension) ──────────────────────────────
@@ -32,6 +32,8 @@ public:
     kOcrBatch,
     kOcrPixels,
     kOcrPdf,
+    kOcrMarkdown,
+    kInfer,
     kHealth,
     kOther,
     kRouteCount
@@ -40,16 +42,20 @@ public:
   static constexpr const char *route_name(Route r) {
     constexpr const char *names[] = {
         "/ocr", "/ocr/raw", "/ocr/batch", "/ocr/pixels", "/ocr/pdf",
-        "/health", "other"};
+        "/ocr/markdown", "/infer", "/health", "other"};
+    static_assert(sizeof(names) / sizeof(names[0]) == kRouteCount,
+                  "route label table out of sync with the Route enum");
     return names[r];
   }
 
   static Route route_from_path(std::string_view path) {
-    if (path == "/ocr")        return kOcr;
-    if (path == "/ocr/raw")    return kOcrRaw;
-    if (path == "/ocr/batch")  return kOcrBatch;
-    if (path == "/ocr/pixels") return kOcrPixels;
-    if (path == "/ocr/pdf")    return kOcrPdf;
+    if (path == "/ocr")          return kOcr;
+    if (path == "/ocr/raw")      return kOcrRaw;
+    if (path == "/ocr/batch")    return kOcrBatch;
+    if (path == "/ocr/pixels")   return kOcrPixels;
+    if (path == "/ocr/pdf")      return kOcrPdf;
+    if (path == "/ocr/markdown") return kOcrMarkdown;
+    if (path == "/infer")        return kInfer;
     if (path == "/health" || path == "/health/live" || path == "/health/ready")
       return kHealth;
     // Any other matched handler (e.g. the CPU build's /profile) is bucketed

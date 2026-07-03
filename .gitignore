@@ -6,7 +6,6 @@
 __pycache__/
 .pytest_cache/
 .venv*/
-.claude/
 *.trt
 *.engine
 *.pyc

@@ -129,7 +129,7 @@ void register_capabilities_route(const CapabilitiesInfo &info) {
   body += R"(},"endpoints":["/health","/health/live","/health/ready",)"
           R"("/metrics","/capabilities","/ocr","/ocr/raw","/ocr/batch",)"
           R"("/ocr/pixels","/ocr/pdf")";
-  if (info.is_gpu) body += R"(,"/ocr/markdown","/infer")";
+  if (info.is_gpu) body += R"(,"/ocr/markdown","/infer","/ocr/stream")";
   if (info.profile_endpoint) body += R"(,"/profile")";
   body += "]";
 

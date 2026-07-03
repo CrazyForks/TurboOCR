@@ -413,6 +413,12 @@ int main(int argc, char **argv) try {
                                         /*default_dpi=*/100,
                                         cfg.max_pdf_pages,
                                         /*doc_ori_available=*/!doc_ori_model.empty());
+  turbo_ocr::routes::register_ocr_stream_route_gpu(work_pool, *dispatcher, pdf_renderer, decode,
+                                                   default_pdf_mode, layout_available,
+                                                   table_avail, formula_avail,
+                                                   /*default_dpi=*/100,
+                                                   cfg.max_pdf_pages,
+                                                   /*doc_ori_available=*/!doc_ori_model.empty());
 
   // GET /capabilities (M6) — advertise this build's honored feature set so a
   // client can discover the known GPU/CPU divergences without trial requests.

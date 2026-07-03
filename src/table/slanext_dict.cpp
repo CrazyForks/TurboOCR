@@ -1,5 +1,7 @@
 #include "turbo_ocr/table/slanext_dict.h"
 
+#include "turbo_ocr/table/table_types.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
@@ -8,10 +10,12 @@
 
 namespace turbo_ocr::table {
 
+namespace {
+
 // Verbatim PaddleX table_structure_dict_ch.txt — 48 base tokens.
 // Whitespace and quoting are byte-for-byte; alteration breaks SLANeXt
 // vocab alignment.
-const std::string_view DEFAULT_DICT_TEXT =
+constexpr std::string_view kDefaultDictText =
     "<thead>\n"
     "</thead>\n"
     "<tr>\n"
@@ -61,6 +65,49 @@ const std::string_view DEFAULT_DICT_TEXT =
     "<tbody>\n"
     "</tbody>\n";
 
+// Count of non-empty \n-separated lines — the base-token count from_text() sees.
+constexpr std::size_t count_base_tokens(std::string_view t) noexcept {
+    std::size_t n = 0, run = 0;
+    for (char c : t) {
+        if (c == '\n') { n += (run != 0); run = 0; }
+        else ++run;
+    }
+    return n + (run != 0);
+}
+
+// True if any whole line of `text` equals `needle`.
+constexpr bool has_token_line(std::string_view text, std::string_view needle) noexcept {
+    for (std::size_t i = 0; i <= text.size();) {
+        const std::size_t nl = text.find('\n', i);
+        const std::size_t end = (nl == std::string_view::npos) ? text.size() : nl;
+        if (text.substr(i, end - i) == needle) return true;
+        if (nl == std::string_view::npos) break;
+        i = nl + 1;
+    }
+    return false;
+}
+
+// Compile-time model of build(): merge_no_span_structure appends "<td></td>"
+// when absent and drops "<td>", then sos/eos wrap the sequence.
+constexpr std::size_t realized_vocab(std::string_view text) noexcept {
+    std::size_t n = count_base_tokens(text);
+    if (!has_token_line(text, "<td></td>")) ++n;
+    if (has_token_line(text, "<td>")) --n;
+    return n + 2;
+}
+
+// The bundled vocabulary is load-bearing: SLANeXt token IDs index directly into
+// it, so a stray edit would silently corrupt every decoded table. Pin the shape
+// here so mistakes fail the build, not TEDS.
+static_assert(count_base_tokens(kDefaultDictText) == 48,
+              "bundled SLANeXt dict must hold exactly 48 base tokens");
+static_assert(realized_vocab(kDefaultDictText) == SLANEXT_VOCAB,
+              "bundled dict is out of sync with SLANEXT_VOCAB");
+
+} // namespace
+
+const std::string_view DEFAULT_DICT_TEXT = kDefaultDictText;
+
 CharDict CharDict::build(std::vector<std::string> base) {
     if (std::none_of(base.begin(), base.end(),
                      [](const std::string& s) { return s == "<td></td>"; })) {
@@ -109,8 +156,15 @@ std::string_view CharDict::token(std::size_t idx) const {
 
 bool CharDict::is_td_token(std::size_t idx) const {
     if (idx >= chars_.size()) return false;
-    const std::string& t = chars_[idx];
-    return t == "<td>" || t == "<td" || t == "<td></td>";
+    // The three td-bbox tokens have distinct lengths, so a size switch dispatches
+    // in O(1) and the common non-td token returns without any string compare.
+    const std::string_view t = chars_[idx];
+    switch (t.size()) {
+        case 3: return t == "<td";
+        case 4: return t == "<td>";
+        case 9: return t == "<td></td>";
+        default: return false;
+    }
 }
 
 CharDict default_dict() {

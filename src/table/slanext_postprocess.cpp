@@ -1,7 +1,8 @@
 #include "turbo_ocr/table/slanext_postprocess.h"
 
-#include <algorithm>
+#include <array>
 #include <limits>
+#include <utility>
 
 namespace turbo_ocr::table {
 
@@ -37,12 +38,20 @@ StructureResult decode_structure(
     // PaddleX: `scales[0::2] = [h_scale]*4; scales[1::2] = [w_scale]*4`.
     // h_scale lands on x-coordinate indices — preserved literally for
     // byte-equal output, even though the naming looks swapped.
-    const float scales[8] = {
+    const std::array<float, 8> scales = {
         h_scale, w_scale, h_scale, w_scale, h_scale, w_scale, h_scale, w_scale,
     };
 
-    std::vector<std::string> structure;
-    structure.reserve(t);
+    // Emit straight into the final wrapped sequence: the intermediate token
+    // vector and its move-loop are pure overhead. `t` bounds the kept tokens,
+    // so one reservation covers the wrapper tags plus every decoded token with
+    // no reallocation.
+    std::vector<std::string> html;
+    html.reserve(t + 6);
+    html.emplace_back("<html>");
+    html.emplace_back("<body>");
+    html.emplace_back("<table>");
+
     std::vector<StructureCell> cells;
     float score_sum = 0.0f;
     std::size_t score_n = 0;
@@ -60,7 +69,6 @@ StructureResult decode_structure(
         if (step > 0 && best_i == eos) break;
         if (best_i == sos || best_i == eos) continue;
 
-        std::string_view token = dict.token(best_i);
         if (dict.is_td_token(best_i)) {
             const float* lrow = loc_preds + step * 8;
             std::array<int, 8> bbox{};
@@ -69,29 +77,23 @@ StructureResult decode_structure(
             }
             // A blank (all-zero) quad means "no detected cell box". Push it as a
             // POSITIONAL PLACEHOLDER anyway so `cells` stays index-aligned with the
-            // <td> tokens in `structure`: dropping the slot shifts every later
-            // cell's text by one (silent content corruption on tables with empty
-            // cells). A zero-area quad matches no OCR line and renders <td></td>.
+            // <td> tokens: dropping the slot shifts every later cell's text by one
+            // (silent content corruption on tables with empty cells). A zero-area
+            // quad matches no OCR line and renders <td></td>.
             cells.push_back(StructureCell{best_i, bbox});
         }
-        structure.emplace_back(token);
+        html.emplace_back(dict.token(best_i));
         score_sum += best_v;
         ++score_n;
     }
 
-    std::vector<std::string> wrapped;
-    wrapped.reserve(structure.size() + 6);
-    wrapped.emplace_back("<html>");
-    wrapped.emplace_back("<body>");
-    wrapped.emplace_back("<table>");
-    for (auto& s : structure) wrapped.emplace_back(std::move(s));
-    wrapped.emplace_back("</table>");
-    wrapped.emplace_back("</body>");
-    wrapped.emplace_back("</html>");
+    html.emplace_back("</table>");
+    html.emplace_back("</body>");
+    html.emplace_back("</html>");
 
     const float structure_score =
         score_n > 0 ? score_sum / static_cast<float>(score_n) : 0.0f;
-    return StructureResult{std::move(wrapped), std::move(cells), structure_score};
+    return StructureResult{std::move(html), std::move(cells), structure_score};
 }
 
 } // namespace turbo_ocr::table

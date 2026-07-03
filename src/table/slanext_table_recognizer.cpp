@@ -88,24 +88,41 @@ SlanextTableRecognizer::run(const GpuImage &page, const std::vector<Box> &region
   std::vector<router::TableResult> out;
   out.reserve(regions.size());
 
+  // Per-region scratch hoisted out of the loop: cleared (capacity retained)
+  // each region so recognizing N tables on one page reuses a single set of
+  // buffers instead of re-allocating per region. region_ocr and region_texts
+  // stay index-aligned — the matcher returns indices into region_ocr and
+  // reconstruct_html reads the same indices out of region_texts.
+  std::vector<OcrLine>            region_ocr;
+  std::vector<std::string>        region_texts;
+  std::vector<std::array<int, 8>> quads;
+  std::vector<Box>                empty_boxes;
+  std::vector<std::size_t>        empty_ci;
+  region_ocr.reserve(page_ocr.size());
+  region_texts.reserve(page_ocr.size());
+
   for (std::size_t ti = 0; ti < regions.size(); ++ti) {
    try {
-    const Box &region = regions[ti];
-    int rx = INT_MAX, ry = INT_MAX, rax2 = INT_MIN, ray2 = INT_MIN;
-    for (const auto &p : region.pts) {
-      rx = std::min(rx, p[0]); ry = std::min(ry, p[1]);
-      rax2 = std::max(rax2, p[0]); ray2 = std::max(ray2, p[1]);
-    }
-    rx = std::max(rx, 0); ry = std::max(ry, 0);  // match infer()'s clamp origin
+    region_ocr.clear();
+    region_texts.clear();
+    quads.clear();
+    empty_boxes.clear();
+    empty_ci.clear();
 
-    const auto sr = wired_->infer(page, region, stream);
+    const Box &region = regions[ti];
+    // Crop origin the region-local cell quads are shifted back by; must equal
+    // the (page top-left–clamped) origin infer() crops at. Same aabb() helper
+    // infer() uses, so the two stay in lockstep by construction.
+    const auto rb = aabb(region);
+    const int rx = std::max(rb[0], 0), ry = std::max(rb[1], 0);
+    const int rax2 = rb[2], ray2 = rb[3];
+
+    const StructureResult sr = wired_->infer(page, region, stream);
 
     // Cells from the page text-OCR: geometry-match each structure-order cell
     // quad to OCR lines inside the region, then reconstruct_html substitutes.
-    std::vector<OcrLine> region_ocr;
-    std::vector<std::string> region_texts;
-    region_ocr.reserve(page_ocr.size());
-    region_texts.reserve(page_ocr.size());
+    // The matcher reads only OcrLine.bbox, so each in-region string is copied
+    // once into region_texts (its index pool); region_ocr carries geometry only.
     for (const auto &r : page_ocr) {
       int bx1 = INT_MAX, by1 = INT_MAX, bx2 = INT_MIN, by2 = INT_MIN, cx = 0, cy = 0;
       for (const auto &p : r.box.pts) {
@@ -117,11 +134,10 @@ SlanextTableRecognizer::run(const GpuImage &page, const std::vector<Box> &region
       if (cx < rx || cx > rax2 || cy < ry || cy > ray2) continue;
       region_ocr.push_back(OcrLine{{static_cast<float>(bx1), static_cast<float>(by1),
                                     static_cast<float>(bx2), static_cast<float>(by2)},
-                                   r.text});
+                                   {}});
       region_texts.push_back(r.text);
     }
     // SLANeXt per-token cell quads are region-local -> shift to page coords.
-    std::vector<std::array<int, 8>> quads;
     quads.reserve(sr.cells.size());
     for (const auto &c : sr.cells) {
       std::array<int, 8> q = c.bbox;
@@ -135,17 +151,14 @@ SlanextTableRecognizer::run(const GpuImage &page, const std::vector<Box> &region
     // detector under-segmented (the dominant local-table content loss). One
     // batched rec call per table over all empty cells; page-coordinate quads.
     if (cell_rec_ && !matched.empty()) {
-      std::vector<Box> empty_boxes;
-      std::vector<std::size_t> empty_ci;
       for (std::size_t ci = 0; ci < matched.size() && ci < quads.size(); ++ci) {
         if (!matched[ci].ocr_indices.empty()) continue;
         const auto &q = quads[ci];
         const int w = std::abs(q[2] - q[0]);
         const int h = std::abs(q[5] - q[1]);
         if (w < 4 || h < 4) continue;  // skip degenerate / spacer cells
-        Box b;
-        b.pts = {{{q[0], q[1]}, {q[2], q[3]}, {q[4], q[5]}, {q[6], q[7]}}};
-        empty_boxes.push_back(b);
+        empty_boxes.push_back(
+            Box{{{{q[0], q[1]}, {q[2], q[3]}, {q[4], q[5]}, {q[6], q[7]}}}});
         empty_ci.push_back(ci);
       }
       if (!empty_boxes.empty()) {

@@ -1,7 +1,7 @@
 #include "turbo_ocr/table/table_recognizer.h"
 
-#include <cstdlib>
 #include <iostream>
+#include <memory>
 
 #include "turbo_ocr/backends/openai_endpoint.h"
 #include "turbo_ocr/routing/routing_config.h"

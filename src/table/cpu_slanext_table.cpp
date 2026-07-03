@@ -161,12 +161,26 @@ StructureResult CpuSlanextEncoder::infer(const cv::Mat &page, const Box &region)
   const int rh = std::clamp(bb[3] - ry, 1, page.rows - ry);
   if (rw <= 0 || rh <= 0) return empty;
 
-  cv::Mat crop = page(cv::Rect(rx, ry, rw, rh)).clone();  // contiguous BGR8
+  // Zero-copy ROI view: slanext_preprocess samples through crop.step, so it
+  // honours the parent's row stride directly and needs no contiguous clone.
+  // Reading the shared page data yields byte-identical samples to a cloned copy
+  // (same pixels, same order) — the clone was pure defensiveness, so dropping it
+  // removes a per-region allocation + copy without changing the encoder input.
+  const cv::Mat crop = page(cv::Rect(rx, ry, rw, rh));
 
-  std::vector<float> in_chw;
+  // Per-thread scratch reused across regions: both the preprocess input and the
+  // encoder output are fixed-shape, so after the first infer() each already
+  // holds its capacity and steady-state inference allocates nothing (kills the
+  // per-region ~2.9 MB in_chw + feat heap churn plain locals incurred). Values
+  // written are identical to fresh locals — slanext_preprocess unconditionally
+  // fills all 3*DST*DST elements (content + zero pad) and the encoder Run fully
+  // overwrites feat — so the encoder I/O, and thus the decode, is bit-unchanged.
+  // thread_local (not a member) keeps a pipeline pool race-free without locking.
+  thread_local std::vector<float> in_chw;
+  thread_local std::vector<float> feat;
   slanext_preprocess(crop, in_chw);
+  feat.resize(static_cast<std::size_t>(kTenc) * kCtx);
 
-  std::vector<float> feat(static_cast<std::size_t>(kTenc) * kCtx);
   try {
     const std::array<int64_t, 4> in_shape{1, 3, DST, DST};
     Ort::Value xv = Ort::Value::CreateTensor<float>(

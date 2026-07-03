@@ -5,7 +5,7 @@ pipeline targets. This page documents the current score, the round-by-round
 trajectory, where the remaining gaps live, and how to reproduce the numbers
 locally.
 
-## Headline (full 1651-page run — SOTA integration, 2026-05-17)
+## Headline (full 1651-page run — model integration, 2026-05-17)
 
 These are the **full 1651-page** scores from the 2026-05-17 run. The formula CDM 0.063 below was an
 integration bug that has **since been fixed** — the current in-process PP-FormulaNet-S stage scores
@@ -22,7 +22,7 @@ The full-1651 composite still embeds the old broken-formula 0.063, so it is a fl
 | reading_order Edit_dist (ALL_page_avg) | full 1651 | **0.326** | ↓ | Down from 0.451 (R1/R2/R3 + locality improvements) |
 
 Source JSON: `omnidocbench/result/md_quick_match_metric_result.json`
-(regenerated 2026-05-17 after SOTA integration). 1651/1651 pages
+(regenerated 2026-05-17 after the model integration). 1651/1651 pages
 evaluated, 0 timeouts, 0 exceptions.
 
 ### Current formula state (125-doc subset)
@@ -45,7 +45,7 @@ the same eval config.
 |---|---|---:|---:|---:|---:|---:|
 | baseline (v1) | 2026-05-14 | 0.5087 | 0.0274 | 0.4494 | 0.5190 | 32.27 |
 | optim (R1+R2+R3) | 2026-05-15 | 0.5002 | 0.0274 | 0.4465 | 0.4513 | 32.46 |
-| **SOTA integration** | **2026-05-17** | **0.160** | **0.568** | 0.063 *(bug, since fixed)* | **0.326** | **≈ 49.0** |
+| **Model integration** | **2026-05-17** | **0.160** | **0.568** | 0.063 *(bug, since fixed)* | **0.326** | **≈ 49.0** |
 
 (All rows are the **full 1651-page** set.) Net delta vs baseline: **+16.7 composite points**
 (32.27 → 49.0). The forensic prediction in internal engineering notes was +25 from
@@ -57,7 +57,7 @@ composite above understates the current pipeline and is pending a re-measure.
 
 Baseline (May 14) numbers are sourced from internal engineering notes
 §1 because the on-disk `md_quick_match_metric_result.json` was overwritten
-by today's SOTA regen. The May 15 optim numbers come from
+by the integration-day regen. The May 15 optim numbers come from
 `omnidocbench/result/md_optim_quick_match_metric_result.json` (still on
 disk).
 
@@ -67,7 +67,7 @@ CJK collapse: simplified_chinese dropped from 0.935 → 0.234, traditional
 from 0.931 → 0.486. en_ch_mixed dropped from 0.428 → 0.177. English held
 flat at the leaderboard-competitive 0.079.
 
-| Language | May 15 optim | May 17 SOTA | Δ |
+| Language | May 15 optim | May 17 integration | Δ |
 |---|---:|---:|---:|
 | **english** | 0.078 | **0.079** | +0.001 (flat) |
 | en_ch_mixed | 0.428 | **0.177** | **−0.251** |
@@ -86,7 +86,7 @@ coverage is partial.
 Now with `reading_order[]` exposed on the server JSON, the column splitter
 landed, and tables/figures resolve in-place rather than free-floating.
 
-| Layout | May 15 optim | May 17 SOTA | Δ |
+| Layout | May 15 optim | May 17 integration | Δ |
 |---|---:|---:|---:|
 | layout: three_column | 0.2418 | **0.2160** | −0.0258 |
 | layout: double_column | 0.3940 | **0.3143** | −0.0797 |
@@ -156,18 +156,18 @@ and continued reading-order work.
 ```mermaid
 xychart-beta
     title "OmniDocBench composite — round-by-round"
-    x-axis ["v1 baseline (May 14)", "optim R1+R2+R3 (May 15)", "SOTA integration (May 17)"]
+    x-axis ["v1 baseline (May 14)", "optim R1+R2+R3 (May 15)", "model integration (May 17)"]
     y-axis "Composite Overall" 0 --> 60
     bar [32.27, 32.46, 49.0]
     line [32.27, 32.46, 49.0]
 ```
 
-The optim step (+0.19) and the SOTA step (+16.5) tell the order of
+The optim step (+0.19) and the integration step (+16.5) tell the order of
 operations: pure-code wins were small because the floor was held down by
 upstream model availability; once the tables and CJK gates opened, the
-composite jumped accordingly. The `md_sota_v*` series in
-`omnidocbench/result/` (v2…v30) records the intermediate model-swap and
-re-export iterations that funnelled into today's SOTA tag — see
+composite jumped accordingly. The intermediate result series in
+`omnidocbench/result/` (v2…v30) records the model-swap and
+re-export iterations that funnelled into the final run — see
 internal engineering notes for the per-attempt diary.
 
 ## 6. Reproduce
@@ -218,7 +218,7 @@ timeout 11000 bash scripts/bench_cua_loop.sh
 
 ## 7. Net read
 
-The SOTA integration realized both forensic-predicted wins on text and
+The model integration realized both forensic-predicted wins on text and
 tables (+10 and +25 composite pts respectively), landing the full-1651 composite
 at ~49. The formula CDM regression that depressed that run is **now fixed**: the in-process
 PP-FormulaNet-S decoder emits literal LaTeX and scores **CDM 0.805 on the 125-doc table/formula

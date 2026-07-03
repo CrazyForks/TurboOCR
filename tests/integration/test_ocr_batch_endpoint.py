@@ -97,6 +97,34 @@ class TestOcrBatchEndpoint:
         )
         assert r.status_code == 400
 
+    def test_batch_two_jpegs(self, server_url, hello_image, numbers_image):
+        """Regression (GitHub #22): >=2 JPEGs in one batch is the ONLY way to
+        reach the nvJPEG batched-decode path (single JPEG and mixed PNG+JPEG
+        stay on per-image decode). That path used to hand nvjpegDecodeBatched
+        host output pointers, poisoning the CUDA context (502 + process exit).
+        """
+        b64_1 = pil_to_base64(hello_image, "JPEG")
+        b64_2 = pil_to_base64(numbers_image, "JPEG")
+        r = requests.post(
+            f"{server_url}/ocr/batch",
+            json={"images": [b64_1, b64_2]},
+            timeout=30,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["batch_results"]) == 2
+        for i, slot in enumerate(data["batch_results"]):
+            assert slot["results"], f"slot {i} decoded to no text: {slot}"
+
+        # The context must survive: a follow-up request still works.
+        r2 = requests.post(
+            f"{server_url}/ocr/batch",
+            json={"images": [b64_1, b64_2, b64_1]},
+            timeout=30,
+        )
+        assert r2.status_code == 200
+        assert len(r2.json()["batch_results"]) == 3
+
     def test_batch_mixed_formats(self, server_url, hello_image, numbers_image):
         """Batch with mixed PNG and JPEG images should work."""
         b64_png = pil_to_base64(hello_image, "PNG")
@@ -109,3 +137,45 @@ class TestOcrBatchEndpoint:
         assert r.status_code == 200
         data = r.json()
         assert len(data["batch_results"]) == 2
+
+    def test_batch_partial_failure_preserves_order(self, server_url,
+                                                    hello_image, numbers_image):
+        """A garbage image in the middle must NOT drop or shift the others: the
+        response keeps a 1:1 slot mapping, the errors[] array flags only the bad
+        slot (non-null), and the two valid slots still carry their text. This is
+        the failure-isolation contract the single-image tests can't reach."""
+        import base64
+        good1 = pil_to_base64(hello_image, "JPEG")
+        good2 = pil_to_base64(numbers_image, "JPEG")
+        garbage = base64.b64encode(b"\xff\xd8not-a-real-jpeg\x00\x01").decode("ascii")
+        r = requests.post(
+            f"{server_url}/ocr/batch",
+            json={"images": [good1, garbage, good2]},
+            timeout=15,
+        )
+        assert r.status_code == 200, r.text[:300]
+        data = r.json()
+        assert len(data["batch_results"]) == 3
+        errors = data.get("errors", [None, None, None])
+        assert errors[0] is None, f"valid slot 0 flagged as error: {errors[0]}"
+        assert errors[1] is not None, "garbage slot 1 was not flagged as an error"
+        assert errors[2] is None, f"valid slot 2 flagged as error: {errors[2]}"
+        # The valid slots must still carry text (not shifted into slot 1's place).
+        assert data["batch_results"][0]["results"], "slot 0 lost its text"
+        assert data["batch_results"][2]["results"], "slot 2 lost its text"
+
+    def test_batch_zero_byte_slot(self, server_url, hello_image):
+        """An empty-bytes slot is a decode failure, isolated to that slot."""
+        import base64
+        good = pil_to_base64(hello_image, "PNG")
+        empty = base64.b64encode(b"").decode("ascii")
+        r = requests.post(
+            f"{server_url}/ocr/batch",
+            json={"images": [good, empty]},
+            timeout=15,
+        )
+        assert r.status_code == 200, r.text[:300]
+        data = r.json()
+        assert len(data["batch_results"]) == 2
+        assert data.get("errors", [None, None])[1] is not None
+        assert data["batch_results"][0]["results"], "valid slot lost its text"

@@ -131,3 +131,56 @@ TEST_CASE("DET_MAX_SIDE shrinks both the buffer and the resize cap together", "[
     ::unsetenv("DET_MAX_SIDE");
   }
 }
+
+// Regression (GitHub #23): DET_LIMIT_TYPE=max alone used to inherit the
+// min-policy default limit_side_len=64, which under max semantics means
+// "shrink the LONGEST side to 64px" — every image became a thumbnail and OCR
+// silently returned zero results.
+TEST_CASE("DET_LIMIT_TYPE=max without DET_LIMIT_SIDE_LEN targets the max-side cap",
+          "[det_config]") {
+  ::unsetenv("DET_MAX_SIDE");
+  ::unsetenv("DET_MAX_SIDE_LIMIT");
+  ::unsetenv("DET_LIMIT_TYPE");
+  ::unsetenv("DET_LIMIT_SIDE_LEN");
+
+  SECTION("bare max policy keeps native resolution up to the cap") {
+    ::setenv("DET_LIMIT_TYPE", "max", 1);
+    auto p = read_det_resize();
+    CHECK(p.limit_side_len == p.max_side_limit);
+    auto [rh, rw] = compute_det_resize(1000, 800, p);
+    CHECK(std::max(rh, rw) >= 960);  // near-native, NOT a 64px thumbnail
+    ::unsetenv("DET_LIMIT_TYPE");
+  }
+
+  SECTION("issue #23 env combo: max policy + DET_MAX_SIDE_LIMIT=2560") {
+    ::setenv("DET_LIMIT_TYPE", "max", 1);
+    ::setenv("DET_MAX_SIDE_LIMIT", "2560", 1);
+    auto p = read_det_resize();
+    CHECK(p.limit_side_len == 2560);
+    auto [rh, rw] = compute_det_resize(4000, 3000, p);
+    CHECK(std::max(rh, rw) == 2560);  // capped, not thumbnailed
+    ::unsetenv("DET_LIMIT_TYPE");
+    ::unsetenv("DET_MAX_SIDE_LIMIT");
+  }
+
+  SECTION("explicit DET_LIMIT_SIDE_LEN under max policy is honored") {
+    ::setenv("DET_LIMIT_TYPE", "max", 1);
+    ::setenv("DET_LIMIT_SIDE_LEN", "960", 1);
+    auto p = read_det_resize();
+    CHECK(p.limit_side_len == 960);
+    auto [rh, rw] = compute_det_resize(4000, 3000, p);
+    CHECK(std::max(rh, rw) == 960);
+    ::unsetenv("DET_LIMIT_TYPE");
+    ::unsetenv("DET_LIMIT_SIDE_LEN");
+  }
+
+  SECTION("garbage/zero numeric envs clamp instead of thumbnailing to 0") {
+    ::setenv("DET_MAX_SIDE_LIMIT", "0", 1);
+    ::setenv("DET_LIMIT_SIDE_LEN", "junk", 1);
+    auto p = read_det_resize();
+    CHECK(p.max_side_limit >= 32);
+    CHECK(p.limit_side_len >= 32);
+    ::unsetenv("DET_MAX_SIDE_LIMIT");
+    ::unsetenv("DET_LIMIT_SIDE_LEN");
+  }
+}

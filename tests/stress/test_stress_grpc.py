@@ -6,17 +6,27 @@ grpc_target fixture from tests/conftest.py.
 
 import concurrent.futures
 import os
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
 pytestmark = pytest.mark.stress
 
+# Generated stubs live in tests/_grpc_generated. Import them the way
+# test_grpc_endpoint.py does (dir on sys.path) — `from tests._grpc_generated
+# import ...` only resolves when the repo root is on sys.path, which it isn't
+# when pytest runs with tests/ as rootdir, so the soak silently skipped.
+_GRPC_GENERATED = Path(__file__).resolve().parent.parent / "_grpc_generated"
+
 
 def test_stress_grpc_recognize(grpc_target):
     try:
         import grpc
-        from tests._grpc_generated import ocr_pb2, ocr_pb2_grpc  # type: ignore
+        sys.path.insert(0, str(_GRPC_GENERATED))
+        import ocr_pb2
+        import ocr_pb2_grpc
     except Exception as e:
         pytest.skip(f"gRPC stack unavailable: {e}")
 

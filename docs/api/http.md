@@ -31,6 +31,7 @@ Parsed by `server::parse_query_options()` in
 | `as_blocks` | `0` | Emit paragraph-level `blocks`. Auto-enables `layout` + `reading_order`. |
 | `tables` | `0` | Run the table branch (SLANeXt, or a VLM backend) and emit `tables`. Strict opt-in: `1` requires a table backend configured at startup, else `400 TABLE_BACKEND_DISABLED`. Auto-enables `layout`. |
 | `formulas` | `0` | Run the formula branch (PP-FormulaNet-S, in-process ORT-CUDA-13) and emit `formulas`. Strict opt-in: `1` requires a formula backend configured at startup, else `400 FORMULA_BACKEND_DISABLED`. Auto-enables `layout`. |
+| `text` | `1` | The one opt-OUT flag. `text=0` skips text detection/recognition entirely: with `layout=1` the request is a layout-only pass (`results` comes back empty); on `/ocr/pdf`, `text=0&images=inline` is the fast page-images path with zero OCR cost, and adding `layout=1` yields layout + image per page. Rejected with `tables`/`formulas`/`as_blocks`/`reading_order` (all consume recognized text), on `/ocr/batch`, and on the CPU build. |
 
 !!! note "Optional fields stay byte-identical when empty"
     `layout`, `reading_order`, `blocks`, `tables`, `formulas` are
@@ -419,6 +420,54 @@ Error codes: `MISSING_PDF`, `MISSING_FILE`, `INVALID_MULTIPART`,
 `AUTOROTATE_DISABLED`.
 
 ---
+
+## `POST /ocr/stream`
+
+GPU build only. **One streaming endpoint for PDFs and single images**
+(content-sniffed by magic bytes): the response is `application/x-ndjson` —
+one JSON object per line, flushed as produced. Built for streaming consumers:
+a RAG ingester can start chunking/embedding page 1 while pages 2…N are still
+being OCR'd, instead of waiting for the whole document.
+
+Accepts the same query parameters as `/ocr/pdf` (`layout`, `text`, `tables`,
+`formulas`, `dpi`, `mode`, `images=inline`, `autorotate`, …).
+
+Line protocol:
+
+```text
+{"event":"meta","kind":"pdf","pages":500,"dpi":100,"mode":"ocr"}
+{"event":"page", ...same shape as an /ocr/pdf pages[] element...}
+{"event":"page_error","page_index":17}
+{"event":"error","code":"..."}            # job-level failure mid-stream
+{"event":"end","pages":500,"failed":0}
+```
+
+Page events arrive **as each page completes — out of order** (that is the
+point); `page_index` identifies the page, so reorder client-side if you need
+to, or don't (embedding doesn't care). Single images produce exactly
+`meta` → `page` → `end`. Errors detected before the first byte are normal
+HTTP 4xx; once streaming has begun they arrive as `error` events (the 200 is
+already on the wire — chunked transfer has no second status line).
+
+```bash
+curl -sN -X POST 'http://localhost:8000/ocr/stream?layout=1' \
+     --data-binary @doc.pdf -H 'Content-Type: application/pdf' |
+  while read -r line; do echo "$line" | jq -r '.event'; done
+```
+
+```python
+with requests.post(url + "/ocr/stream", data=pdf_bytes, stream=True,
+                   headers={"Content-Type": "application/pdf"}) as r:
+    for line in r.iter_lines():
+        ev = json.loads(line)
+        if ev["event"] == "page":
+            embed_page(ev["page_index"], ev["results"])   # overlap with OCR
+```
+
+!!! warning "Keep-alive required"
+    Chunked streaming needs a keep-alive connection. A request carrying
+    `Connection: close` (python `urllib` sends this) is rejected with a 400
+    rather than returning a silently-empty body — use `requests`/`httpx`.
 
 ## `POST /ocr/markdown`
 

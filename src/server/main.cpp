@@ -285,14 +285,17 @@ int main(int argc, char **argv) try {
     // bools. The dispatcher itself is long-lived and captured by reference.
     // On deadline this throws turbo_ocr::TimeoutError; the route's
     // run_with_error_handling maps it to HTTP 504 (INFERENCE_TIMEOUT).
+    const bool want_text = opts.want_text;
     const bool want_layout = opts.want_layout;
     const bool want_reading_order = opts.want_reading_order;
     const bool want_tables = opts.want_tables;
     const bool want_formulas = opts.want_formulas;
     const auto routing_override = opts.routing_override;  // by-value (timeout-safe)
     auto out = dispatcher->submit_for_default(
-        [img, want_layout, want_reading_order, want_tables, want_formulas,
-         routing_override](auto &e) {
+        [img, want_text, want_layout, want_reading_order, want_tables,
+         want_formulas, routing_override](auto &e) {
+          if (!want_text)
+            return e.pipeline->run_layout_only(img, e.stream);
           return e.pipeline->run_with_layout(img, e.stream, want_layout,
                                              want_reading_order, routing_override,
                                              /*defer_external=*/false,
@@ -410,6 +413,12 @@ int main(int argc, char **argv) try {
                                         /*default_dpi=*/100,
                                         cfg.max_pdf_pages,
                                         /*doc_ori_available=*/!doc_ori_model.empty());
+  turbo_ocr::routes::register_ocr_stream_route_gpu(work_pool, *dispatcher, pdf_renderer, decode,
+                                                   default_pdf_mode, layout_available,
+                                                   table_avail, formula_avail,
+                                                   /*default_dpi=*/100,
+                                                   cfg.max_pdf_pages,
+                                                   /*doc_ori_available=*/!doc_ori_model.empty());
 
   // GET /capabilities (M6) — advertise this build's honored feature set so a
   // client can discover the known GPU/CPU divergences without trial requests.

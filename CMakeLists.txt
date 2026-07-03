@@ -494,6 +494,65 @@ else()
     endif()
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -lineinfo --expt-relaxed-constexpr")
 
+    # --- ONNX Runtime (GPU build: CUDA execution provider REQUIRED) ---
+    # ort_session.cpp creates its sessions on ORT's CUDA EP
+    # (CreateCUDAProviderOptions), which needs libonnxruntime.so PLUS
+    # libonnxruntime_providers_cuda.so side by side. The official
+    # onnxruntime-linux-<arch>-<ver>.tgz release asset is CPU-ONLY — it would
+    # configure and link fine here and then fail at runtime when the formula
+    # backend asks for the CUDA EP. So: discover, then hard-require the CUDA
+    # EP at configure time instead of fetching a wrong-flavor tarball.
+    # third_party/ is searched first (the vendored copy is the known-good
+    # CUDA-enabled build); /usr/local second.
+    find_library(ONNXRUNTIME_LIB onnxruntime
+        HINTS ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/lib /usr/local/lib)
+    find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+        HINTS ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/include /usr/local/include)
+    if((NOT ONNXRUNTIME_LIB OR NOT ONNXRUNTIME_INCLUDE_DIR)
+       AND TURBO_ARCH STREQUAL "x64")
+        # Clean-clone fallback: fetch the official CUDA-13 GPU build (the
+        # gpu_cuda13 release asset — the plain tarball is CPU-only and would
+        # break the formula backends at runtime). Same pin as Dockerfile.gpu.
+        include(FetchContent)
+        set(ORT_GPU_VERSION "1.27.0" CACHE STRING "ONNX Runtime (GPU/CUDA-13) version to fetch")
+        set(ORT_GPU_SHA256 "1a3227e1dc2f53d9f877c93278af500b15e26d99aa5ade877692138b3ab7d351"
+            CACHE STRING "onnxruntime-linux-x64-gpu_cuda13 tarball SHA256")
+        message(STATUS "ONNX Runtime not found; fetching v${ORT_GPU_VERSION} (x64, CUDA 13)")
+        FetchContent_Declare(onnxruntime_gpu_prebuilt
+            URL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_GPU_VERSION}/onnxruntime-linux-x64-gpu_cuda13-${ORT_GPU_VERSION}.tgz"
+            URL_HASH SHA256=${ORT_GPU_SHA256}
+            SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/onnxruntime)
+        FetchContent_MakeAvailable(onnxruntime_gpu_prebuilt)
+        find_library(ONNXRUNTIME_LIB onnxruntime
+            HINTS ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/lib)
+        find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+            HINTS ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/include)
+    endif()
+    if(NOT ONNXRUNTIME_LIB OR NOT ONNXRUNTIME_INCLUDE_DIR)
+        message(FATAL_ERROR
+            "ONNX Runtime not found (looked in third_party/onnxruntime and "
+            "/usr/local). The GPU build needs a CUDA-enabled ONNX Runtime "
+            "(libonnxruntime.so + libonnxruntime_providers_cuda.so + headers); "
+            "the plain onnxruntime-linux-<arch>-<ver>.tgz release asset is "
+            "CPU-only and will NOT work. Microsoft publishes no GPU aarch64 "
+            "tarball — install a CUDA-enabled ORT into "
+            "third_party/onnxruntime/{include,lib} or /usr/local, matching "
+            "your CUDA major version.")
+    endif()
+    get_filename_component(ONNXRUNTIME_LIB_DIR "${ONNXRUNTIME_LIB}" DIRECTORY)
+    find_library(ONNXRUNTIME_CUDA_EP onnxruntime_providers_cuda
+        HINTS ${ONNXRUNTIME_LIB_DIR} NO_DEFAULT_PATH)
+    if(NOT ONNXRUNTIME_CUDA_EP)
+        message(FATAL_ERROR
+            "Found ONNX Runtime at ${ONNXRUNTIME_LIB}, but it has no CUDA "
+            "execution provider (libonnxruntime_providers_cuda.so is not next "
+            "to it). This is the CPU-only distribution; the formula backends "
+            "would fail at runtime. Install a CUDA-enabled ORT build (GPU "
+            "package matching your CUDA major) into third_party/onnxruntime "
+            "or /usr/local instead.")
+    endif()
+    message(STATUS "ONNX Runtime (CUDA EP): ${ONNXRUNTIME_LIB}")
+
     # --- GPU library ---
     add_library(turbo_ocr_gpu STATIC
         src/engine/trt_engine.cpp
@@ -553,7 +612,7 @@ else()
         ${TENSORRT_DIR}/include
         ${PROTO_GEN_DIR}
         ${TURBO_PDFIUM_DIR}/include
-        ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/include   # ort_session.cpp: formula encoder+prep+step via ORT-CUDA-13
+        ${ONNXRUNTIME_INCLUDE_DIR}   # ort_session.cpp: formula encoder+prep+step via ORT-CUDA
     )
     target_link_directories(turbo_ocr_gpu PUBLIC ${TENSORRT_DIR}/lib)
     # Link libpdfium.so directly for in-process text-layer extraction.
@@ -566,7 +625,18 @@ else()
     find_library(TURBOJPEG_LIB turbojpeg REQUIRED)
     message(STATUS "libjpeg-turbo: ${TURBOJPEG_LIB}")
     # libcurl: VLMFormula/VLMTable call an OpenAI-compatible vLLM endpoint.
-    find_library(CURL_LIB curl REQUIRED)
+    # The backends are runtime-opt-in but always compiled, so the dev package
+    # is a hard build dependency — say which one to install instead of
+    # find_library's bare "Could not find CURL_LIB".
+    find_library(CURL_LIB curl)
+    if(NOT CURL_LIB)
+        message(FATAL_ERROR
+            "libcurl development files not found. The VLM table/formula "
+            "clients (src/table/vlm_table.cpp, src/formula/vlm_formula.cpp) "
+            "link libcurl unconditionally even though they are runtime-opt-in. "
+            "Install it first: libcurl4-openssl-dev (Debian/Ubuntu), "
+            "libcurl-devel (Fedora/RHEL), or curl (Arch).")
+    endif()
     message(STATUS "libcurl: ${CURL_LIB}")
     target_link_libraries(turbo_ocr_gpu PUBLIC
         turbo_ocr_common
@@ -578,7 +648,7 @@ else()
         ${TURBO_PDFIUM_DIR}/lib/libpdfium.so
         ${TURBOJPEG_LIB}
         ${CURL_LIB}
-        ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/lib/libonnxruntime.so
+        ${ONNXRUNTIME_LIB}
     )
     target_compile_options(turbo_ocr_gpu PRIVATE ${TURBO_OCR_CXX_FLAGS})
     add_library(turbo_ocr::gpu ALIAS turbo_ocr_gpu)
@@ -641,7 +711,7 @@ else()
     # lib would not be found; DT_RPATH IS searched transitively for such loads.
     set_target_properties(turboocr-server PROPERTIES
         BUILD_RPATH "${TENSORRT_DIR}/lib"
-        INSTALL_RPATH "${TENSORRT_DIR}/lib;${CMAKE_SOURCE_DIR}/third_party/onnxruntime/lib")
+        INSTALL_RPATH "${TENSORRT_DIR}/lib;${ONNXRUNTIME_LIB_DIR}")
     target_link_options(turboocr-server PRIVATE "-Wl,--disable-new-dtags")
 
     # Dev/CI-only drivers — EXCLUDE_FROM_ALL so the default `make` (and the Docker image build)

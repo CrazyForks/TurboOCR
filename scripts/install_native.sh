@@ -42,7 +42,7 @@ info "GPU: $GPU_NAME"
 # ─── Step 1: System packages ────────────────────────────────────────────────
 
 info "Installing system packages (cmake, opencv, protobuf, grpc, nginx, drogon deps)..."
-sudo pacman -S --needed --noconfirm cmake opencv protobuf grpc jsoncpp openssl c-ares nginx
+sudo pacman -S --needed --noconfirm cmake opencv protobuf grpc jsoncpp openssl c-ares nginx curl libjpeg-turbo
 
 # ─── Step 1b: Drogon HTTP framework ────────────────────────────────────────
 

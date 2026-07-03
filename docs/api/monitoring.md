@@ -40,7 +40,7 @@ curl http://localhost:8000/metrics
 
 !!! note "Label values"
     `route` is one of `/ocr`, `/ocr/raw`, `/ocr/batch`, `/ocr/pixels`,
-    `/ocr/pdf`, `/ocr/markdown`, `/infer`, `/health`, `other`. `status` is bucketed by class —
+    `/ocr/pdf`, `/ocr/markdown`, `/infer`, `/ocr/stream`, `/health`, `other`. `status` is bucketed by class —
     `2xx`, `4xx`, or `5xx`, **not** the exact code. The `/health` route is
     intentionally omitted from the latency histogram so probe traffic can't
     skew percentiles (`metrics.h`, the `kHealth` skip in `serialize()`).

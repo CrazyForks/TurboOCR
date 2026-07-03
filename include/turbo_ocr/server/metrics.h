@@ -34,6 +34,7 @@ public:
     kOcrPdf,
     kOcrMarkdown,
     kInfer,
+    kOcrStream,
     kHealth,
     kOther,
     kRouteCount
@@ -42,7 +43,7 @@ public:
   static constexpr const char *route_name(Route r) {
     constexpr const char *names[] = {
         "/ocr", "/ocr/raw", "/ocr/batch", "/ocr/pixels", "/ocr/pdf",
-        "/ocr/markdown", "/infer", "/health", "other"};
+        "/ocr/markdown", "/infer", "/ocr/stream", "/health", "other"};
     static_assert(sizeof(names) / sizeof(names[0]) == kRouteCount,
                   "route label table out of sync with the Route enum");
     return names[r];
@@ -56,6 +57,7 @@ public:
     if (path == "/ocr/pdf")      return kOcrPdf;
     if (path == "/ocr/markdown") return kOcrMarkdown;
     if (path == "/infer")        return kInfer;
+    if (path == "/ocr/stream")   return kOcrStream;
     if (path == "/health" || path == "/health/live" || path == "/health/ready")
       return kHealth;
     // Any other matched handler (e.g. the CPU build's /profile) is bucketed

@@ -69,25 +69,33 @@ RUN cd /tmp && \
     cp -r cmake-${CMAKE_VERSION}-linux-${CM_ARCH}/share/* /usr/local/share/ && \
     rm -rf /tmp/cmake*
 
-# Install ONNX Runtime C++ SDK (for CPU mode).
+# Install the ONNX Runtime C++ SDK — the CUDA-13 GPU build. The formula
+# backends (ort_session.cpp) create their sessions on ORT's CUDA execution
+# provider, so the image needs libonnxruntime.so PLUS
+# libonnxruntime_providers_cuda.so / _shared.so; the plain (CPU-only)
+# onnxruntime-linux-<arch>-<ver>.tgz asset would configure and link fine and
+# then fail at runtime. The base image already carries the runtime deps
+# (libcudnn.so.9, libcudart/cublas.so.13). CMake's GPU ORT discovery finds
+# this /usr/local install and hard-requires the CUDA EP at configure time.
 # Pinned tarball SHA256 — must match ORT_VERSION below. To refresh after a
 # version bump, recompute via:
-#   curl -sL https://github.com/microsoft/onnxruntime/releases/download/v<NEW>/onnxruntime-linux-x64-<NEW>.tgz | sha256sum
-ARG ORT_VERSION=1.22.0
-ARG ORT_SHA256=8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3
-# The aarch64 tarball has a different hash; override with --build-arg
-# ORT_SHA256_ARM64=... after an ORT_VERSION bump (empty = download without checksum).
-ARG ORT_SHA256_ARM64=bb76395092d150b52c7092dc6b8f2fe4d80f0f3bf0416d2f269193e347e24702
+#   curl -sL https://github.com/microsoft/onnxruntime/releases/download/v<NEW>/onnxruntime-linux-x64-gpu_cuda13-<NEW>.tgz | sha256sum
+ARG ORT_VERSION=1.27.0
+ARG ORT_SHA256=1a3227e1dc2f53d9f877c93278af500b15e26d99aa5ade877692138b3ab7d351
+# aarch64: Microsoft publishes no GPU/CUDA aarch64 tarball, so arm64 gets the
+# CPU asset and the configure-time CUDA-EP gate fails LOUDLY — an arm64 GPU
+# image needs a custom CUDA-enabled ORT dropped into third_party/onnxruntime.
+ARG ORT_SHA256_ARM64=3e4d83ac06924a32a07b6d7f91ce6f852876153fc0bbdf931bf517a140bfbe48
 RUN cd /tmp && \
     case "${TARGETARCH:-amd64}" in \
-      arm64) ORT_ARCH=aarch64; ORT_SHA=${ORT_SHA256_ARM64} ;; \
-      *)     ORT_ARCH=x64;     ORT_SHA=${ORT_SHA256} ;; \
+      arm64) ORT_PKG=onnxruntime-linux-aarch64-${ORT_VERSION};            ORT_SHA=${ORT_SHA256_ARM64} ;; \
+      *)     ORT_PKG=onnxruntime-linux-x64-gpu_cuda13-${ORT_VERSION};     ORT_SHA=${ORT_SHA256} ;; \
     esac && \
-    wget -q "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}.tgz" -O ort.tgz && \
-    if [ -n "${ORT_SHA}" ]; then echo "${ORT_SHA}  ort.tgz" | sha256sum -c -; else echo "WARN: no SHA256 pinned for ${ORT_ARCH} ONNX Runtime; skipping checksum"; fi && \
+    wget -q "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_PKG}.tgz" -O ort.tgz && \
+    if [ -n "${ORT_SHA}" ]; then echo "${ORT_SHA}  ort.tgz" | sha256sum -c -; else echo "WARN: no SHA256 pinned for ONNX Runtime; skipping checksum"; fi && \
     tar xzf ort.tgz && \
-    cp -r onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}/include/* /usr/local/include/ && \
-    cp onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}/lib/libonnxruntime.so* /usr/local/lib/ && \
+    cp -r ${ORT_PKG}/include/* /usr/local/include/ && \
+    cp -P ${ORT_PKG}/lib/libonnxruntime*.so* /usr/local/lib/ && \
     ldconfig && rm -rf /tmp/onnxruntime* /tmp/ort.tgz
 
 WORKDIR /app

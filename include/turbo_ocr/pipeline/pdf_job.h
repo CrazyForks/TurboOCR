@@ -100,7 +100,16 @@ struct PdfJobOptions {
   bool want_blocks = false;
   bool want_tables = false;
   bool want_formulas = false;
+  // ?text=0 — skip det/rec on every page: geometric pages drop their
+  // text-layer text, OCR pages run layout-only (or nothing). Combine with
+  // images=inline for a fast pdf->page-images path with no GPU OCR cost.
+  bool want_text = true;
   bool autorotate = false;
+  // Streaming hooks (see PdfPageSink) — set only by /ocr/stream. on_page_ready
+  // receives the finished page MOVED OUT of the sink (the aggregate result then
+  // carries an empty slot for it — the streaming route never reads job.pages).
+  std::function<void(int page_idx, PdfPageResult &&page)> on_page_ready;
+  std::function<void(int page_idx)> on_page_failed;
   PdfImageMode image_mode = PdfImageMode::None;
   pdf::EncodeOptions encode_opts{};
   // Per-request deadline (ms; 0 = unbounded). The GPU job bounds its page-future
@@ -322,12 +331,32 @@ struct PdfPageSink {
   // the request asked (?tables=1 / ?formulas=1). Default off.
   bool want_tables = false;
   bool want_formulas = false;
+  bool want_text = true;
   // Rendered pages whose PPM could not be read back (a server-side fault).
   std::atomic<int> decode_failures{0};
   // Pages whose OCR/inference threw — counted by the true page count (the whole
   // chunk on the batched path), so any > 0 fails the job rather than returning a
   // silently-empty page in a 200.
   std::atomic<int> page_failures{0};
+  // Streaming hooks (/ocr/stream). on_page_ready fires exactly once per page,
+  // AFTER the page's slot is fully stored, from whichever thread completed it
+  // (dispatcher worker for rendered pages, run_pdf_job itself for render-skipped
+  // geometric pages) — the callee must be thread-safe. It receives the page
+  // moved out of the slot. on_page_failed mirrors the page_failures increment.
+  // Both null on the non-streaming routes.
+  std::function<void(int page_idx, PdfPageResult &&page)> on_page_ready;
+  std::function<void(int page_idx)> on_page_failed;
+  // Move a finished page out of its slot (under the results mutex) and hand it
+  // to on_page_ready. Call ONLY after the slot is final.
+  void emit_page_ready(int page_idx) {
+    PdfPageResult moved;
+    {
+      std::lock_guard<std::mutex> lk(results_mutex);
+      if (page_idx < static_cast<int>(page_results.size()))
+        moved = std::move(page_results[static_cast<size_t>(page_idx)]);
+    }
+    on_page_ready(page_idx, std::move(moved));
+  }
 };
 
 [[nodiscard]] inline std::vector<uint8_t>
@@ -420,6 +449,7 @@ inline void ocr_single_page(GpuPipelineEntry &e, PdfPageSink &sink,
     TOCR_LOG_ERROR("Failed to decode PPM for page",
                    "route", "/ocr/pdf", "page", page_idx);
     sink.decode_failures.fetch_add(1, std::memory_order_relaxed);
+    if (sink.on_page_failed) sink.on_page_failed(page_idx);
     return;
   }
 
@@ -443,6 +473,7 @@ inline void ocr_single_page(GpuPipelineEntry &e, PdfPageSink &sink,
       store_geometric_page(sink, page_idx, std::move(layout),
                            img.cols, img.rows, want_reading_order,
                            std::move(encoded));
+      if (sink.on_page_ready) sink.emit_page_ready(page_idx);
     } else {
       // OCR page: de-rotate upright FIRST (autorotate=1) so det/rec, the boxes,
       // and the encoded image all share one upright frame.
@@ -450,17 +481,23 @@ inline void ocr_single_page(GpuPipelineEntry &e, PdfPageSink &sink,
           ? e.pipeline->detect_orientation(img, e.stream) : 0;
       if (orient) classification::rotate_upright(img, orient);
       auto encoded = maybe_encode_page(sink, img);
-      auto out = e.pipeline->run_with_layout(img, e.stream, layout_enabled,
-                                             want_reading_order, /*routing=*/{},
-                                             /*defer_external=*/false,
-                                             sink.want_tables, sink.want_formulas);
+      // ?text=0: layout-only (or image-only when layout is off) — no det/rec.
+      auto out = sink.want_text
+          ? e.pipeline->run_with_layout(img, e.stream, layout_enabled,
+                                        want_reading_order, /*routing=*/{},
+                                        /*defer_external=*/false,
+                                        sink.want_tables, sink.want_formulas)
+          : (layout_enabled ? e.pipeline->run_layout_only(img, e.stream)
+                            : OcrPipelineResult{});
       store_ocr_page(sink, page_idx, std::move(out), img.cols, img.rows,
                      std::move(encoded), orient);
+      if (sink.on_page_ready) sink.emit_page_ready(page_idx);
     }
   } catch (const std::exception &ex) {
     // Leave the slot default (empty); the orchestrator turns any page_failures
     // into a job-level PAGE_FAILED rather than a 200 with a blank page.
     sink.page_failures.fetch_add(1, std::memory_order_relaxed);
+    if (sink.on_page_failed) sink.on_page_failed(page_idx);
     TOCR_LOG_ERROR("PDF page inference error", "route", "/ocr/pdf",
                    "page", page_idx, "error", std::string_view(ex.what()));
   }
@@ -672,6 +709,9 @@ inline int run_streamed_render_cpu(
   sink->autorotate = opts.autorotate;
   sink->want_tables = opts.want_tables;
   sink->want_formulas = opts.want_formulas;
+  sink->want_text = opts.want_text;
+  sink->on_page_ready = opts.on_page_ready;
+  sink->on_page_failed = opts.on_page_failed;
 
   pdf::PdfMode mode = opts.mode;
   open_pdf_for_text_layer(pdf_data, pdf_len, mode, sink->pdf_doc,
@@ -680,10 +720,20 @@ inline int run_streamed_render_cpu(
   std::vector<uint8_t> need_render;
   bool any_need_render = (mode == pdf::PdfMode::Ocr);
 
-  if (mode != pdf::PdfMode::Ocr)
+  if (mode != pdf::PdfMode::Ocr) {
     prepopulate_pages(mode, opts.want_layout, sink->page_text_cache,
                       sink->page_results, need_render, &any_need_render,
                       opts.image_mode == PdfImageMode::Inline);
+    // ?text=0: the caller asked for no text at all — drop what the text
+    // layer prefilled so geometric pages honor the contract too.
+    if (!opts.want_text)
+      for (auto &pg : sink->page_results) pg.results.clear();
+    // Streaming: render-skipped pages (trusted text layer, no pixels needed)
+    // are final right now — emit them before the render even starts.
+    if (opts.on_page_ready)
+      for (size_t p = 0; p < need_render.size(); ++p)
+        if (!need_render[p]) sink->emit_page_ready(static_cast<int>(p));
+  }
 
   std::vector<int> dropped;
   auto stream_handle = std::make_shared<render::PdfRenderer::StreamHandle>();

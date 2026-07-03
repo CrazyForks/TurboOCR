@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -71,6 +72,33 @@ namespace turbo_ocr::server {
     return def;
   }
   return static_cast<int>(val);
+}
+
+/// Strict float parse. Same contract as env_int_strict: unset/empty → def,
+/// malformed or out-of-range → error pushed, def returned.
+[[nodiscard]] inline float env_float_strict(const char *name, float def,
+                                             float min_val, float max_val,
+                                             std::vector<std::string> &errors) {
+  const char *v = std::getenv(name);
+  if (!v || !*v) return def;
+  char *end = nullptr;
+  errno = 0;
+  float val = std::strtof(v, &end);
+  // NaN passes both range comparisons below (all NaN compares are false),
+  // so it must be rejected as malformed explicitly.
+  if (end == v || *end != '\0' || std::isnan(val)) {
+    errors.push_back(std::string(name) + "=\"" + v +
+                     "\" is not a valid number");
+    return def;
+  }
+  if (errno == ERANGE || val < min_val || val > max_val) {
+    errors.push_back(std::string(name) + "=\"" + v +
+                     "\" is outside the allowed range [" +
+                     std::to_string(min_val) + ", " +
+                     std::to_string(max_val) + "]");
+    return def;
+  }
+  return val;
 }
 
 /// Strict boolean parse. Accepts (case-insensitive): 1/0, true/false,

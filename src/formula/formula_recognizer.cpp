@@ -1,10 +1,10 @@
 #include "turbo_ocr/formula/formula_recognizer.h"
 
-#include <cstring>
 #include <iostream>
 #include <memory>
 
 #include "turbo_ocr/backends/openai_endpoint.h"
+#include "turbo_ocr/formula/auto_cjk_formula.h"
 #include "turbo_ocr/formula/ppformulanet_ort.h"
 #include "turbo_ocr/formula/vlm_formula.h"
 #include "turbo_ocr/routing/routing_config.h"
@@ -24,11 +24,16 @@ make_formula_recognizer(std::string_view backend) {
     // required (no fused fallback).
     return std::make_unique<PPFormulaNetOrt>("ppformulanet_plus_m");
   }
+  if (backend == "auto") {
+    // Opt-in composite: -S over all crops, plus-M re-run on CJK crops only.
+    return std::make_unique<AutoCjkFormula>();
+  }
   if (backend == "vlm") {
     return std::make_unique<VLMFormula>();
   }
   std::cerr << "[FormulaRecognizer] unknown FORMULA_BACKEND='" << backend
-            << "' (expected 'ppformulanet_s', 'ppformulanet_plus_m', or 'vlm')\n";
+            << "' (expected 'ppformulanet_s', 'ppformulanet_plus_m', 'auto', "
+               "or 'vlm')\n";
   return nullptr;
 }
 

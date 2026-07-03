@@ -2,19 +2,40 @@
 
 #include <onnxruntime_cxx_api.h>
 
+#include <cstdlib>
 #include <iostream>
 
 namespace turbo_ocr::formula {
 
+namespace {
+// Element count of a bind shape (all dims are concrete here).
+inline size_t numel(const std::vector<int64_t> &s) {
+  size_t n = 1;
+  for (int64_t d : s) n *= static_cast<size_t>(d);
+  return n;
+}
+}  // namespace
+
 struct OrtSession::Impl {
   Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "ppfns_ort"};
   std::unique_ptr<Ort::Session> sess;
-  Ort::MemoryInfo mem{nullptr};
+  Ort::MemoryInfo mem{nullptr};       // I/O device: "Cuda" (GPU) or "Cpu" (CPU EP)
+  Ort::MemoryInfo cpu_mem{nullptr};   // host target for run_tokens' dynamic output
   int device_id = 0;
   bool ready = false;
   // Persistent binding for run_graph() (CUDA-graph replay): built once, reused.
   std::unique_ptr<Ort::IoBinding> binding;
   std::vector<Ort::Value> gvals;  // own the Value wrappers across replays
+
+  // Build one Ort::Value view over a caller-owned buffer bound by OrtTensor.
+  Ort::Value make_value(const OrtTensor &t) const {
+    const size_t n = numel(t.shape);
+    return t.i64
+        ? Ort::Value::CreateTensor<int64_t>(mem, static_cast<int64_t *>(t.data), n,
+                                            t.shape.data(), t.shape.size())
+        : Ort::Value::CreateTensor<float>(mem, static_cast<float *>(t.data), n,
+                                          t.shape.data(), t.shape.size());
+  }
 };
 
 OrtSession::OrtSession() : p_(std::make_unique<Impl>()) {}
@@ -36,6 +57,13 @@ bool OrtSession::load(const std::string &onnx_path, int device_id, void *cuda_st
     const OrtApi &api = Ort::GetApi();
     OrtCUDAProviderOptionsV2 *cuda = nullptr;
     Ort::ThrowOnError(api.CreateCUDAProviderOptions(&cuda));
+    // RAII: release the provider-options handle on every exit path (ORT copies the
+    // options into the session on Append, so releasing after is correct) — a throw
+    // from any Update*/Append call below would otherwise leak the handle.
+    const std::unique_ptr<OrtCUDAProviderOptionsV2, void (*)(OrtCUDAProviderOptionsV2 *)>
+        cuda_guard(cuda, [](OrtCUDAProviderOptionsV2 *c) {
+          Ort::GetApi().ReleaseCUDAProviderOptions(c);
+        });
     std::string dev = std::to_string(device_id);
     const char *keys[] = {"device_id", "do_copy_in_default_stream", "enable_cuda_graph"};
     const char *vals[] = {dev.c_str(), do_copy_default_stream ? "1" : "0",
@@ -45,10 +73,10 @@ bool OrtSession::load(const std::string &onnx_path, int device_id, void *cuda_st
       Ort::ThrowOnError(
           api.UpdateCUDAProviderOptionsWithValue(cuda, "user_compute_stream", cuda_stream));
     opts.AppendExecutionProvider_CUDA_V2(*cuda);
-    api.ReleaseCUDAProviderOptions(cuda);
 
     p_->sess = std::make_unique<Ort::Session>(p_->env, onnx_path.c_str(), opts);
     p_->mem = Ort::MemoryInfo("Cuda", OrtDeviceAllocator, device_id, OrtMemTypeDefault);
+    p_->cpu_mem = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
     p_->ready = true;
     return true;
   } catch (const std::exception &e) {
@@ -62,10 +90,25 @@ bool OrtSession::load_cpu(const std::string &onnx_path) {
   try {
     p_->device_id = -1;
     Ort::SessionOptions opts;
+    // Formula fused graph is validated at ALL (unlike v6 rec, which regresses under
+    // SimplifiedLayerNormFusion) — this drives the measured CDM and must not change.
     opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    // Bound the per-session intra-op pool: the recognizer runs one shared session
+    // concurrently from the worker pool, so the ORT default (= all physical cores per
+    // session) oversubscribes under load. Mirror the engine CPU path (intra 4, inter 1,
+    // sequential); result is bit-identical (MLAS partitions output tiles with a fixed
+    // accumulation order, deterministic across thread count). ORT_NUM_THREADS overrides.
+    if (const char *env = std::getenv("ORT_NUM_THREADS"))
+      opts.SetIntraOpNumThreads(std::atoi(env));
+    else
+      opts.SetIntraOpNumThreads(4);
+    opts.SetInterOpNumThreads(1);
+    opts.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+    opts.EnableCpuMemArena();
     // No execution provider appended => ORT's default CPUExecutionProvider.
     p_->sess = std::make_unique<Ort::Session>(p_->env, onnx_path.c_str(), opts);
     p_->mem = Ort::MemoryInfo("Cpu", OrtArenaAllocator, 0, OrtMemTypeDefault);
+    p_->cpu_mem = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
     p_->ready = true;
     return true;
   } catch (const std::exception &e) {
@@ -101,23 +144,17 @@ std::vector<std::string> OrtSession::output_names() const {
 bool OrtSession::run(const std::vector<OrtTensor> &inputs,
                      const std::vector<OrtTensor> &outputs) {
   try {
-    auto numel = [](const std::vector<int64_t> &s) {
-      size_t n = 1; for (int64_t d : s) n *= static_cast<size_t>(d); return n;
-    };
     Ort::IoBinding binding(*p_->sess);
     std::vector<Ort::Value> vals;  // own the Value wrappers for the Run() lifetime
     vals.reserve(inputs.size() + outputs.size());
-    auto make = [&](const OrtTensor &t) -> Ort::Value & {
-      size_t n = numel(t.shape);
-      vals.push_back(t.i64
-          ? Ort::Value::CreateTensor<int64_t>(p_->mem, static_cast<int64_t *>(t.data), n,
-                                              t.shape.data(), t.shape.size())
-          : Ort::Value::CreateTensor<float>(p_->mem, static_cast<float *>(t.data), n,
-                                            t.shape.data(), t.shape.size()));
-      return vals.back();
-    };
-    for (const auto &t : inputs) binding.BindInput(t.name, make(t));
-    for (const auto &t : outputs) binding.BindOutput(t.name, make(t));
+    for (const auto &t : inputs) {
+      vals.push_back(p_->make_value(t));
+      binding.BindInput(t.name, vals.back());
+    }
+    for (const auto &t : outputs) {
+      vals.push_back(p_->make_value(t));
+      binding.BindOutput(t.name, vals.back());
+    }
     p_->sess->Run(Ort::RunOptions{nullptr}, binding);
     return true;
   } catch (const std::exception &e) {
@@ -130,23 +167,17 @@ bool OrtSession::run_graph(const std::vector<OrtTensor> &inputs,
                            const std::vector<OrtTensor> &outputs) {
   try {
     if (!p_->binding) {  // first call: build + cache the binding (fixed buffers)
-      auto numel = [](const std::vector<int64_t> &s) {
-        size_t n = 1; for (int64_t d : s) n *= static_cast<size_t>(d); return n;
-      };
       p_->binding = std::make_unique<Ort::IoBinding>(*p_->sess);
       p_->gvals.clear();
       p_->gvals.reserve(inputs.size() + outputs.size());
-      auto make = [&](const OrtTensor &t) -> Ort::Value & {
-        size_t n = numel(t.shape);
-        p_->gvals.push_back(t.i64
-            ? Ort::Value::CreateTensor<int64_t>(p_->mem, static_cast<int64_t *>(t.data), n,
-                                                t.shape.data(), t.shape.size())
-            : Ort::Value::CreateTensor<float>(p_->mem, static_cast<float *>(t.data), n,
-                                              t.shape.data(), t.shape.size()));
-        return p_->gvals.back();
-      };
-      for (const auto &t : inputs) p_->binding->BindInput(t.name, make(t));
-      for (const auto &t : outputs) p_->binding->BindOutput(t.name, make(t));
+      for (const auto &t : inputs) {
+        p_->gvals.push_back(p_->make_value(t));
+        p_->binding->BindInput(t.name, p_->gvals.back());
+      }
+      for (const auto &t : outputs) {
+        p_->gvals.push_back(p_->make_value(t));
+        p_->binding->BindOutput(t.name, p_->gvals.back());
+      }
     }
     p_->sess->Run(Ort::RunOptions{nullptr}, *p_->binding);  // captures on 1st call, replays after
     return true;
@@ -169,9 +200,9 @@ bool OrtSession::run_tokens(const char *in_name, const char *out_name, const flo
     Ort::Value xv = Ort::Value::CreateTensor<float>(
         p_->mem, const_cast<float *>(d_x), (size_t)B * 1 * 384 * 384, shp, 4);
     binding.BindInput(in_name, xv);
-    // Let ORT allocate the dynamic [B,L] token output directly in host memory.
-    Ort::MemoryInfo cpu("Cpu", OrtDeviceAllocator, 0, OrtMemTypeDefault);
-    binding.BindOutput(out_name, cpu);
+    // Let ORT allocate the dynamic [B,L] token output directly in host memory
+    // (cached MemoryInfo — avoids re-interning "Cpu" on every crop).
+    binding.BindOutput(out_name, p_->cpu_mem);
     binding.SynchronizeInputs();
     p_->sess->Run(Ort::RunOptions{nullptr}, binding);
     binding.SynchronizeOutputs();

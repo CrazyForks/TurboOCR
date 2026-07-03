@@ -2,11 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <regex>
-#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -103,11 +104,36 @@ std::string replace_all(std::string s, std::string_view needle, std::string_view
     }
 }
 
-std::string trim(const std::string& s) {
+std::string_view trim(std::string_view s) {
     std::size_t a = 0, b = s.size();
     while (a < b && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
     while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
     return s.substr(a, b - a);
+}
+
+// Single-pass, in-place removal of the PP-FormulaNet literal frame markers. Exactly
+// equivalent to three sequential replace_all() passes ([EOS] then [BOS] then [PAD]) —
+// the markers are distinct, equal-length, and never rescanned — but allocates nothing:
+// it compacts survivors left with a write cursor and shrinks. For this tokenizer the
+// markers never occur (they live in no vocab token); the strip is kept for other vocabs.
+void strip_frame_markers(std::string& s) {
+    static constexpr std::array<std::string_view, 3> kMarkers{"[EOS]", "[BOS]", "[PAD]"};
+    const std::size_t n = s.size();
+    std::size_t w = 0, i = 0;
+    while (i < n) {
+        std::size_t skip = 0;
+        if (s[i] == '[') {
+            for (std::string_view m : kMarkers) {
+                if (n - i >= m.size() && std::memcmp(s.data() + i, m.data(), m.size()) == 0) {
+                    skip = m.size();
+                    break;
+                }
+            }
+        }
+        if (skip) i += skip;
+        else s[w++] = s[i++];
+    }
+    s.resize(w);
 }
 
 // True if the [begin, end) UTF-8 span contains a CJK Unified Ideograph in
@@ -341,20 +367,23 @@ std::optional<FormulaTokenizer> FormulaTokenizer::load(const std::string& json_p
 std::string FormulaTokenizer::decode(std::span<const int64_t> ids, bool post_process) const {
     std::string raw;
     raw.reserve(ids.size() * 2);
+    const std::size_t vocab = id_to_token_.size();
     for (int64_t id : ids) {
         if (id == eos_id_) break;
         if (special_ids_.count(id)) continue;
-        if (id < 0 || static_cast<std::size_t>(id) >= id_to_token_.size()) continue;
-        raw.append(id_to_token_[static_cast<std::size_t>(id)]);
+        if (id < 0 || static_cast<std::size_t>(id) >= vocab) continue;
+        raw += id_to_token_[static_cast<std::size_t>(id)];
     }
 
-    // Byte-level BPE -> real UTF-8 (Ġ -> space falls out of the map automatically).
+    // Byte-level BPE -> real UTF-8 (Ġ -> space falls out of the map automatically), then
+    // drop the literal frame markers and trim. Bit-identical to the prior
+    // byte_level_to_utf8 + [EOS]/[BOS]/[PAD] replace_all + trim chain, but with one buffer
+    // instead of five: the marker strip compacts in place and the trim returns a view.
     std::string text = byte_level_to_utf8(raw);
-    text = replace_all(std::move(text), "[EOS]", "");
-    text = replace_all(std::move(text), "[BOS]", "");
-    text = replace_all(std::move(text), "[PAD]", "");
-    std::string trimmed = trim(text);
-    return post_process ? latex_post_process(trimmed) : trimmed;
+    strip_frame_markers(text);
+    const std::string_view trimmed = trim(text);
+    if (post_process) return latex_post_process(std::string(trimmed));
+    return std::string(trimmed);
 }
 
 }  // namespace turbo_ocr::formula

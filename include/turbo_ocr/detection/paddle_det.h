@@ -83,15 +83,11 @@ private:
   // Pre-allocated GPU buffers (single-image, RAII)
   CudaPtr<float> d_input_;
   CudaPtr<float> d_output_;
-  size_t input_size_ = 0;
-  size_t output_size_ = 0;
 
   // Pre-allocated batch GPU buffers (kMaxBatchSize images, RAII)
   CudaPtr<float> d_batch_input_;
   CudaPtr<float> d_batch_output_;
   CudaPtr<uint8_t> d_batch_bitmap_;
-  size_t batch_input_size_ = 0;
-  size_t batch_output_size_ = 0;
 
   // Device-side arrays for batched kernel launch params (RAII)
   CudaPtr<void *> d_batch_src_ptrs_;
@@ -107,12 +103,6 @@ private:
 
   // Pre-allocated bitmap buffer (RAII)
   CudaPtr<uint8_t> d_bitmap_buf_;
-
-  // Non-owning working pointers. Normally point to d_output_.get() and
-  // d_bitmap_buf_.get(). In batch mode, temporarily aliased to slices of
-  // d_batch_output_ / d_batch_bitmap_ for per-image post-processing.
-  float *cur_output_ = nullptr;
-  uint8_t *cur_bitmap_ = nullptr;
 
   // GPU CCL buffers (pre-allocated in load_model — NO per-request alloc, RAII)
   CudaPtr<int> d_ccl_labels_;
@@ -145,6 +135,11 @@ private:
   CudaPtr<uint32_t> d_jfa_seeds_;      // [max_pixels] packed JFA nearest-seed coords (primary)
   CudaPtr<uint32_t> d_jfa_seeds_alt_;  // [max_pixels] JFA ping-pong buffer
   CudaPtr<float> d_expand_per_comp_;   // [kMaxGpuComponents] per-component expand
+  CudaPtr<int> d_perim_per_comp_;      // [kMaxGpuComponents] per-component crack perimeter
+  // Oriented min-area-rect scratch (mode-2): PCA second-moment sums (uint64)
+  // and per-component axis + projection extents (float). [kMaxGpuComponents*6].
+  CudaPtr<unsigned long long> d_ccl_moments_;
+  CudaPtr<float> d_ccl_orient_;
   // Pinned host buffer for post-expand bboxes. Pre-allocated once so
   // run_gpu_ccl_fast doesn't cudaMallocHost on every request.
   CudaHostPtr<kernels::GpuDetBox> h_exp_boxes_;
@@ -154,20 +149,29 @@ private:
   [[nodiscard]] bool init_buffers(const DetResizeParams &resize,
                                   const DbParams &db);
 
+  // Post-process helpers take the device probability map + bitmap for the image
+  // slice explicitly (no hidden member state), so single-image and per-batch-slice
+  // callers share one path re-usable across SEQUENTIAL slices. Not thread-safe:
+  // the helpers still write shared instance scratch (h_ccl_boxes_, ccl_contour_buf_,
+  // d_jfa_*, ...), so one instance serves one worker thread (the pool contract).
+
   // GPU CCL path: returns boxes from GPU + per-ROI findContours (accurate)
-  [[nodiscard]] std::vector<Box> run_gpu_ccl(int resize_h, int resize_w,
+  [[nodiscard]] std::vector<Box> run_gpu_ccl(const float *d_pred, const uint8_t *d_bitmap,
+                                              int resize_h, int resize_w,
                                               int orig_h, int orig_w,
                                               cudaStream_t stream);
 
   // GPU CCL fast (GPU_CCL=2): all-GPU JFA per-component Euclidean unclip.
   // Matches CPU CCL=1 word-F1 within run-to-run noise (~0.900 vs 0.902 on
   // FUNSD), with tighter latency tail (no pred_map download, no findContours).
-  [[nodiscard]] std::vector<Box> run_gpu_ccl_fast(int resize_h, int resize_w,
+  [[nodiscard]] std::vector<Box> run_gpu_ccl_fast(const float *d_pred, const uint8_t *d_bitmap,
+                                                    int resize_h, int resize_w,
                                                     int orig_h, int orig_w,
                                                     cudaStream_t stream);
 
   // CPU fallback path (original findContours)
-  [[nodiscard]] std::vector<Box> run_cpu_contours(int resize_h, int resize_w,
+  [[nodiscard]] std::vector<Box> run_cpu_contours(const float *d_pred, const uint8_t *d_bitmap,
+                                                   int resize_h, int resize_w,
                                                    int orig_h, int orig_w,
                                                    cudaStream_t stream);
 

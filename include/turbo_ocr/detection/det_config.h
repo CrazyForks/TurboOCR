@@ -1,8 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <format>
+#include <iostream>
 #include <utility>
 
 namespace turbo_ocr::detection {
@@ -84,12 +87,22 @@ inline constexpr DbParams kDbDefaults{0.2f, 0.45f, 1.4f};
 // never exceed the engine profile / pinned buffers.
 //   DET_LIMIT_TYPE / DET_LIMIT_SIDE_LEN / DET_MAX_SIDE_LIMIT / DET_MAX_SIDE
 [[nodiscard]] inline DetResizeParams read_det_resize(DetResizeParams base = kDetResizeDefault) {
+  const bool base_was_min = (base.limit_type[1] == 'i');
+  bool side_len_from_env = false;
   if (const char* env = std::getenv("DET_LIMIT_TYPE"))
-    base.limit_type = (env[0] == 'm' && env[1] == 'a') ? "max" : "min";
-  if (const char* env = std::getenv("DET_LIMIT_SIDE_LEN"); env && *env)
-    base.limit_side_len = std::atoi(env);
+    base.limit_type =
+        (std::tolower(static_cast<unsigned char>(env[0])) == 'm' &&
+         std::tolower(static_cast<unsigned char>(env[1])) == 'a') ? "max" : "min";
+  // Numeric envs are clamped to [kDetMaxSideMin, kDetMaxSideMax]: atoi turns
+  // garbage/negative input into values that would otherwise thumbnail every
+  // image (a 0 cap resizes everything to 32px) — same silent-empty-results
+  // failure class as GitHub #23.
+  if (const char* env = std::getenv("DET_LIMIT_SIDE_LEN"); env && *env) {
+    base.limit_side_len = std::clamp(std::atoi(env), kDetMaxSideMin, kDetMaxSideMax);
+    side_len_from_env = true;
+  }
   if (const char* env = std::getenv("DET_MAX_SIDE_LIMIT"); env && *env)
-    base.max_side_limit = std::atoi(env);
+    base.max_side_limit = std::clamp(std::atoi(env), kDetMaxSideMin, kDetMaxSideMax);
   // DET_MAX_SIDE sizes the TRT profile MAX + pinned buffers via
   // effective_det_max_side(); it must ALSO cap the resize output, or a
   // DET_MAX_SIDE below max_side_limit (e.g. 640 < 1280) lets compute_det_resize
@@ -99,6 +112,17 @@ inline constexpr DbParams kDbDefaults{0.2f, 0.45f, 1.4f};
   if (const char* env = std::getenv("DET_MAX_SIDE"); env && *env)
     base.max_side_limit =
         std::min(base.max_side_limit, std::clamp(std::atoi(env), kDetMaxSideMin, kDetMaxSideMax));
+  // DET_LIMIT_TYPE=max without DET_LIMIT_SIDE_LEN: the min-policy base default
+  // (64 = "grow the SHORTER side to at least 64") would flip meaning to
+  // "shrink the LONGER side down to 64px", thumbnailing every image into zero
+  // detections (GitHub #23). The only sane implicit max-policy target is the
+  // resize cap itself: native resolution up to max_side_limit.
+  if (base_was_min && !side_len_from_env && base.limit_type[1] == 'a') {
+    base.limit_side_len = base.max_side_limit;
+    std::cerr << std::format(
+        "[DetConfig] DET_LIMIT_TYPE=max set without DET_LIMIT_SIDE_LEN; "
+        "defaulting limit_side_len to the max-side cap ({})\n", base.max_side_limit);
+  }
   return base;
 }
 

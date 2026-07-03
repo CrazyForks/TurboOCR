@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <array>
+#include <iostream>
 
 #include <nlohmann/json.hpp>
 
@@ -26,9 +27,13 @@ std::string env_or(const char *k, const std::string &dflt) {
 //                      English/Latin only (the default — fastest).
 // ppformulanet_plus_m = 6-layer MBart model, in-process C++ FAST host-loop, the only
 //                      backend that reads CHINESE formulas (CJK-F1 0.73); slower.
+// auto                = composite: -S over all crops, plus-M re-run on the crops
+//                      whose -S output shows CJK it mangled. EN crops keep -S
+//                      speed; CJK crops get plus-M accuracy. GPU build only.
 // Swap with FORMULA_BACKEND + point FORMULA_ONNX/FORMULA_TOKENIZER at the chosen model.
-const std::array<const char *, 4> kFormulaEngines{"formulanet", "ppformulanet_s",
-                                                  "ppformulanet_plus_m", "vlm"};
+const std::array<const char *, 5> kFormulaEngines{"formulanet", "ppformulanet_s",
+                                                  "ppformulanet_plus_m", "vlm",
+                                                  "auto"};
 const std::array<const char *, 2> kTableEngines{"slanext", "vlm"};
 
 bool engine_valid_for(const std::string &modality, const std::string &engine) {
@@ -76,6 +81,12 @@ RoutingTable synth_from_env() {
   // Default = the fast English/Latin -S model. FORMULA_BACKEND=ppformulanet_plus_m
   // swaps in the slower Chinese-capable model (point FORMULA_ONNX/FORMULA_TOKENIZER at it).
   std::string fb = env_or("FORMULA_BACKEND", "ppformulanet_s");
+  if (!engine_valid_for("formula", fb))
+    // A typo'd FORMULA_BACKEND must not silently disable formula (the env path
+    // previously skipped this validation the config-file path enforces).
+    std::cerr << "[routing] FORMULA_BACKEND='" << fb
+              << "' is not a recognized formula engine — formula will be "
+                 "DISABLED (expected ppformulanet_s|ppformulanet_plus_m|auto|vlm)\n";
   {
     BackendSpec b; b.name = "formula-env"; b.kind = Kind::Local; b.engine = fb;
     t.backends["formula-env"] = b;
@@ -95,6 +106,10 @@ RoutingTable synth_from_env() {
   }
   // env-only `vlm` → kind:Local engine="vlm" (tested VLMTable via the string
   // factory); OpenAIEndpoint only via explicit kind:openai config (see formula).
+  if (!tb.empty() && !engine_valid_for("table", tb))
+    std::cerr << "[routing] TABLE_BACKEND='" << tb
+              << "' is not a recognized table engine — tables fall back to the "
+                 "geometric default (expected slanext|vlm)\n";
   if (!tb.empty()) {
     BackendSpec b; b.name = "table-env"; b.kind = Kind::Local; b.engine = tb;
     t.backends["table-env"] = b;

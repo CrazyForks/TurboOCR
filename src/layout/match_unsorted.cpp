@@ -1,6 +1,7 @@
 #include "turbo_ocr/layout/match_unsorted.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <limits>
 
@@ -108,6 +109,12 @@ constexpr float kEdgeWeight = 1e4f;
 constexpr float kUpEdgeWeight = 1.0f;
 constexpr float kLeftEdgeWeight = 1e-4f;
 
+// A layout_idx is a valid subscript into `layout` iff it is non-negative
+// and in range. Orphan/synthetic entries carry negative sentinels.
+inline bool in_layout_range(int idx, const std::vector<LayoutBox> &layout) noexcept {
+  return idx >= 0 && static_cast<size_t>(idx) < layout.size();
+}
+
 // reference_insert: pick the highest sorted block that is fully ABOVE
 // `block` (sorted_block.bbox[3] <= block.bbox[1]) and insert AFTER it.
 // Used for cross-references / footnotes that should appear at the END
@@ -199,9 +206,22 @@ void weighted_distance_insert(const UnsortedBlock &block,
     sorted_blocks.push_back(block);
     return;
   }
+
+  // Everything about `block` is constant across the scan, so its geometry,
+  // its label class, and its origin-centroid are computed exactly once
+  // rather than re-derived for every candidate comparison.
   const auto weights = weights_for(block.order_label, direction);
-  const int x1 = block.aabb[0], y1 = block.aabb[1];
-  const int x2 = block.aabb[2];
+  const bool horizontal = direction == Direction::kHorizontal;
+  const int x1 = block.aabb[0], y1 = block.aabb[1], x2 = block.aabb[2];
+  const double block_centroid = centroid_l2_sq(block.aabb);
+  const bool label_flips_below =
+      block.order_label == OrderLabel::kDocTitle ||
+      block.order_label == OrderLabel::kParagraphTitle ||
+      block.order_label == OrderLabel::kVisionTitle ||
+      block.order_label == OrderLabel::kVision;
+  const bool label_is_vision =
+      block.order_label == OrderLabel::kVision ||
+      block.order_label == OrderLabel::kVisionTitle;
 
   // Disperse term: doc_title gets a tolerance of max(2, text_line_width)
   // px so up-edge distance ties cleanly across same-row neighbours
@@ -217,32 +237,18 @@ void weighted_distance_insert(const UnsortedBlock &block,
 
   for (size_t i = 0; i < sorted_blocks.size(); ++i) {
     const auto &sb = sorted_blocks[i];
-    const int y1p = sb.aabb[1];
-    const int x1p = sb.aabb[0];
-    const int y2p = sb.aabb[3];
-    const int x2p = sb.aabb[2];
+    const auto [x1p, y1p, x2p, y2p] = sb.aabb;
 
-    float edge_distance = nearest_edge_distance(block.aabb, sb.aabb, weights);
+    const float edge_distance =
+        nearest_edge_distance(block.aabb, sb.aabb, weights);
     // PaddleX's primary "up_edge_distance" is y1' for horizontal,
     // -x2' for vertical (a column closer to the right edge has a
     // SMALLER -x2 → reads earlier).
-    float up_edge = direction == Direction::kHorizontal
-                        ? float(y1p)
-                        : -float(x2p);
-    float left_edge = direction == Direction::kHorizontal
-                          ? float(x1p)
-                          : float(y1p);
-    const bool is_below_sorted = direction == Direction::kHorizontal
-                                     ? y2p < y1
-                                     : x1p > x2;
+    float up_edge = horizontal ? float(y1p) : -float(x2p);
+    float left_edge = horizontal ? float(x1p) : float(y1p);
+    const bool is_below_sorted = horizontal ? y2p < y1 : x1p > x2;
 
-    const bool flip_for_below =
-        (block.order_label == OrderLabel::kDocTitle ||
-         block.order_label == OrderLabel::kParagraphTitle ||
-         block.order_label == OrderLabel::kVisionTitle ||
-         block.order_label == OrderLabel::kVision) &&
-        is_below_sorted;
-    if (flip_for_below) {
+    if (label_flips_below && is_below_sorted) {
       up_edge = -up_edge;
       left_edge = -left_edge;
     }
@@ -264,19 +270,15 @@ void weighted_distance_insert(const UnsortedBlock &block,
       if (std::abs(y1 / 2 - y1p / 2) > 0) {
         sorted_distance = y1p;
         block_distance = y1;
-      } else if (direction == Direction::kHorizontal &&
-                 std::abs(x1 / 2 - x2 / 2) > 0) {
+      } else if (horizontal && std::abs(x1 / 2 - x2 / 2) > 0) {
         sorted_distance = x1p;
         block_distance = x1;
-      } else if (direction == Direction::kVertical &&
-                 std::abs(x1 - x2) > 0) {
+      } else if (!horizontal && std::abs(x1 - x2) > 0) {
         sorted_distance = -x2p;
         block_distance = -x2;
       } else {
-        const double sb_c = centroid_l2_sq(sb.aabb);
-        const double bl_c = centroid_l2_sq(block.aabb);
-        sorted_distance = static_cast<int>(sb_c);
-        block_distance  = static_cast<int>(bl_c);
+        sorted_distance = static_cast<int>(centroid_l2_sq(sb.aabb));
+        block_distance  = static_cast<int>(block_centroid);
       }
       if (block_distance > sorted_distance) {
         nearest = i + 1;
@@ -284,14 +286,10 @@ void weighted_distance_insert(const UnsortedBlock &block,
         // and the next block in sorted (i+1) form a paragraph
         // continuation, bump past the next block so the figure
         // doesn't split mid-paragraph.
-        if (i + 1 < sorted_blocks.size() &&
-            (block.order_label == OrderLabel::kVision ||
-             block.order_label == OrderLabel::kVisionTitle)) {
+        if (label_is_vision && i + 1 < sorted_blocks.size()) {
           const int next_idx = sorted_blocks[i + 1].layout_idx;
-          if (next_idx >= 0 &&
-              static_cast<size_t>(next_idx) < layout.size() &&
-              sb.layout_idx >= 0 &&
-              static_cast<size_t>(sb.layout_idx) < layout.size()) {
+          if (in_layout_range(next_idx, layout) &&
+              in_layout_range(sb.layout_idx, layout)) {
             const SegFlag sf = get_seg_flag(
                 layout[static_cast<size_t>(next_idx)],
                 layout[static_cast<size_t>(sb.layout_idx)],
@@ -299,31 +297,27 @@ void weighted_distance_insert(const UnsortedBlock &block,
             if (!sf.seg_start_flag) ++nearest;
           }
         }
-      } else if (i > 0) {
+      } else if (label_is_vision && i > 0) {
         // Vision look-behind: only step into the previous slot when
         // the current sorted block is mid-paragraph relative to its
         // predecessor (i.e. not a clean paragraph start).
-        const bool is_vision =
-            block.order_label == OrderLabel::kVision ||
-            block.order_label == OrderLabel::kVisionTitle;
-        if (is_vision) {
-          const int curr_idx = sb.layout_idx;
-          const int prev_idx = sorted_blocks[i - 1].layout_idx;
-          if (curr_idx >= 0 && prev_idx >= 0 &&
-              static_cast<size_t>(curr_idx) < layout.size() &&
-              static_cast<size_t>(prev_idx) < layout.size()) {
-            const SegFlag sf = get_seg_flag(
-                layout[static_cast<size_t>(curr_idx)],
-                layout[static_cast<size_t>(prev_idx)],
-                direction);
-            if (!sf.seg_start_flag) nearest = i - 1;
-          }
+        const int curr_idx = sb.layout_idx;
+        const int prev_idx = sorted_blocks[i - 1].layout_idx;
+        if (in_layout_range(curr_idx, layout) &&
+            in_layout_range(prev_idx, layout)) {
+          const SegFlag sf = get_seg_flag(
+              layout[static_cast<size_t>(curr_idx)],
+              layout[static_cast<size_t>(prev_idx)],
+              direction);
+          if (!sf.seg_start_flag) nearest = i - 1;
         }
       }
     }
   }
   if (nearest > sorted_blocks.size()) nearest = sorted_blocks.size();
-  sorted_blocks.insert(sorted_blocks.begin() + nearest, block);
+  sorted_blocks.insert(sorted_blocks.begin() +
+                           static_cast<std::ptrdiff_t>(nearest),
+                       block);
 }
 
 } // namespace

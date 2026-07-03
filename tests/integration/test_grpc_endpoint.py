@@ -111,6 +111,49 @@ class TestGrpcEndpoint:
         assert response.total_images == 2
         assert len(response.batch_results) == 2
 
+    @staticmethod
+    def _slot_detections(slot):
+        """Detection count for one batch slot, robust to json_bytes vs
+        structured response mode (results is empty in the default mode)."""
+        if slot.json_response:
+            return len(json.loads(slot.json_response).get("results", []))
+        return slot.num_detections
+
+    def test_batch_recognize_jpegs(self, grpc_stub, hello_image, numbers_image):
+        """Regression (GitHub #22, gRPC side): >=2 JPEGs in one RecognizeBatch is
+        the only way to reach the nvJPEG batched-decode path over gRPC. The HTTP
+        path is covered in test_ocr_batch_endpoint; this guards the gRPC twin,
+        which the endpoint matrix left untested (it batched a single image, and
+        test_batch_recognize batches PNGs, which never touch nvJPEG)."""
+        images = [pil_to_jpeg_bytes(hello_image), pil_to_jpeg_bytes(numbers_image)]
+        response = grpc_stub.RecognizeBatch(
+            ocr_pb2.OCRBatchRequest(images=images), timeout=15)
+        assert response.total_images == 2
+        assert len(response.batch_results) == 2
+        for i, slot in enumerate(response.batch_results):
+            assert self._slot_detections(slot) > 0, \
+                f"gRPC batch JPEG slot {i} decoded to no text"
+        # The CUDA context must survive: a follow-up request still works.
+        again = grpc_stub.RecognizeBatch(
+            ocr_pb2.OCRBatchRequest(
+                images=[pil_to_jpeg_bytes(hello_image)] * 3), timeout=15)
+        assert again.total_images == 3
+
+    def test_batch_recognize_mixed_formats(self, grpc_stub, hello_image, numbers_image):
+        """Mixed PNG + JPEG in one gRPC batch exercises the decode splitter's
+        jpeg-vs-other reindex (batched JPEGs scattered back to their original
+        slots alongside per-image-decoded PNGs)."""
+        images = [pil_to_png_bytes(hello_image),
+                  pil_to_jpeg_bytes(numbers_image),
+                  pil_to_jpeg_bytes(hello_image)]
+        response = grpc_stub.RecognizeBatch(
+            ocr_pb2.OCRBatchRequest(images=images), timeout=15)
+        assert response.total_images == 3
+        assert len(response.batch_results) == 3
+        for i, slot in enumerate(response.batch_results):
+            assert self._slot_detections(slot) > 0, \
+                f"gRPC mixed batch slot {i} decoded to no text"
+
     def test_grpc_matches_http(self, grpc_stub, server_url, hello_image):
         """gRPC and HTTP should return the same text for the same image."""
         png_bytes = pil_to_png_bytes(hello_image)

@@ -11,17 +11,31 @@ namespace {
 
 class CacheLogger : public nvinfer1::ILogger {
   void log(Severity severity, const char *msg) noexcept override {
-    if (severity != Severity::kINFO)
-      std::cerr << "[TRT] " << msg << '\n';
+    if (severity == Severity::kINFO)
+      return;
+    // TensorRT calls loggers from its internal worker threads; serialize the
+    // chained cerr write so concurrent builds don't interleave/tear output.
+    static std::mutex log_mu;
+    std::lock_guard<std::mutex> lk(log_mu);
+    std::cerr << "[TRT] " << msg << '\n';
   }
 };
+
+// The logger must outlive the IRuntime AND every engine deserialized from it
+// (TensorRT requirement). An intentionally-leaked singleton guarantees that
+// regardless of static-destruction order — a member of the static CacheState
+// could be destroyed while an engine (holding the runtime alive via its deleter)
+// still exists, leaving the live runtime with a dangling logger (use-after-free).
+nvinfer1::ILogger &cache_logger() {
+  static CacheLogger *logger = new CacheLogger();
+  return *logger;
+}
 
 // The IRuntime is constructed on first use and shared via each engine's deleter,
 // so it is guaranteed to outlive every engine deserialized from it regardless of
 // static-destruction order (TensorRT requires the runtime to outlive its engines).
 struct CacheState {
   std::mutex mu;
-  CacheLogger logger;
   std::shared_ptr<nvinfer1::IRuntime> runtime;
 };
 
@@ -57,21 +71,24 @@ std::vector<char> read_file(const std::string &path) {
 // safe way to share that keeps the throughput, so sharing is not offered.
 std::shared_ptr<nvinfer1::ICudaEngine>
 load_engine(const std::string &trt_path) {
-  CacheState &s = state();
-  std::lock_guard<std::mutex> lock(s.mu);
-
-  if (!s.runtime) {
-    s.runtime.reset(nvinfer1::createInferRuntime(s.logger));
-    if (!s.runtime) {
-      std::cerr << "[TRT] Failed to create runtime for: " << trt_path << '\n';
-      return nullptr;
-    }
-  }
-
+  // Read the engine blob OUTSIDE the cache lock — only runtime creation +
+  // deserialize need serialization, so concurrent cold starts don't queue on
+  // each other's disk I/O.
   const std::vector<char> blob = read_file(trt_path);
   if (blob.empty()) {
     std::cerr << "[TRT] Error loading engine file: " << trt_path << '\n';
     return nullptr;
+  }
+
+  CacheState &s = state();
+  std::lock_guard<std::mutex> lock(s.mu);
+
+  if (!s.runtime) {
+    s.runtime.reset(nvinfer1::createInferRuntime(cache_logger()));
+    if (!s.runtime) {
+      std::cerr << "[TRT] Failed to create runtime for: " << trt_path << '\n';
+      return nullptr;
+    }
   }
 
   nvinfer1::ICudaEngine *raw =

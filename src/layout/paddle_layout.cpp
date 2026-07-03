@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <cstring>
 #include <iostream>
 #include <string>
 
@@ -13,11 +12,6 @@
 #include "turbo_ocr/layout/layout_postfilter.h"
 
 namespace turbo_ocr::layout {
-
-PaddleLayout::~PaddleLayout() noexcept {
-  if (d2h_event_)
-    cudaEventDestroy(d2h_event_);
-}
 
 bool PaddleLayout::discover_tensor_names() {
   // PP-DocLayoutV3 has:
@@ -96,10 +90,6 @@ bool PaddleLayout::init_buffers() {
   engine_->set_tensor_address(name_out0_,         d_out0_.get());
   engine_->set_tensor_address(name_out1_,         d_out1_.get());
   engine_->set_tensor_address(name_out2_,         d_out2_.get());
-
-  // Event used to notify collect() that the D2H readback is complete.
-  // Timing is disabled — we only care about the ordering guarantee.
-  CUDA_CHECK(cudaEventCreateWithFlags(&d2h_event_, cudaEventDisableTiming));
   return true;
 }
 
@@ -118,7 +108,7 @@ bool PaddleLayout::enqueue(const GpuImage &gpu_img, int orig_h, int orig_w,
                            cudaStream_t stream) {
   // Cleared up front; only re-armed on full success (step 5 below). collect()
   // treats a null pending_stream_ as "the last enqueue failed" and bails,
-  // rather than syncing a stale event and decoding a stale buffer.
+  // rather than draining a stream and decoding a stale buffer.
   pending_stream_ = nullptr;
   pending_orig_h_ = orig_h;
   pending_orig_w_ = orig_w;
@@ -156,28 +146,39 @@ bool PaddleLayout::enqueue(const GpuImage &gpu_img, int orig_h, int orig_w,
     return false;
   }
 
-  // 5. Record event so collect() knows when the execute has finished.
-  //    Shape query + D2H are deferred to collect() to keep enqueue() fully
-  //    async — avoids the implicit GPU sync that getTensorShape() causes
-  //    on DETR models with data-dependent output shapes.
+  // 5. Publish the stream. The D2H readback is deferred to collect() to keep
+  //    enqueue() fully async — and to avoid the implicit GPU sync that
+  //    getTensorShape() triggers on DETR models with data-dependent output
+  //    shapes. The copies collect() issues on this same stream are ordered
+  //    after the execute above, so a single stream sync there suffices.
   pending_stream_ = stream;
-  CUDA_CHECK(cudaEventRecord(d2h_event_, stream));
   return true;
 }
 
 std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
   std::vector<LayoutBox> out;
-  if (!engine_ || !d2h_event_) return out;
+  if (!engine_) return out;
 
-  // A null pending_stream_ means the matching enqueue() bailed before
-  // recording d2h_event_ (e.g. execute() returned false). Syncing the event
-  // here would wait on a stale recording from an earlier successful request
-  // and then decode whatever is left in h_out0_ — silently serving the
-  // previous request's layout. Bail instead.
-  if (!pending_stream_) return out;
+  // A null pending_stream_ means the matching enqueue() bailed (e.g. execute()
+  // returned false). Draining a stream and decoding h_out0_ here would silently
+  // serve the previous request's layout. Bail instead.
+  cudaStream_t stream = pending_stream_;
+  if (!stream) return out;
 
-  // Wait for the TRT execute to finish on layout_stream_.
-  CUDA_CHECK(cudaEventSynchronize(d2h_event_));
+  // Single host<->device sync for the whole readback. Both D2H copies are
+  // issued on the stream the TRT execute ran on, so stream ordering places
+  // them strictly after it — one cudaStreamSynchronize drains the execute AND
+  // both copies. We copy the full fixed-size detection buffer (kMaxDetections
+  // rows, ~8 KB) unconditionally rather than reading the count first and then
+  // sizing a second copy; that removes the mid-readback sync the old two-phase
+  // path needed, so a burst-idle GPU sees one round-trip instead of three.
+  CUDA_CHECK(cudaMemcpyAsync(h_out1_.get(), d_out1_.get(), sizeof(int32_t),
+                             cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(
+      h_out0_.get(), d_out0_.get(),
+      sizeof(float) * static_cast<size_t>(kMaxDetections) * 7,
+      cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
 
   // The detection count comes from the model's own count tensor (out1), NOT
   // from getTensorShape(out0). out0's (N,7) shape has a data-dependent first
@@ -186,9 +187,6 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
   // first request and a stale/zero N on later ones, which silently dropped
   // layout out of every consecutive response. out1[0] is written by the
   // model's NMS on every run and is authoritative.
-  CUDA_CHECK(cudaMemcpyAsync(h_out1_.get(), d_out1_.get(), sizeof(int32_t),
-                             cudaMemcpyDeviceToHost, pending_stream_));
-  CUDA_CHECK(cudaStreamSynchronize(pending_stream_));
   int n_rows = h_out1_.get()[0];
   if (n_rows <= 0) return out;
   n_rows = std::min(n_rows, kMaxDetections);
@@ -197,40 +195,35 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
   // count and the previously-trusted getTensorShape() value.
   static const bool kLayoutDebug = std::getenv("TURBO_LAYOUT_DEBUG") != nullptr;
   if (kLayoutDebug) {
-    auto sd = engine_->tensor_shape(name_out0_);
+    const auto sd = engine_->tensor_shape(name_out0_);
     std::cerr << "[layout-dbg] out1_count=" << h_out1_.get()[0]
               << " getTensorShape(out0).d[0]="
               << (sd.nbDims >= 2 ? sd.d[0] : -1) << '\n';
   }
 
-  // D2H the detection tensor (8 KB for 300 rows × 7 × 4 B). The GPU is
-  // idle on this stream so the copy completes immediately.
-  CUDA_CHECK(cudaMemcpyAsync(
-      h_out0_.get(), d_out0_.get(),
-      sizeof(float) * static_cast<size_t>(n_rows) * 7,
-      cudaMemcpyDeviceToHost, pending_stream_));
-  CUDA_CHECK(cudaStreamSynchronize(pending_stream_));
-
-  const int orig_h  = pending_orig_h_;
-  const int orig_w  = pending_orig_w_;
+  const int orig_h = pending_orig_h_;
+  const int orig_w = pending_orig_w_;
 
   // Decode rows: [class_id, score, xmin, ymin, xmax, ymax, read_order].
   // With correct im_shape/scale_factor (PaddleX convention), the model's
   // postprocessor outputs coordinates directly in the original image space.
+  // A few hundred boxes is decoded/NMS'd on the host by design: a GPU NMS
+  // kernel over so few boxes would cost more in launch + result-D2H overhead
+  // than it saves.
   out.reserve(static_cast<size_t>(n_rows));
-  const float *rows = h_out0_.get();
+  const float *const rows = h_out0_.get();
   for (int i = 0; i < n_rows; ++i) {
-    const float *row = rows + i * 7;
-    float score = row[1];
+    const float *const row = rows + i * 7;
+    const float score = row[1];
     if (score < score_threshold) continue;
 
-    int cls = static_cast<int>(row[0]);
+    const int cls = static_cast<int>(row[0]);
     if (cls < 0 || cls >= static_cast<int>(kLayoutLabels.size())) continue;
 
-    int x0 = std::clamp(static_cast<int>(row[2]), 0, orig_w - 1);
-    int y0 = std::clamp(static_cast<int>(row[3]), 0, orig_h - 1);
-    int x1 = std::clamp(static_cast<int>(row[4]), 0, orig_w - 1);
-    int y1 = std::clamp(static_cast<int>(row[5]), 0, orig_h - 1);
+    const int x0 = std::clamp(static_cast<int>(row[2]), 0, orig_w - 1);
+    const int y0 = std::clamp(static_cast<int>(row[3]), 0, orig_h - 1);
+    const int x1 = std::clamp(static_cast<int>(row[4]), 0, orig_w - 1);
+    const int y1 = std::clamp(static_cast<int>(row[5]), 0, orig_h - 1);
     if (x1 <= x0 || y1 <= y0) continue;
 
     LayoutBox lb;

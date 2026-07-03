@@ -43,6 +43,8 @@ bool http_get_ok(const std::string &url, int timeout_s, std::string &body,
   curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
   curl_easy_setopt(c, CURLOPT_WRITEDATA, &body);
   curl_easy_setopt(c, CURLOPT_TIMEOUT, static_cast<long>(timeout_s));
+  curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);       // SIGALRM path isn't thread-safe
+  curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L); // a stalled handshake mustn't eat the budget
   CURLcode rc = curl_easy_perform(c);
   long code = 0;
   curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);

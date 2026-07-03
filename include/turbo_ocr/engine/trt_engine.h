@@ -4,6 +4,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <NvInfer.h>
@@ -89,7 +90,8 @@ public:
   // of the same engine corrupts Myelin state (observed empirically), and
   // lazily allocated arenas make VRAM unbounded.
 
-  // Opt-in via TURBO_OCR_CUDA_GRAPHS=1 (default off).
+  // Default ON (rec is launch-bound; see the A/B in trt_engine.cpp).
+  // Opt out with TURBO_OCR_CUDA_GRAPHS=0 on VRAM-constrained cards.
   [[nodiscard]] static bool graphs_enabled();
 
   // Record a graph for `dims` on optimization profile `profile_idx` with the
@@ -137,6 +139,11 @@ private:
   int current_profile_ = 0;
   void *bound_input_ = nullptr;
   void *bound_output_ = nullptr;
+  // Every tensor address set via set_tensor_address(), so ALL of them can be
+  // restored after a profile switch (TRT clears every address, not just the
+  // primary IO). Without this, a multi-input model's extra inputs read a stale
+  // pointer after select_profile() -> garbage / illegal address.
+  std::unordered_map<std::string, void *> extra_addrs_;
 };
 
 } // namespace turbo_ocr::engine

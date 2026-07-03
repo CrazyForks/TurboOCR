@@ -415,6 +415,10 @@ void assign_title_levels(std::vector<std::vector<ParsingBlock>>& blocks_by_page)
       final_level = cluster_level;
     }
 
+    // Clamp to valid Markdown heading depth: a shallower-numbered heading after a
+    // deeper first one could drive this <=0 (empty prefix) and deep numbering
+    // (1.2.3.4.5) past 6 ("#######" renders as literal text).
+    final_level = std::clamp(final_level, 1, 6);
     e.final_level = final_level;
     e.block->title_level = final_level;
   }

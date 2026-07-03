@@ -1,8 +1,12 @@
 #include "turbo_ocr/table/cell_matcher.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
+#include <iostream>
+#include <vector>
 
 #ifdef __has_include
 #  if __has_include(<boost/geometry.hpp>)
@@ -22,18 +26,31 @@ namespace {
 // this size yields a TOTAL order over (band, x), which std::sort requires —
 // the raw tolerance comparison is non-transitive (strict-weak-ordering UB).
 constexpr float READING_ORDER_BAND_PX = 8.0f;
+
+inline float box_area(const std::array<float, 4>& b) {
+    return std::max(b[2] - b[0], 0.0f) * std::max(b[3] - b[1], 0.0f);
+}
+
+// Fraction of `box` (whose area is passed in precomputed) lying inside `region`
+// — PaddleX's inter_area / box_b_area. Split out so the box area, which is
+// invariant across every cell a given line is tested against, is computed once
+// per line instead of once per (cell, line) pair. Bit-identical to the inline
+// form: same intersection edges, same divisor bits.
+inline float overlap_fraction(const std::array<float, 4>& region,
+                              const std::array<float, 4>& box,
+                              float box_a) {
+    const float x_left = std::max(region[0], box[0]);
+    const float y_top = std::max(region[1], box[1]);
+    const float x_right = std::min(region[2], box[2]);
+    const float y_bottom = std::min(region[3], box[3]);
+    const float iw = std::max(x_right - x_left, 0.0f);
+    const float ih = std::max(y_bottom - y_top, 0.0f);
+    return box_a > 0.0f ? (iw * ih) / box_a : 0.0f;
+}
 } // namespace
 
 float compute_inter(const std::array<float, 4>& a, const std::array<float, 4>& b) {
-    const float x_left = std::max(a[0], b[0]);
-    const float y_top = std::max(a[1], b[1]);
-    const float x_right = std::min(a[2], b[2]);
-    const float y_bottom = std::min(a[3], b[3]);
-    const float iw = std::max(x_right - x_left, 0.0f);
-    const float ih = std::max(y_bottom - y_top, 0.0f);
-    const float inter = iw * ih;
-    const float area_b = std::max(b[2] - b[0], 0.0f) * std::max(b[3] - b[1], 0.0f);
-    return area_b > 0.0f ? inter / area_b : 0.0f;
+    return overlap_fraction(a, b, box_area(b));
 }
 
 std::array<float, 4> quad_to_bbox(const std::array<int, 8>& quad) {
@@ -82,27 +99,48 @@ inline float match_threshold() {
 // dropped; 0 disables the rescue. Env-tunable (TABLE_MATCH_FALLBACK).
 inline float fallback_floor() {
     static const float t = [] {
-        if (const char* e = std::getenv("TABLE_MATCH_FALLBACK"))
-            return std::strtof(e, nullptr);
+        // Malformed input keeps the default: strtof-ing garbage to 0.0f would
+        // silently hit the "0 disables the rescue" sentinel on a typo.
+        if (const char* e = std::getenv("TABLE_MATCH_FALLBACK"); e && *e) {
+            char* end = nullptr;
+            const float v = std::strtof(e, &end);
+            if (end != e && *end == '\0' && !std::isnan(v)) return v;
+            std::cerr << "[cell_matcher] ignoring malformed TABLE_MATCH_FALLBACK=\""
+                      << e << "\"\n";
+        }
         return 0.15f;
     }();
     return t;
 }
+
+// Precompute each line's own area once; it is the divisor in every overlap test
+// (both the threshold pass and the argmax rescue), so hoisting it out of the
+// O(cells × lines) comparisons is a strict work reduction with identical output.
+inline std::vector<float> line_areas(const std::vector<OcrLine>& ocr) {
+    std::vector<float> areas(ocr.size());
+    for (std::size_t i = 0; i < ocr.size(); ++i) areas[i] = box_area(ocr[i].bbox);
+    return areas;
+}
+
 // Rescue still-unassigned lines into their argmax cell (>= floor), then sort each
 // cell's indices into reading order. PaddleX's match_table_and_ocr places a line in
 // EVERY cell it clears the threshold for (one line may land in multiple cells) —
 // empirically higher TEDS than forcing one cell. `assigned[i]` marks lines already
-// placed during the per-cell threshold pass.
+// placed during the per-cell threshold pass. Ties resolve to the lowest cell index
+// (strict `>`), matching PaddleX's first-wins argmax.
 inline void finalize_multicell(const std::vector<OcrLine>& ocr,
+                               const std::vector<float>& areas,
                                std::vector<MatchedCell>& out,
                                std::vector<char>& assigned) {
     const float floor = fallback_floor();
     for (std::size_t i = 0; i < ocr.size(); ++i) {
         if (assigned[i]) continue;
+        const auto& box = ocr[i].bbox;
+        const float area = areas[i];
         float best = 0.0f;
         std::size_t bestc = out.size();
         for (std::size_t c = 0; c < out.size(); ++c) {
-            const float r = compute_inter(out[c].bbox, ocr[i].bbox);
+            const float r = overlap_fraction(out[c].bbox, box, area);
             if (r > best) { best = r; bestc = c; }
         }
         if (bestc < out.size() && best > floor) {
@@ -116,6 +154,15 @@ inline void finalize_multicell(const std::vector<OcrLine>& ocr,
                       return reading_order_less(ocr, a, b);
                   });
     }
+}
+
+inline std::vector<MatchedCell> make_cells(
+    const std::vector<std::array<int, 8>>& cells) {
+    std::vector<MatchedCell> out;
+    out.reserve(cells.size());
+    for (const auto& quad : cells)
+        out.push_back(MatchedCell{quad_to_bbox(quad), {}});
+    return out;
 }
 } // namespace
 
@@ -131,19 +178,17 @@ using RTree = bgi::rtree<BValue, bgi::rstar<16>>;
 std::vector<MatchedCell> match_cells_to_ocr(
     const std::vector<std::array<int, 8>>& cells,
     const std::vector<OcrLine>& ocr) {
+    std::vector<MatchedCell> out = make_cells(cells);
+    if (ocr.empty()) return out;
+
     std::vector<BValue> entries;
     entries.reserve(ocr.size());
     for (std::size_t i = 0; i < ocr.size(); ++i) {
         const auto& b = ocr[i].bbox;
-        entries.emplace_back(
-            BBox(BPoint(b[0], b[1]), BPoint(b[2], b[3])), i);
+        entries.emplace_back(BBox(BPoint(b[0], b[1]), BPoint(b[2], b[3])), i);
     }
-    RTree tree(entries.begin(), entries.end());
-
-    std::vector<MatchedCell> out;
-    out.reserve(cells.size());
-    for (const auto& quad : cells)
-        out.push_back(MatchedCell{quad_to_bbox(quad), {}});
+    const RTree tree(entries.begin(), entries.end());
+    const std::vector<float> areas = line_areas(ocr);
 
     // PaddleX match_table_and_ocr semantics: a line goes into EVERY cell where
     // >threshold of its area overlaps (one line may land in multiple cells — this
@@ -151,70 +196,75 @@ std::vector<MatchedCell> match_cells_to_ocr(
     // finalize. The rtree query yields each line once per cell, so no per-cell dedup.
     const float thr = match_threshold();
     std::vector<char> assigned(ocr.size(), 0);
-    for (std::size_t c = 0; c < out.size(); ++c) {
-        const auto& cell_bbox = out[c].bbox;
-        const BBox query(BPoint(cell_bbox[0], cell_bbox[1]),
-                         BPoint(cell_bbox[2], cell_bbox[3]));
-        for (auto it = tree.qbegin(bgi::intersects(query));
-             it != tree.qend(); ++it) {
+    for (auto& cell : out) {
+        const auto& cb = cell.bbox;
+        const BBox query(BPoint(cb[0], cb[1]), BPoint(cb[2], cb[3]));
+        for (auto it = tree.qbegin(bgi::intersects(query)); it != tree.qend(); ++it) {
             const std::size_t i = it->second;
-            if (compute_inter(cell_bbox, ocr[i].bbox) > thr) {
-                out[c].ocr_indices.push_back(i);
+            if (overlap_fraction(cb, ocr[i].bbox, areas[i]) > thr) {
+                cell.ocr_indices.push_back(i);
                 assigned[i] = 1;
             }
         }
     }
-    finalize_multicell(ocr, out, assigned);
+    finalize_multicell(ocr, areas, out, assigned);
     return out;
 }
 
 #else
 
-// 16-bucket grid fallback when Boost.Geometry isn't available. Bucket count is
-// fixed; cell→bucket assignment is by axis-aligned envelope. Sub-ms either
-// way for the expected ≤500 cells × ≤200 OCR lines.
+// Dependency-free uniform-grid spatial index used when Boost.Geometry is absent.
+// A line box is registered into every grid bucket its extent overlaps; a cell
+// query scans only the buckets its bbox covers. Because bucketing is monotone in
+// each coordinate, two boxes whose extents overlap ALWAYS share a bucket, so this
+// enumerates the exact same candidate set as an exhaustive scan (and the rtree
+// path) — no positive-overlap pair is ever missed. Output is byte-identical to the
+// rtree variant: finalize re-sorts each cell, so bucket iteration order is moot.
 namespace {
 constexpr int GRID_N = 16;
+constexpr int GRID_CELLS = GRID_N * GRID_N;
 
 struct Grid {
     float x0{0}, y0{0}, x1{0}, y1{0};
-    std::vector<std::size_t> buckets[GRID_N][GRID_N];
-
-    void build(const std::vector<OcrLine>& ocr) {
-        if (ocr.empty()) return;
-        x0 = ocr[0].bbox[0]; y0 = ocr[0].bbox[1];
-        x1 = ocr[0].bbox[2]; y1 = ocr[0].bbox[3];
-        for (const auto& l : ocr) {
-            x0 = std::min(x0, l.bbox[0]);
-            y0 = std::min(y0, l.bbox[1]);
-            x1 = std::max(x1, l.bbox[2]);
-            y1 = std::max(y1, l.bbox[3]);
-        }
-        for (std::size_t i = 0; i < ocr.size(); ++i) {
-            int bx0, by0, bx1, by1;
-            range(ocr[i].bbox, bx0, by0, bx1, by1);
-            for (int gy = by0; gy <= by1; ++gy)
-                for (int gx = bx0; gx <= bx1; ++gx)
-                    buckets[gy][gx].push_back(i);
-        }
-    }
+    // CSR layout: `items` holds line indices grouped by bucket; `start[b]..start[b+1]`
+    // delimits bucket b. One allocation instead of GRID_CELLS separate vectors.
+    std::array<int, GRID_CELLS + 1> start{};
+    std::vector<std::size_t> items;
 
     void range(const std::array<float, 4>& b,
                int& bx0, int& by0, int& bx1, int& by1) const {
         const float dx = std::max(x1 - x0, 1.0f);
         const float dy = std::max(y1 - y0, 1.0f);
-        auto bucket_x = [&](float v) {
-            int g = static_cast<int>(((v - x0) / dx) * GRID_N);
-            return std::clamp(g, 0, GRID_N - 1);
+        auto bx = [&](float v) {
+            return std::clamp(static_cast<int>(((v - x0) / dx) * GRID_N), 0, GRID_N - 1);
         };
-        auto bucket_y = [&](float v) {
-            int g = static_cast<int>(((v - y0) / dy) * GRID_N);
-            return std::clamp(g, 0, GRID_N - 1);
+        auto by = [&](float v) {
+            return std::clamp(static_cast<int>(((v - y0) / dy) * GRID_N), 0, GRID_N - 1);
         };
-        bx0 = bucket_x(b[0]);
-        by0 = bucket_y(b[1]);
-        bx1 = bucket_x(b[2]);
-        by1 = bucket_y(b[3]);
+        bx0 = bx(b[0]); by0 = by(b[1]); bx1 = bx(b[2]); by1 = by(b[3]);
+    }
+
+    void build(const std::vector<OcrLine>& ocr) {
+        if (ocr.empty()) return;
+        x0 = x1 = ocr[0].bbox[0]; y0 = y1 = ocr[0].bbox[1];
+        for (const auto& l : ocr) {
+            x0 = std::min(x0, l.bbox[0]); y0 = std::min(y0, l.bbox[1]);
+            x1 = std::max(x1, l.bbox[2]); y1 = std::max(y1, l.bbox[3]);
+        }
+        // Counting sort into CSR: tally bucket occupancy, prefix-sum, then scatter.
+        std::array<int, GRID_CELLS + 1> count{};
+        auto touch = [&](const std::array<float, 4>& b, auto&& fn) {
+            int bx0, by0, bx1, by1;
+            range(b, bx0, by0, bx1, by1);
+            for (int gy = by0; gy <= by1; ++gy)
+                for (int gx = bx0; gx <= bx1; ++gx) fn(gy * GRID_N + gx);
+        };
+        for (const auto& l : ocr) touch(l.bbox, [&](int b) { ++count[b + 1]; });
+        for (int i = 0; i < GRID_CELLS; ++i) count[i + 1] += count[i];
+        start = count;
+        items.resize(count[GRID_CELLS]);
+        for (std::size_t i = 0; i < ocr.size(); ++i)
+            touch(ocr[i].bbox, [&](int b) { items[count[b]++] = i; });
     }
 };
 } // namespace
@@ -222,40 +272,39 @@ struct Grid {
 std::vector<MatchedCell> match_cells_to_ocr(
     const std::vector<std::array<int, 8>>& cells,
     const std::vector<OcrLine>& ocr) {
-    Grid grid;
-    grid.build(ocr);
-
-    std::vector<MatchedCell> out;
-    out.reserve(cells.size());
-    for (const auto& quad : cells)
-        out.push_back(MatchedCell{quad_to_bbox(quad), {}});
+    std::vector<MatchedCell> out = make_cells(cells);
     if (ocr.empty()) return out;
 
-    // Multi-cell (see rtree variant): a line goes into every cell it clears the
-    // threshold for. A line spans multiple grid buckets, so a per-cell `seen`
-    // guard avoids adding it to the SAME cell twice; across cells it may repeat.
+    Grid grid;
+    grid.build(ocr);
+    const std::vector<float> areas = line_areas(ocr);
+
+    // A line spans multiple buckets, so a per-cell `seen` guard avoids adding it to
+    // the SAME cell twice; across cells it may repeat (multi-cell, see rtree variant).
     const float thr = match_threshold();
     std::vector<char> assigned(ocr.size(), 0);
     std::vector<char> seen(ocr.size(), 0);
-    for (std::size_t c = 0; c < out.size(); ++c) {
-        const auto& cell_bbox = out[c].bbox;
+    for (auto& cell : out) {
+        const auto& cb = cell.bbox;
         int bx0, by0, bx1, by1;
-        grid.range(cell_bbox, bx0, by0, bx1, by1);
+        grid.range(cb, bx0, by0, bx1, by1);
         std::fill(seen.begin(), seen.end(), 0);
         for (int gy = by0; gy <= by1; ++gy) {
             for (int gx = bx0; gx <= bx1; ++gx) {
-                for (std::size_t i : grid.buckets[gy][gx]) {
+                const int b = gy * GRID_N + gx;
+                for (int k = grid.start[b]; k < grid.start[b + 1]; ++k) {
+                    const std::size_t i = grid.items[k];
                     if (seen[i]) continue;
                     seen[i] = 1;
-                    if (compute_inter(cell_bbox, ocr[i].bbox) > thr) {
-                        out[c].ocr_indices.push_back(i);
+                    if (overlap_fraction(cb, ocr[i].bbox, areas[i]) > thr) {
+                        cell.ocr_indices.push_back(i);
                         assigned[i] = 1;
                     }
                 }
             }
         }
     }
-    finalize_multicell(ocr, out, assigned);
+    finalize_multicell(ocr, areas, out, assigned);
     return out;
 }
 

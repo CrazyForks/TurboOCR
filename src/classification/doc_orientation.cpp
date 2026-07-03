@@ -1,6 +1,7 @@
 #include "turbo_ocr/classification/doc_orientation.h"
 
 #include <algorithm>
+#include <iostream>
 
 #include "turbo_ocr/classification/doc_orientation_common.h"
 #include "turbo_ocr/common/cuda_check.h"
@@ -41,7 +42,12 @@ int DocOrientation::detect(const cv::Mat &bgr, cudaStream_t stream) {
   dims.d[1] = 3;
   dims.d[2] = kDocOriSize;
   dims.d[3] = kDocOriSize;
-  if (!engine_->infer_dynamic(dims, stream)) return 0;  // best-effort: no rotate
+  if (!engine_->infer_dynamic(dims, stream)) {
+    // Fail loud: a real inference failure must not be indistinguishable from a
+    // confidently-upright page (no-silent-failure).
+    std::cerr << "[doc-ori] orientation inference failed; page left un-rotated\n";
+    return 0; // best-effort: no rotate
+  }
 
   CUDA_CHECK(cudaMemcpyAsync(h_output_.get(), d_output_.get(),
                               4 * sizeof(float), cudaMemcpyDeviceToHost, stream));

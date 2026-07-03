@@ -14,6 +14,11 @@
 #include "turbo_ocr/layout/reading_order.h"
 #include "turbo_ocr/router/router_types.h"
 
+// Shared no-silent-failure guard for the base text stage (single source of
+// truth for the text_degraded flag + warning string; keeps the CPU and GPU
+// pipelines byte-identical on the degraded response).
+#include "ocr_pipeline_detail.h"
+
 namespace turbo_ocr::pipeline {
 
 using ::turbo_ocr::Box;
@@ -68,6 +73,12 @@ void CpuOcrPipeline::warmup() {
 }
 
 std::vector<OCRResultItem> CpuOcrPipeline::run(const cv::Mat &img) {
+  std::size_t num_boxes = 0;
+  return run_core_(img, num_boxes);
+}
+
+std::vector<OCRResultItem> CpuOcrPipeline::run_core_(const cv::Mat &img,
+                                                     std::size_t &num_boxes) {
   namespace prof = turbo_ocr::prof;
 
   // Detection
@@ -76,6 +87,7 @@ std::vector<OCRResultItem> CpuOcrPipeline::run(const cv::Mat &img) {
     prof::Scope _s(prof::DET);
     boxes = det_->run(img);
   }
+  num_boxes = boxes.size();
 
   // Sort boxes top-to-bottom, left-to-right
   {
@@ -114,6 +126,13 @@ std::vector<OCRResultItem> CpuOcrPipeline::run(const cv::Mat &img) {
       });
     }
   }
+  if (rec_results.size() < boxes.size())
+    // Recognizer under-ran the detector: fail loud (parity with formula/table),
+    // don't silently drop detected text lines.
+    std::cerr << std::format(
+        "[Pipeline] rec returned {} of {} detected boxes — {} line(s) dropped "
+        "(recognizer under-run, not empty text)\n",
+        rec_results.size(), boxes.size(), boxes.size() - rec_results.size());
 
   return final_results;
 }
@@ -160,6 +179,8 @@ void CpuOcrPipeline::run_structure_stages(const cv::Mat &img,
     turbo_ocr::prof::Scope _s(turbo_ocr::prof::FORMULA);
     std::vector<Box> fboxes;
     std::vector<int> flids;
+    fboxes.reserve(out.layout.size());
+    flids.reserve(out.layout.size());
     for (std::size_t lid = 0; lid < out.layout.size(); ++lid) {
       if (!is_formula_class(out.layout[lid].class_id)) continue;
       flids.push_back(static_cast<int>(lid));
@@ -193,6 +214,8 @@ void CpuOcrPipeline::run_structure_stages(const cv::Mat &img,
     turbo_ocr::prof::Scope _s(turbo_ocr::prof::TABLE);
     std::vector<Box> tboxes;
     std::vector<int> tlids;
+    tboxes.reserve(out.layout.size());
+    tlids.reserve(out.layout.size());
     for (std::size_t lid = 0; lid < out.layout.size(); ++lid) {
       if (!is_table_class(out.layout[lid].class_id)) continue;
       tlids.push_back(static_cast<int>(lid));
@@ -237,7 +260,13 @@ OcrPipelineResult CpuOcrPipeline::run_with_layout(const cv::Mat &img,
                                                     bool want_tables,
                                                     bool want_formulas) {
   OcrPipelineResult out;
-  out.results = run(img);
+  std::size_t num_boxes = 0;
+  out.results = run_core_(img, num_boxes);
+  // No-silent-failure parity with the GPU pipeline: detection found text
+  // regions but recognition produced nothing usable -> flag text_degraded so a
+  // recognition failure on a text page is never a byte-identical clean empty
+  // 200. A genuinely text-free page (num_boxes == 0) is not degraded.
+  detail::flag_text_degraded(out, num_boxes);
   if (want_layout && layout_) {
     turbo_ocr::prof::Scope _s(turbo_ocr::prof::LAYOUT);
     out.layout = layout_->run(img);

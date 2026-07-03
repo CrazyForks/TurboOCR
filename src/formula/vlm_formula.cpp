@@ -66,6 +66,31 @@ size_t curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
   return size * nmemb;
 }
 
+// A stalled TCP/TLS handshake must not silently consume the whole request
+// budget; cap it independently of the total timeout (mirrors openai_endpoint).
+constexpr long kConnectTimeoutS = 5;
+
+// RAII wrappers so the easy handle + header list are always released on every
+// return/throw path — no manual cleanup to forget on a new early-return.
+struct CurlEasy {
+  CURL *h = curl_easy_init();
+  CurlEasy() = default;
+  CurlEasy(const CurlEasy &) = delete;
+  CurlEasy &operator=(const CurlEasy &) = delete;
+  ~CurlEasy() { if (h) curl_easy_cleanup(h); }
+  explicit operator bool() const noexcept { return h != nullptr; }
+  operator CURL *() const noexcept { return h; }
+};
+
+struct CurlHeaders {
+  curl_slist *h = nullptr;
+  CurlHeaders() = default;
+  CurlHeaders(const CurlHeaders &) = delete;
+  CurlHeaders &operator=(const CurlHeaders &) = delete;
+  ~CurlHeaders() { if (h) curl_slist_free_all(h); }
+  void append(const char *s) { h = curl_slist_append(h, s); }
+};
+
 struct HttpResp {
   bool        ok      = false;
   long        status  = 0;
@@ -75,23 +100,22 @@ struct HttpResp {
 HttpResp http_post_json(const std::string &url, const std::string &json_body,
                         int timeout_s) {
   HttpResp r;
-  CURL *curl = curl_easy_init();
-  if (curl == nullptr) return r;
-  struct curl_slist *hdrs = nullptr;
-  hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-  hdrs = curl_slist_append(hdrs, "Accept: application/json");
-
+  CurlEasy curl;
+  if (!curl) return r;
+  CurlHeaders hdrs;
+  hdrs.append("Content-Type: application/json");
+  hdrs.append("Accept: application/json");
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);      // thread-safe timeout path
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_POST, 1L);
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body.c_str());
   curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)json_body.size());
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs.h);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout_s);
-  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutS);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r.body);
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
   CURLcode rc = curl_easy_perform(curl);
   if (rc == CURLE_OK) {
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
@@ -99,17 +123,16 @@ HttpResp http_post_json(const std::string &url, const std::string &json_body,
   } else {
     std::cerr << "[VLMFormula] curl error: " << curl_easy_strerror(rc) << '\n';
   }
-  curl_slist_free_all(hdrs);
-  curl_easy_cleanup(curl);
   return r;
 }
 
 HttpResp http_get(const std::string &url, int timeout_s) {
   HttpResp r;
-  CURL *curl = curl_easy_init();
-  if (curl == nullptr) return r;
+  CurlEasy curl;
+  if (!curl) return r;
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout_s);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutS);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r.body);
@@ -118,7 +141,6 @@ HttpResp http_get(const std::string &url, int timeout_s) {
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
     r.ok = (r.status >= 200 && r.status < 300);
   }
-  curl_easy_cleanup(curl);
   return r;
 }
 
@@ -175,7 +197,7 @@ VLMFormula::~VLMFormula() noexcept = default;
 bool VLMFormula::load_model_dir(const std::string &/*model_dir*/) {
   base_url_   = get_env("VLLM_BASE_URL", "http://localhost:8000");
   while (!base_url_.empty() && base_url_.back() == '/') base_url_.pop_back();
-  // Default to PaddleOCR-VL-1.6 (SOTA, 96.33% OmniDocBench, architecturally
+  // Default to PaddleOCR-VL-1.6 (96.33% OmniDocBench, architecturally
   // identical to 1.5 → drop-in). Its formula head is trained on the exact
   // "Formula Recognition:" prompt; a free-form instruction degrades it. Point
   // VLLM_MODEL/VLLM_FORMULA_PROMPT at a MiniCPM endpoint to override.
@@ -284,7 +306,12 @@ bool VLMFormula::batched_request(
   };
   HttpResp r = http_post_json(base_url_ + "/v1/chat/completions",
                               body.dump(), timeout_s_ * std::max(1, (int)crops_png.size() / 4));
-  if (!r.ok) return false;
+  if (!r.ok) {
+    std::cerr << "[VLMFormula] batched chat status=" << r.status
+              << " body=" << r.body.substr(0, std::min<size_t>(r.body.size(), 200))
+              << " — falling back to per-crop\n";
+    return false;
+  }
   try {
     auto j = nlohmann::json::parse(r.body);
     std::string msg = j.at("choices").at(0).at("message").at("content").get<std::string>();
@@ -356,7 +383,7 @@ VLMFormula::run_pool(const std::vector<uint8_t> &host_page,
   for (int i = 0; i < n; ++i) {
     futs.push_back(pool.submit(
         std::move(crops_png[i]),
-        prompt_, model_, max_tokens_, timeout_s_, base_url_));
+        prompt_, model_, max_tokens_, timeout_s_, base_url_, std::string()));
   }
 
   // Collect results.
@@ -420,7 +447,7 @@ VLMFormula::submit_async(const std::vector<uint8_t> &host_page,
   for (int i = 0; i < n; ++i) {
     futs.push_back(pool.submit(
         std::move(crops_png[i]),
-        prompt_, model_, max_tokens_, timeout_s_, base_url_));
+        prompt_, model_, max_tokens_, timeout_s_, base_url_, std::string()));
   }
   return futs;
 }

@@ -90,7 +90,12 @@ set(TURBO_PDFIUM_DIR "${CMAKE_SOURCE_DIR}/third_party/pdfium"
 # files, so generate and use must share one build directory.
 set(PGO_MODE "off" CACHE STRING "Profile-guided optimization: off|generate|use")
 set_property(CACHE PGO_MODE PROPERTY STRINGS off generate use)
-if(NOT PGO_MODE STREQUAL "off")
+# Line/branch coverage. Instruments host C++ only (same $<COMPILE_LANGUAGE:CXX>
+# scoping as PGO; nvcc .cu objects are left alone). Build with it on, run the
+# test suite, then aggregate the *.gcda with scripts/coverage.sh (gcovr) — any
+# 0-hit branch is a path no test exercises.
+option(TURBO_COVERAGE "Instrument host C++ for gcov line/branch coverage" OFF)
+if(NOT PGO_MODE STREQUAL "off" OR TURBO_COVERAGE)
     # The executable is linked by the C++ compiler, but CMake prepends CUDA's
     # implicit link dirs — and since CUDA 13.2's nvcc host compiler is GCC 15,
     # that dir ships a 15.x libgcov that -lgcov would resolve before the C++
@@ -114,6 +119,17 @@ elseif(PGO_MODE STREQUAL "use")
         $<$<COMPILE_LANGUAGE:CXX>:-Wno-missing-profile>
         $<$<COMPILE_LANGUAGE:CXX>:-Wno-coverage-mismatch>)
     add_link_options(-fprofile-use)
+endif()
+if(TURBO_COVERAGE)
+    message(STATUS "Coverage: instrumented build (--coverage); gcov dir ${_gcc_libdir}")
+    # -fprofile-abs-path makes the emitted .gcno reference absolute source paths
+    # so gcovr resolves them regardless of the invocation cwd. -O0 keeps line
+    # mapping honest (no inlining collapsing branches away).
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:--coverage>
+        $<$<COMPILE_LANGUAGE:CXX>:-fprofile-abs-path>
+        $<$<COMPILE_LANGUAGE:CXX>:-O0>)
+    add_link_options(--coverage)
 endif()
 
 option(USE_CPU_ONLY "Build CPU-only mode with ONNX Runtime" OFF)
@@ -517,6 +533,7 @@ else()
         src/table/kernels/table_kernels.cu
         src/formula/formula_tokenizer.cpp
         src/formula/formula_recognizer.cpp
+        src/formula/auto_cjk_formula.cpp
         src/formula/vlm_formula.cpp
         src/formula/ppformulanet_ort.cu
         src/formula/ppformulanet_preprocess.cpp

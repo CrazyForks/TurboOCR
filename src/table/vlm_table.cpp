@@ -57,6 +57,31 @@ size_t curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
   return size * nmemb;
 }
 
+// A stalled TCP/TLS handshake must not silently consume the whole request
+// budget; cap it independently of the total timeout (mirrors openai_endpoint).
+constexpr long kConnectTimeoutS = 5;
+
+// RAII wrappers so the easy handle + header list are always released on every
+// return/throw path — no manual cleanup to forget on a new early-return.
+struct CurlEasy {
+  CURL *h = curl_easy_init();
+  CurlEasy() = default;
+  CurlEasy(const CurlEasy &) = delete;
+  CurlEasy &operator=(const CurlEasy &) = delete;
+  ~CurlEasy() { if (h) curl_easy_cleanup(h); }
+  explicit operator bool() const noexcept { return h != nullptr; }
+  operator CURL *() const noexcept { return h; }
+};
+
+struct CurlHeaders {
+  curl_slist *h = nullptr;
+  CurlHeaders() = default;
+  CurlHeaders(const CurlHeaders &) = delete;
+  CurlHeaders &operator=(const CurlHeaders &) = delete;
+  ~CurlHeaders() { if (h) curl_slist_free_all(h); }
+  void append(const char *s) { h = curl_slist_append(h, s); }
+};
+
 struct HttpResp {
   bool        ok      = false;
   long        status  = 0;
@@ -66,18 +91,19 @@ struct HttpResp {
 HttpResp http_post_json(const std::string &url, const std::string &json_body,
                         int timeout_s) {
   HttpResp r;
-  CURL *curl = curl_easy_init();
-  if (curl == nullptr) return r;
-  struct curl_slist *hdrs = nullptr;
-  hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-  hdrs = curl_slist_append(hdrs, "Accept: application/json");
+  CurlEasy curl;
+  if (!curl) return r;
+  CurlHeaders hdrs;
+  hdrs.append("Content-Type: application/json");
+  hdrs.append("Accept: application/json");
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);      // thread-safe timeout path
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_POST, 1L);
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body.c_str());
   curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)json_body.size());
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs.h);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout_s);
-  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutS);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r.body);
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -88,17 +114,16 @@ HttpResp http_post_json(const std::string &url, const std::string &json_body,
   } else {
     std::cerr << "[VLMTable] curl error: " << curl_easy_strerror(rc) << '\n';
   }
-  curl_slist_free_all(hdrs);
-  curl_easy_cleanup(curl);
   return r;
 }
 
 HttpResp http_get(const std::string &url, int timeout_s) {
   HttpResp r;
-  CURL *curl = curl_easy_init();
-  if (curl == nullptr) return r;
+  CurlEasy curl;
+  if (!curl) return r;
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout_s);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutS);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r.body);
@@ -107,7 +132,6 @@ HttpResp http_get(const std::string &url, int timeout_s) {
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
     r.ok = (r.status >= 200 && r.status < 300);
   }
-  curl_easy_cleanup(curl);
   return r;
 }
 
@@ -432,18 +456,19 @@ bool VLMTable::single_request(const std::vector<uint8_t> &crop_png,
     out_otsl = j.at("choices").at(0).at("message").at("content").get<std::string>();
     return true;
   } catch (const std::exception &e) {
-    std::cerr << "[VLMTable] response parse failed: " << e.what() << '\n';
+    std::cerr << "[VLMTable] response parse failed: " << e.what()
+              << " body=" << r.body.substr(0, std::min<size_t>(r.body.size(), 200))
+              << '\n';
     return false;
   }
 }
 
-// Helper: convert raw VLM response to HTML.
+// Helper: convert raw VLM response to HTML. A model that already emits HTML
+// (`<table…`) passes through untouched; only OTSL is converted. Trim first so a
+// whitespace/newline-prefixed HTML response isn't mangled by otsl_to_html
+// (matches backends/openai_endpoint.cpp::otsl_or_html).
 static std::string otsl_or_html(const std::string &raw) {
-  if (raw.size() > 6 &&
-      raw[0]=='<' && raw[1]=='t' && raw[2]=='a' &&
-      raw[3]=='b' && raw[4]=='l' && raw[5]=='e') {
-    return raw;
-  }
+  if (trim(raw).rfind("<table", 0) == 0) return raw;
   return raw.empty() ? "" : otsl_to_html(raw);
 }
 
@@ -483,15 +508,10 @@ VLMTable::run(const GpuImage &page, const std::vector<Box> &regions,
       enc_threads.emplace_back([&] {
         for (int i = next.fetch_add(1, std::memory_order_relaxed); i < n;
              i = next.fetch_add(1, std::memory_order_relaxed)) {
-          auto r = aabb(regions[i]);
-          int x0 = std::clamp(r[0], 0, std::max(0, page.cols - 1));
-          int y0 = std::clamp(r[1], 0, std::max(0, page.rows - 1));
-          int x1 = std::clamp(r[2], x0, page.cols);
-          int y1 = std::clamp(r[3], y0, page.rows);
-          int w = std::max(1, x1 - x0);
-          int h = std::max(1, y1 - y0);
-          const uint8_t *src = host_page.data() + (size_t)y0 * page.step + (size_t)x0 * 3;
-          crops_png[i] = encode_png_bgr(src, w, h, (int)page.step);
+          auto cr = clamped_crop_rect(regions[i], page.cols, page.rows);
+          const uint8_t *src =
+              host_page.data() + (size_t)cr[1] * page.step + (size_t)cr[0] * 3;
+          crops_png[i] = encode_png_bgr(src, cr[2], cr[3], (int)page.step);
         }
       });
     }
@@ -508,7 +528,7 @@ VLMTable::run(const GpuImage &page, const std::vector<Box> &regions,
     for (int i = 0; i < n; ++i) {
       futs.push_back(pool.submit(
           std::move(crops_png[i]),
-          prompt_, model_, max_tokens_, timeout_s_, base_url_));
+          prompt_, model_, max_tokens_, timeout_s_, base_url_, std::string()));
     }
     for (int i = 0; i < n; ++i) {
       out[i] = otsl_or_html(futs[i].get());
@@ -573,15 +593,10 @@ VLMTable::submit_async(const GpuImage &page,
       enc_threads.emplace_back([&] {
         for (int i = next.fetch_add(1, std::memory_order_relaxed); i < n;
              i = next.fetch_add(1, std::memory_order_relaxed)) {
-          auto r = aabb(regions[i]);
-          int x0 = std::clamp(r[0], 0, std::max(0, page.cols - 1));
-          int y0 = std::clamp(r[1], 0, std::max(0, page.rows - 1));
-          int x1 = std::clamp(r[2], x0, page.cols);
-          int y1 = std::clamp(r[3], y0, page.rows);
-          int w = std::max(1, x1 - x0);
-          int h = std::max(1, y1 - y0);
-          const uint8_t *src = host_page.data() + (size_t)y0 * page.step + (size_t)x0 * 3;
-          crops_png[i] = encode_png_bgr(src, w, h, (int)page.step);
+          auto cr = clamped_crop_rect(regions[i], page.cols, page.rows);
+          const uint8_t *src =
+              host_page.data() + (size_t)cr[1] * page.step + (size_t)cr[0] * 3;
+          crops_png[i] = encode_png_bgr(src, cr[2], cr[3], (int)page.step);
         }
       });
     }
@@ -592,7 +607,7 @@ VLMTable::submit_async(const GpuImage &page,
   for (int i = 0; i < n; ++i) {
     futs.push_back(pool.submit(
         std::move(crops_png[i]),
-        prompt_, model_, max_tokens_, timeout_s_, base_url_));
+        prompt_, model_, max_tokens_, timeout_s_, base_url_, std::string()));
   }
   return futs;
 }

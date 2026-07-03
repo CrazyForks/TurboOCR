@@ -343,6 +343,10 @@ int main(int argc, char **argv) try {
   };
   auto probe = std::make_shared<ProbeState>();
   auto readiness = [&dispatcher, probe, layout_available]() -> bool {
+    // Fail readiness the instant a drain begins so k8s stops routing NEW traffic
+    // to a shutting-down pod (previously it reported Ready throughout drain).
+    if (bootstrap::g_shutdown_requested.load(std::memory_order_acquire))
+      return false;
     using namespace std::chrono;
     const int64_t now_ms = duration_cast<milliseconds>(
         steady_clock::now().time_since_epoch()).count();
@@ -442,6 +446,8 @@ int main(int argc, char **argv) try {
   // readiness GPU-free (M2): a busy GPU can't make Health() block, so it can't
   // flap the process out of service.
   auto readiness_cached = [probe]() -> bool {
+    if (bootstrap::g_shutdown_requested.load(std::memory_order_acquire))
+      return false; // drain: stop advertising Ready to k8s / gRPC Health
     return probe->ok.load(std::memory_order_acquire);
   };
 

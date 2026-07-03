@@ -16,6 +16,32 @@ using turbo_ocr::engine::TrtEngine;
 using turbo_ocr::Box;
 using turbo_ocr::GpuImage;
 
+namespace {
+
+// One queued (bucket, slot) inference awaiting CPU-side CTC decode.
+struct BatchRecord {
+  int beg, end, seq_len, slot;
+};
+
+// Decode every queued batch's argmax rows into per-crop (text, score) results.
+// The ONE decode site shared by run() and run_multi(), both the mid-loop
+// slot-exhaustion drains and both final passes — any change to the decode call
+// has exactly one edit site instead of four.
+template <class Slots, class Emit>
+void decode_records(const std::vector<BatchRecord> &records, Slots &slots,
+                    const std::vector<std::string> &labels, const Emit &emit) {
+  for (const auto &rec : records) {
+    auto &os = slots[rec.slot];
+    for (int j = 0; j < rec.end - rec.beg; ++j)
+      emit(rec.beg + j,
+           ctc_greedy_decode(os.h_indices.get() + j * rec.seq_len,
+                             os.h_scores.get() + j * rec.seq_len, rec.seq_len,
+                             labels));
+  }
+}
+
+}  // namespace
+
 PaddleRec::PaddleRec() { label_list_.push_back("blank"); }
 
 void PaddleRec::infer_bucket(int cur_batch, int imgW, cudaStream_t stream,
@@ -37,8 +63,13 @@ void PaddleRec::infer_bucket(int cur_batch, int imgW, cudaStream_t stream,
     if (best >= 0 && 4 * cur_batch >= 3 * engine::kRecGraphProfiles[best].batch &&
         baked_slots_[static_cast<size_t>(best)].slot >= 0) {
       const auto &s = baked_slots_[static_cast<size_t>(best)];
-      if (!engine_->launch_baked(s.slot, stream))
+      if (!engine_->launch_baked(s.slot, stream)) {
+        // Same contract as infer_dynamic/execute: a sticky fault (illegal
+        // address, launch failure) has poisoned the context process-wide —
+        // fail fast rather than let later requests serve garbage.
+        turbo_ocr::abort_on_sticky_cuda_fault("PaddleRec::infer_bucket graph launch");
         throw turbo_ocr::InferenceError("Recognition graph launch failed");
+      }
       seq_len = s.seq_len;
       num_classes = actual_num_classes_;
       return;
@@ -150,6 +181,16 @@ void PaddleRec::bake_graphs(cudaStream_t stream) {
   int baked = 0;
   for (int i = 0; i < engine::kNumRecGraphProfiles; ++i) {
     const auto &gp = engine::kRecGraphProfiles[i];
+    // d_batch_input_/d_output_ are sized for rec_batch_num_ rows; baking a
+    // larger profile would run (and write) past them. Holds by construction
+    // today (max profile batch == default 32) — guard it so a future profile
+    // table or batch-size knob can never turn it into a silent overrun.
+    if (gp.batch > rec_batch_num_) {
+      std::cerr << std::format(
+          "[PaddleRec] skipping graph profile ({}x{}): exceeds rec batch {}\n",
+          gp.batch, gp.width, rec_batch_num_);
+      continue;
+    }
     nvinfer1::Dims4 dims{gp.batch, 3, rec_image_h_, gp.width};
     const int slot = engine_->bake_graph(1 + i, dims, d_batch_input_.get(),
                                          d_output_.get(), stream);
@@ -188,7 +229,13 @@ PaddleRec::run(const GpuImage &img, const std::vector<Box> &boxes,
                         ((box[0][1] - box[3][1]) * (box[0][1] - box[3][1])));
     float ar = (h > 0) ? (w / h) : 0;
 
-    // Snap the INDIVIDUAL crop width to a bucket
+    // Snap the INDIVIDUAL crop width to a bucket. KNOWN RECALL CEILING: the
+    // kMaxRecWidth cap horizontally compresses any line with aspect ratio
+    // beyond kMaxRecWidth/rec_image_h (4000/48 ≈ 83:1 — e.g. a full-width
+    // 2000px line under ~24px tall), squashing glyphs below the CTC receptive
+    // field. Inherent CRNN limit, rare on document lines at det scale; the
+    // mitigation (split over-long crops and stitch the transcripts) is an
+    // accuracy-gated experiment, not a local fix.
     int crop_imgW = std::min(static_cast<int>(std::ceil(rec_image_h_ * ar)), kMaxRecWidth);
     crop_imgW = std::max(crop_imgW, 32); // minimum 32px, NOT forced to 320
     int bucket = *std::lower_bound(kWidthBuckets.begin(), kWidthBuckets.end(), crop_imgW);
@@ -207,11 +254,13 @@ PaddleRec::run(const GpuImage &img, const std::vector<Box> &boxes,
   // This eliminates ~N-1 cudaEventSynchronize calls that previously created
   // GPU idle gaps (the CPU couldn't submit batch N+1 until batch N was done).
 
-  struct BatchRecord {
-    int beg, end, seq_len, slot;
-  };
   std::vector<BatchRecord> batch_records;
   batch_records.reserve(16);
+
+  // Sink for decode_records: map a crop index back to its original box slot.
+  const auto emit_result = [&](int ci, std::pair<std::string, float> &&r) {
+    results[crops[ci].orig_idx] = std::move(r);
+  };
 
   int beg = 0;
   int slot = 0;
@@ -230,16 +279,7 @@ PaddleRec::run(const GpuImage &img, const std::vector<Box> &boxes,
     // If we've exhausted our output slots, sync and decode what we have so far
     if (slot >= kMaxSlots) {
       CUDA_CHECK(cudaStreamSynchronize(stream));
-      for (auto &rec : batch_records) {
-        int batch_n = rec.end - rec.beg;
-        auto &os = output_slots_[rec.slot];
-        for (int j = 0; j < batch_n; ++j) {
-          int orig_idx = crops[rec.beg + j].orig_idx;
-          results[orig_idx] =
-              ctc_greedy_decode(os.h_indices.get() + j * rec.seq_len,
-                               os.h_scores.get() + j * rec.seq_len, rec.seq_len, label_list_);
-        }
-      }
+      decode_records(batch_records, output_slots_, label_list_, emit_result);
       batch_records.clear();
       slot = 0;
     }
@@ -298,16 +338,7 @@ PaddleRec::run(const GpuImage &img, const std::vector<Box> &boxes,
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   // CTC decode ALL batches on CPU (all D2H transfers are complete)
-  for (auto &rec : batch_records) {
-    int batch_n = rec.end - rec.beg;
-    auto &os = output_slots_[rec.slot];
-    for (int j = 0; j < batch_n; ++j) {
-      int orig_idx = crops[rec.beg + j].orig_idx;
-      results[orig_idx] =
-          ctc_greedy_decode(os.h_indices.get() + j * rec.seq_len,
-                           os.h_scores.get() + j * rec.seq_len, rec.seq_len, label_list_);
-    }
-  }
+  decode_records(batch_records, output_slots_, label_list_, emit_result);
 
   return results;
 }
@@ -365,11 +396,14 @@ PaddleRec::run_multi(const std::vector<ImageCrops> &image_crops,
   });
 
   // Multi-slot deferred-sync recognition (same as single-image run())
-  struct MultiBatchRecord {
-    int beg, end, seq_len, slot;
-  };
-  std::vector<MultiBatchRecord> batch_records;
+  std::vector<BatchRecord> batch_records;
   batch_records.reserve(16);
+
+  // Sink for decode_records: map a crop index back to its (image, box) slot.
+  const auto emit_result = [&](int ci, std::pair<std::string, float> &&r) {
+    const auto &c = crops[ci];
+    all_results[c.img_idx][c.box_idx] = std::move(r);
+  };
 
   int beg = 0;
   int slot = 0;
@@ -388,16 +422,7 @@ PaddleRec::run_multi(const std::vector<ImageCrops> &image_crops,
     // If we've exhausted output slots, sync and decode what we have so far
     if (slot >= kMaxSlots) {
       CUDA_CHECK(cudaStreamSynchronize(stream));
-      for (auto &rec : batch_records) {
-        int batch_n = rec.end - rec.beg;
-        auto &os = output_slots_[rec.slot];
-        for (int j = 0; j < batch_n; ++j) {
-          const auto &ci = crops[rec.beg + j];
-          all_results[ci.img_idx][ci.box_idx] =
-              ctc_greedy_decode(os.h_indices.get() + j * rec.seq_len,
-                               os.h_scores.get() + j * rec.seq_len, rec.seq_len, label_list_);
-        }
-      }
+      decode_records(batch_records, output_slots_, label_list_, emit_result);
       batch_records.clear();
       slot = 0;
     }
@@ -472,16 +497,7 @@ PaddleRec::run_multi(const std::vector<ImageCrops> &image_crops,
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   // CTC decode all batches
-  for (auto &rec : batch_records) {
-    int batch_n = rec.end - rec.beg;
-    auto &mos = output_slots_[rec.slot];
-    for (int j = 0; j < batch_n; ++j) {
-      const auto &ci = crops[rec.beg + j];
-      all_results[ci.img_idx][ci.box_idx] =
-          ctc_greedy_decode(mos.h_indices.get() + j * rec.seq_len,
-                           mos.h_scores.get() + j * rec.seq_len, rec.seq_len, label_list_);
-    }
-  }
+  decode_records(batch_records, output_slots_, label_list_, emit_result);
 
   return all_results;
 }

@@ -39,3 +39,5 @@ predeploy/
 sdk/
 uploads/
 custom_models/
+webui/
+build-coverage/

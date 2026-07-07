@@ -402,10 +402,13 @@ PdfPageText PdfDocument::extract_page(int page_index) const {
       flush_line();
       continue;
     }
-    // Glyphs with no ToUnicode mapping report U+0000. Skip them (the FFFD/
-    // nonprint scan above already ignores cp==0) — pushing a raw 0 would embed
-    // a NUL that truncates the line at JSON/Markdown serialization.
-    if (u == 0) continue;
+    // Skip control characters (U+0000–U+001F except the \r/\n handled above and
+    // \t). Glyphs with no proper ToUnicode mapping — soft/discretionary hyphens
+    // at line-wrap points, ligature components — report a low control code
+    // (U+0000, or e.g. U+0002 for a wrap hyphen: "de\x02ployment"). Dropping
+    // them rejoins the word ("deployment") and avoids embedding a NUL that would
+    // truncate the line, or a control glyph that renders as tofu (□).
+    if (u < 0x20 && u != '\t') continue;
     // FPDFText_GetUnicode returns a full code point (uint32). Re-encode astral
     // (>U+FFFF) code points as a UTF-16 surrogate pair so utf16le_to_utf8
     // reconstructs them; a bare cast to unsigned short would truncate to 16

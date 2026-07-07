@@ -417,6 +417,7 @@ if(USE_CPU_ONLY)
         src/server/cpu_main.cpp
         src/routes/common_routes.cpp
         src/routes/pdf_routes.cpp
+        src/pipeline/pdf_job.cpp
         ${PROTO_GEN_CC}
         ${GRPC_GEN_CC}
     )
@@ -685,6 +686,7 @@ else()
         src/routes/common_routes.cpp
         src/routes/image_routes.cpp
         src/routes/pdf_routes.cpp
+        src/pipeline/pdf_job.cpp
         ${PROTO_GEN_CC}
         ${GRPC_GEN_CC}
     )

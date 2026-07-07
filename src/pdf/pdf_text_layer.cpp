@@ -402,7 +402,21 @@ PdfPageText PdfDocument::extract_page(int page_index) const {
       flush_line();
       continue;
     }
-    line_units.push_back(static_cast<unsigned short>(u));
+    // Glyphs with no ToUnicode mapping report U+0000. Skip them (the FFFD/
+    // nonprint scan above already ignores cp==0) — pushing a raw 0 would embed
+    // a NUL that truncates the line at JSON/Markdown serialization.
+    if (u == 0) continue;
+    // FPDFText_GetUnicode returns a full code point (uint32). Re-encode astral
+    // (>U+FFFF) code points as a UTF-16 surrogate pair so utf16le_to_utf8
+    // reconstructs them; a bare cast to unsigned short would truncate to 16
+    // bits and corrupt emoji / SMP CJK / math-alphanumeric glyphs.
+    if (u > 0xFFFF) {
+      const unsigned int v = u - 0x10000u;
+      line_units.push_back(static_cast<unsigned short>(0xD800u + (v >> 10)));
+      line_units.push_back(static_cast<unsigned short>(0xDC00u + (v & 0x3FFu)));
+    } else {
+      line_units.push_back(static_cast<unsigned short>(u));
+    }
     double cl = 0, cr = 0, cb = 0, ct = 0;
     // Generated chars (inserted spaces) return degenerate boxes — keep their
     // text, skip them in the bbox union.

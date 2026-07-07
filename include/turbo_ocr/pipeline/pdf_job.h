@@ -164,102 +164,26 @@ inline void fill_from_text_layer_pt(PdfPageResult &pg,
   pg.width  = static_cast<int>(std::round(text.page_width_pt));
   pg.height = static_cast<int>(std::round(text.page_height_pt));
   pg.effective_dpi = 72;
-
-  // The extractor groups runs into lines, but a mid-line font-size change
-  // (small-caps headings: "M"+"AMBA"+"-3") breaks that grouping — the cap and
-  // lowercase runs land in separate lines with different box heights, and the
-  // downstream reading order then interleaves them ("M AMBA -3: I MPROVED
-  // S M ODELING USING EQUENCE ..."). Re-merge runs that share a visual row
-  // (>=50% vertical overlap), left-to-right; glue sub-word-width gaps without
-  // a space so fragmented words reassemble. Column gutters are far wider than
-  // one row height, so multi-column pages never merge across columns.
-  struct Run {
-    const pdf::PdfTextLine *ln;
-    float x0, y0, x1, y1, h;
-  };
-  std::vector<Run> runs;
-  runs.reserve(text.lines.size());
+  // One OCRResultItem per extracted line, order and boxes preserved. The
+  // extractor (pdf_text_layer.cpp) already groups the char stream into visual
+  // lines via PDFium's own flow breaks, so no cross-line re-merging is done
+  // here — merging by y-overlap would glue adjacent table cells / columns that
+  // happen to share a row and would reorder multi-column reading order.
+  pg.results.reserve(text.lines.size());
   for (const auto &line : text.lines) {
-    Run r;
-    r.ln = &line;
-    r.x0 = std::min(line.x0_pt, line.x1_pt);
-    r.x1 = std::max(line.x0_pt, line.x1_pt);
-    r.y0 = std::min(line.y0_pt, line.y1_pt);
-    r.y1 = std::max(line.y0_pt, line.y1_pt);
-    r.h = r.y1 - r.y0;
-    runs.push_back(r);
-  }
-  std::stable_sort(runs.begin(), runs.end(), [](const Run &a, const Run &b) {
-    return (a.y0 + a.y1) < (b.y0 + b.y1);
-  });
-
-  std::vector<std::vector<Run>> rows;
-  float row_y0 = 0, row_y1 = 0;
-  for (const auto &r : runs) {
-    bool same_row = false;
-    if (!rows.empty()) {
-      const float ov = std::min(r.y1, row_y1) - std::max(r.y0, row_y0);
-      const float min_h = std::min(r.h, row_y1 - row_y0);
-      same_row = min_h > 0 && ov >= 0.5f * min_h;
-    }
-    if (same_row) {
-      rows.back().push_back(r);
-      row_y0 = std::min(row_y0, r.y0);
-      row_y1 = std::max(row_y1, r.y1);
-    } else {
-      rows.push_back({r});
-      row_y0 = r.y0;
-      row_y1 = r.y1;
-    }
-  }
-
-  auto flush = [&pg](const std::string &txt, float x0, float y0, float x1,
-                     float y1) {
     OCRResultItem item;
     item.source = "pdf";
     item.confidence = 1.0f;
-    item.text = txt;
-    int ix0 = static_cast<int>(std::round(x0));
-    int iy0 = static_cast<int>(std::round(y0));
-    int ix1 = static_cast<int>(std::round(x1));
-    int iy1 = static_cast<int>(std::round(y1));
+    item.text = line.text;
+    int ix0 = static_cast<int>(std::round(line.x0_pt));
+    int iy0 = static_cast<int>(std::round(line.y0_pt));
+    int ix1 = static_cast<int>(std::round(line.x1_pt));
+    int iy1 = static_cast<int>(std::round(line.y1_pt));
     item.box[0] = {ix0, iy0};
     item.box[1] = {ix1, iy0};
     item.box[2] = {ix1, iy1};
     item.box[3] = {ix0, iy1};
     pg.results.push_back(std::move(item));
-  };
-
-  for (auto &row : rows) {
-    std::stable_sort(row.begin(), row.end(),
-                     [](const Run &a, const Run &b) { return a.x0 < b.x0; });
-    std::string cur = row[0].ln->text;
-    float cx0 = row[0].x0, cy0 = row[0].y0, cx1 = row[0].x1, cy1 = row[0].y1;
-    float prev_h = row[0].h;
-    for (size_t i = 1; i < row.size(); ++i) {
-      const Run &r = row[i];
-      const float row_h = std::max(cy1 - cy0, r.h);
-      const float gap = r.x0 - cx1;
-      if (gap > 1.0f * row_h) {  // column gutter / far-apart cells: keep split
-        flush(cur, cx0, cy0, cx1, cy1);
-        cur = r.ln->text;
-        cx0 = r.x0; cy0 = r.y0; cx1 = r.x1; cy1 = r.y1;
-        prev_h = r.h;
-        continue;
-      }
-      // Word gap vs split glyph run, judged against the SMALLER neighbour's
-      // height: small-caps kerning gaps ("S|EQUENCE") stay well under 0.3 of
-      // the lowercase height while true word gaps sit near 0.4-0.5.
-      const float ref_h = std::max(1.0f, std::min(prev_h, r.h));
-      if (gap > 0.3f * ref_h) cur += ' ';
-      prev_h = r.h;
-      cur += r.ln->text;
-      cx0 = std::min(cx0, r.x0);
-      cy0 = std::min(cy0, r.y0);
-      cx1 = std::max(cx1, r.x1);
-      cy1 = std::max(cy1, r.y1);
-    }
-    flush(cur, cx0, cy0, cx1, cy1);
   }
 }
 

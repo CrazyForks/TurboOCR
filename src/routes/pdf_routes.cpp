@@ -514,9 +514,21 @@ void register_pdf_route(server::WorkPool &pool,
       // Faithful-export defaults (mirror /ocr/markdown): stages the server
       // actually loaded run unless the query explicitly disabled them, so a
       // text-only server produces honest text markdown rather than silently
-      // dropping table/formula sections.
-      if (req->getParameter("tables").empty()) opts.want_tables = table_avail;
-      if (req->getParameter("formulas").empty()) opts.want_formulas = formula_avail;
+      // dropping table/formula sections. EXCEPT in geometric mode: enabling
+      // table/formula recognition there forces the page onto the render+OCR
+      // path (structure runs on the rendered image, not the text layer), which
+      // would replace the exact born-digital text with OCR output — defeating
+      // the whole point of geometric. Honor the layer: a geometric user who
+      // wants structured tables/formulas must pass them explicitly (and accept
+      // OCR) or use mode=ocr.
+      auto md_mode = req->getParameter("mode");
+      const bool geometric_md =
+          md_mode == "geometric" ||
+          (md_mode.empty() && default_pdf_mode == pdf::PdfMode::Geometric);
+      if (!geometric_md) {
+        if (req->getParameter("tables").empty()) opts.want_tables = table_avail;
+        if (req->getParameter("formulas").empty()) opts.want_formulas = formula_avail;
+      }
     }
 
     const bool layout_enabled = opts.want_layout;

@@ -309,6 +309,19 @@ inline void store_ocr_page(PdfPageSink &sink, int page_idx,
     slot.resolved_mode = pdf::PdfMode::Ocr;
 }
 
+// Rescale text-layer boxes from PDF points (DPI 72) to the render's pixel
+// space. Shared by every geometric path (layout-only, +structure, CPU) so the
+// scale/rounding can't drift between them.
+inline void rescale_boxes_pt_to_px(std::vector<OCRResultItem> &results,
+                                    int dpi) {
+  const float pt_to_px = static_cast<float>(dpi) / 72.0f;
+  for (auto &item : results)
+    for (int k = 0; k < 4; ++k) {
+      item.box[k][0] = static_cast<int>(std::round(item.box[k][0] * pt_to_px));
+      item.box[k][1] = static_cast<int>(std::round(item.box[k][1] * pt_to_px));
+    }
+}
+
 // Geometric page: text came from the PDF layer in pt-space. Store layout, then
 // rescale the stored text boxes to pixel space; compute reading order over the
 // (now pixel-space) text + layout when requested, for parity with OCR pages.
@@ -319,12 +332,7 @@ inline void store_geometric_page(PdfPageSink &sink, int page_idx,
                                  int orientation_deg = 0) {
   std::lock_guard<std::mutex> lock(sink.results_mutex);
   auto &slot = sink.page_results[page_idx];
-  const float pt_to_px = static_cast<float>(sink.dpi) / 72.0f;
-  for (auto &item : slot.results)
-    for (int k = 0; k < 4; ++k) {
-      item.box[k][0] = static_cast<int>(std::round(item.box[k][0] * pt_to_px));
-      item.box[k][1] = static_cast<int>(std::round(item.box[k][1] * pt_to_px));
-    }
+  rescale_boxes_pt_to_px(slot.results, sink.dpi);
   slot.layout        = std::move(layout);
   slot.width         = width;
   slot.height        = height;
@@ -377,14 +385,7 @@ inline void store_geometric_structure_page(PdfPageSink &sink, int page_idx,
     std::lock_guard<std::mutex> lk(sink.results_mutex);
     px_text = sink.page_results[static_cast<size_t>(page_idx)].results;
   }
-  const float pt_to_px = static_cast<float>(sink.dpi) / 72.0f;
-  for (auto &item : px_text)
-    for (int k = 0; k < 4; ++k) {
-      item.box[k][0] =
-          static_cast<int>(std::round(item.box[k][0] * pt_to_px));
-      item.box[k][1] =
-          static_cast<int>(std::round(item.box[k][1] * pt_to_px));
-    }
+  rescale_boxes_pt_to_px(px_text, sink.dpi);
 
   auto out = e.pipeline->run_layout_and_structure(
       img, e.stream, std::move(px_text), sink.want_tables, sink.want_formulas);
@@ -433,11 +434,25 @@ inline void ocr_single_page(GpuPipelineEntry &e, PdfPageSink &sink,
     // router WITHOUT det/rec (run_layout_and_structure), so the layer text is
     // preserved AND tables/formulas are structured — no OCR fallback needed.
     const bool structure_requested = sink.want_tables || sink.want_formulas;
-    if (page_mode_of(sink, page_idx) == pdf::PdfMode::Geometric) {
+    const bool geometric =
+        page_mode_of(sink, page_idx) == pdf::PdfMode::Geometric;
+    // A page is only Geometric-with-text when its layer was trusted; a scanned
+    // page under mode=geometric is marked Geometric but has EMPTY results
+    // (fill_from_text_layer_pt was skipped). Such a page must OCR to recover its
+    // prose when structure is requested — feeding its empty results into
+    // store_geometric_structure_page would silently drop the whole page body.
+    bool has_trusted_layer = false;
+    if (geometric) {
+      std::lock_guard<std::mutex> lk(sink.results_mutex);
+      has_trusted_layer =
+          sink.page_results[static_cast<size_t>(page_idx)].text_layer_quality ==
+          "trusted";
+    }
+    if (geometric && (has_trusted_layer || !structure_requested)) {
       // Geometric pages are born-digital/upright with pt-space text boxes;
       // autorotate does not apply (rotating would desync the boxes).
       auto encoded = maybe_encode_page(sink, img);
-      if (structure_requested && layout_enabled) {
+      if (structure_requested && layout_enabled && has_trusted_layer) {
         store_geometric_structure_page(sink, page_idx, e, img,
                                        want_reading_order, std::move(encoded));
       } else {
@@ -601,6 +616,7 @@ inline int run_streamed_render_cpu(
           pg.encoded_image = pdf::encode_page_image(img, encode_opts);
 
         if (pg.resolved_mode == pdf::PdfMode::Geometric) {
+          const bool has_trusted_layer = (pg.text_layer_quality == "trusted");
           if (want_layout) {
             auto inf = infer(img, inf_opts);
             pg.layout = std::move(inf.layout);
@@ -612,19 +628,22 @@ inline int run_streamed_render_cpu(
             pg.formula_warning = std::move(inf.formula_warning);
             pg.table_degraded = inf.table_degraded;
             pg.table_warning = std::move(inf.table_warning);
+            if (!has_trusted_layer) {
+              // Scanned page under mode=geometric: no text layer — recover its
+              // prose from the OCR pass (already pixel-space) instead of
+              // writing back the empty layer results (silent text loss).
+              pg.results = std::move(inf.results);
+              pg.text_degraded = inf.text_degraded;
+              pg.text_warning = std::move(inf.text_warning);
+              for (auto &item : pg.results) item.source = "ocr";
+            }
           }
           pg.width = img.cols;
           pg.height = img.rows;
           pg.effective_dpi = dpi;
-          const float pt_to_px = static_cast<float>(dpi) / 72.0f;
-          for (auto &item : pg.results) {
-            for (int k = 0; k < 4; ++k) {
-              item.box[k][0] = static_cast<int>(
-                  std::round(item.box[k][0] * pt_to_px));
-              item.box[k][1] = static_cast<int>(
-                  std::round(item.box[k][1] * pt_to_px));
-            }
-          }
+          // Only the PDF text layer is pt-space; the OCR fallback above is
+          // already in pixel space.
+          if (has_trusted_layer) rescale_boxes_pt_to_px(pg.results, dpi);
           if (want_reading_order && !pg.layout.empty()) {
             turbo_ocr::assign_layout_ids(pg.results, pg.layout);
             pg.reading_order =

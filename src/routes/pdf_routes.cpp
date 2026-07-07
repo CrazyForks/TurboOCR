@@ -433,6 +433,32 @@ emit_pdf_markdown_response(std::vector<PdfPageResult> &pages, bool as_pages) {
   return resp;
 }
 
+// Per-page Markdown renderer shared by the GPU and CPU /ocr/pdf handlers (set as
+// PdfJobOptions::render_page_markdown). Moves the finished page's fields into an
+// OcrPipelineResult, renders self-contained Markdown (figures embedded as data:
+// URIs), and moves them back so the JSON envelope is unaffected. Runs on the
+// pipeline worker while the page bitmap is still alive.
+[[nodiscard]] std::function<std::string(PdfPageResult &, const cv::Mat &)>
+make_pdf_page_markdown_renderer() {
+  return [](PdfPageResult &pg, const cv::Mat &img) -> std::string {
+    turbo_ocr::assign_layout_ids(pg.results, pg.layout);
+    pipeline::OcrPipelineResult res;
+    res.results = std::move(pg.results);
+    res.layout = std::move(pg.layout);
+    res.reading_order = std::move(pg.reading_order);
+    res.tables = std::move(pg.tables);
+    res.formulas = std::move(pg.formulas);
+    std::string md = output::render_markdown_with_assets(
+        res, img, /*base_dir=*/".", /*embed_images=*/true);
+    pg.results = std::move(res.results);
+    pg.layout = std::move(res.layout);
+    pg.reading_order = std::move(res.reading_order);
+    pg.tables = std::move(res.tables);
+    pg.formulas = std::move(res.formulas);
+    return md;
+  };
+}
+
 } // namespace
 
 #ifndef USE_CPU_ONLY
@@ -634,28 +660,8 @@ void register_pdf_route(server::WorkPool &pool,
       // applies to single-image submits).
       job_opts.request_timeout_ms = dispatcher.request_timeout_ms();
 
-      if (want_markdown) {
-        // Same export as /ocr/markdown, applied per page while the page bitmap
-        // is alive on the dispatcher worker (figure crops become data URIs).
-        job_opts.render_page_markdown =
-            [](PdfPageResult &pg, const cv::Mat &img) -> std::string {
-          turbo_ocr::assign_layout_ids(pg.results, pg.layout);
-          pipeline::OcrPipelineResult res;
-          res.results = std::move(pg.results);
-          res.layout = std::move(pg.layout);
-          res.reading_order = std::move(pg.reading_order);
-          res.tables = std::move(pg.tables);
-          res.formulas = std::move(pg.formulas);
-          std::string md = output::render_markdown_with_assets(
-              res, img, /*base_dir=*/".", /*embed_images=*/true);
-          pg.results = std::move(res.results);
-          pg.layout = std::move(res.layout);
-          pg.reading_order = std::move(res.reading_order);
-          pg.tables = std::move(res.tables);
-          pg.formulas = std::move(res.formulas);
-          return md;
-        };
-      }
+      if (want_markdown)
+        job_opts.render_page_markdown = make_pdf_page_markdown_renderer();
 
       auto job = pipeline::run_pdf_job(dispatcher, pdf_renderer, pdf_data,
                                        pdf_len_local, job_opts);
@@ -1205,26 +1211,8 @@ void register_pdf_route(server::WorkPool &pool,
       job_opts.image_mode = image_mode;
       job_opts.encode_opts = encode_opts;
 
-      if (want_markdown) {
-        job_opts.render_page_markdown =
-            [](PdfPageResult &pg, const cv::Mat &img) -> std::string {
-          turbo_ocr::assign_layout_ids(pg.results, pg.layout);
-          pipeline::OcrPipelineResult res;
-          res.results = std::move(pg.results);
-          res.layout = std::move(pg.layout);
-          res.reading_order = std::move(pg.reading_order);
-          res.tables = std::move(pg.tables);
-          res.formulas = std::move(pg.formulas);
-          std::string md = output::render_markdown_with_assets(
-              res, img, /*base_dir=*/".", /*embed_images=*/true);
-          pg.results = std::move(res.results);
-          pg.layout = std::move(res.layout);
-          pg.reading_order = std::move(res.reading_order);
-          pg.tables = std::move(res.tables);
-          pg.formulas = std::move(res.formulas);
-          return md;
-        };
-      }
+      if (want_markdown)
+        job_opts.render_page_markdown = make_pdf_page_markdown_renderer();
 
       auto job = pipeline::run_pdf_job(infer, pdf_renderer, pdf_data,
                                        pdf_len_local, job_opts, orient_fn);

@@ -617,6 +617,14 @@ inline int run_streamed_render_cpu(
 
         if (pg.resolved_mode == pdf::PdfMode::Geometric) {
           const bool has_trusted_layer = (pg.text_layer_quality == "trusted");
+          // NOTE (CPU vs GPU): the CPU InferFunc (run_with_layout) always runs
+          // det/rec — there is no structure-without-det/rec entry point like the
+          // GPU's run_layout_and_structure. So on a born-digital page here we
+          // still pay full-page OCR and then discard inf.results (keeping the
+          // exact layer text), and table cells are filled from that OCR rather
+          // than the layer text. Correct, but less efficient and slightly less
+          // exact-in-cells than the GPU path. Acceptable for the CPU build;
+          // fixing needs a want_text=false structure mode on the CPU pipeline.
           if (want_layout) {
             auto inf = infer(img, inf_opts);
             pg.layout = std::move(inf.layout);

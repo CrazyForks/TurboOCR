@@ -304,6 +304,33 @@ embedded text is trustworthy.
     `MAX_PDF_PAGES` defaults to `2000`. Exceeding returns
     `400 PDF_TOO_LARGE` with the limit echoed back in the message.
 
+### PDF → Markdown (`?markdown=1`, GPU build)
+
+One call converts the whole PDF to the same faithful Markdown as
+`POST /ocr/markdown`, using the parallel page pipeline — no client-side
+page splitting:
+
+```bash
+curl -X POST 'http://localhost:8000/ocr/pdf?markdown=1' \
+  --data-binary @paper.pdf -H 'Content-Type: application/pdf'
+```
+
+- Returns `text/markdown`: pages concatenated in order, each prefixed with an
+  invisible `<!-- page N -->` marker (safe to render, easy to split on).
+- `&as_pages=1` returns JSON instead — `{"pages":[{"page_index":0,
+  "markdown":"…"}, …]}` — for chunked/RAG consumers; per-page
+  `text_degraded` / `table_degraded` / `formula_degraded` flags appear when set.
+- Implies `layout=1&reading_order=1` (requires the layout model —
+  `400 LAYOUT_DISABLED` otherwise). Tables and formulas are included whenever
+  their backends are loaded; pass `tables=0` / `formulas=0` to opt out.
+- Figure/chart crops are embedded as base64 `data:` URIs with their OCR'd text
+  as alt text; tables come back as HTML, formulas as `$…$` / `$$…$$` LaTeX.
+- `dpi`, `mode` and `autorotate` work as usual. `text=0` and `images=` are
+  rejected (`400 INVALID_PARAMETER`) — markdown needs the text, and the figure
+  crops are already embedded.
+- Per-stage degradation is aggregated in the `X-OCR-Degraded` response header
+  with page numbers (e.g. `table(p3,p7)`), same contract as `/ocr/markdown`.
+
 ### Inline page-image export
 
 `?images=inline` adds each rendered page back to the response as a

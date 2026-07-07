@@ -89,6 +89,9 @@ struct PdfPageResult {
   int orientation_deg = 0;
   // Encoded page-image bytes (set only when image_mode == Inline).
   std::vector<uint8_t> encoded_image;
+  // Rendered per-page Markdown (set only when the transport supplied a
+  // render_page_markdown hook, i.e. /ocr/pdf?markdown=1).
+  std::string markdown;
 };
 
 // Per-request options for run_pdf_job. Defaults preserve today's behaviour.
@@ -110,6 +113,13 @@ struct PdfJobOptions {
   // carries an empty slot for it — the streaming route never reads job.pages).
   std::function<void(int page_idx, PdfPageResult &&page)> on_page_ready;
   std::function<void(int page_idx)> on_page_failed;
+  // Per-page Markdown hook (set by /ocr/pdf?markdown=1). Called on the
+  // dispatcher worker after the page is final (post text-layer verification),
+  // with the page bitmap still alive, so the pipeline layer stays
+  // output-format-agnostic. Must be thread-safe; the returned string is stored
+  // in PdfPageResult::markdown.
+  std::function<std::string(PdfPageResult &page, const cv::Mat &img)>
+      render_page_markdown;
   PdfImageMode image_mode = PdfImageMode::None;
   pdf::EncodeOptions encode_opts{};
   // Per-request deadline (ms; 0 = unbounded). The GPU job bounds its page-future
@@ -346,6 +356,10 @@ struct PdfPageSink {
   // Both null on the non-streaming routes.
   std::function<void(int page_idx, PdfPageResult &&page)> on_page_ready;
   std::function<void(int page_idx)> on_page_failed;
+  // Markdown hook (see PdfJobOptions::render_page_markdown). Applied by the
+  // page worker between store and emit_page_ready.
+  std::function<std::string(PdfPageResult &page, const cv::Mat &img)>
+      render_page_markdown;
   // Move a finished page out of its slot (under the results mutex) and hand it
   // to on_page_ready. Call ONLY after the slot is final.
   void emit_page_ready(int page_idx) {
@@ -438,6 +452,26 @@ inline void store_geometric_page(PdfPageSink &sink, int page_idx,
   }
 }
 
+// Render a finished page's Markdown via the sink hook. The slot is MOVED out
+// under the mutex, rendered lock-free (the exporter crops figures from `img`,
+// too heavy to hold the sink lock), and moved back. Safe because exactly one
+// worker owns each page index and emit_page_ready has not run yet; a
+// concurrent page_results resize only relocates the temporarily-empty slot.
+inline void maybe_render_page_markdown(PdfPageSink &sink, int page_idx,
+                                       const cv::Mat &img) {
+  if (!sink.render_page_markdown) return;
+  PdfPageResult local;
+  {
+    std::lock_guard<std::mutex> lk(sink.results_mutex);
+    local = std::move(sink.page_results[static_cast<size_t>(page_idx)]);
+  }
+  local.markdown = sink.render_page_markdown(local, img);
+  {
+    std::lock_guard<std::mutex> lk(sink.results_mutex);
+    sink.page_results[static_cast<size_t>(page_idx)] = std::move(local);
+  }
+}
+
 #ifndef USE_CPU_ONLY
 // Single-page GPU task: decode the PPM and run layout-only (Geometric) or the
 // full pipeline (everything else). Runs on a dispatcher worker.
@@ -473,6 +507,7 @@ inline void ocr_single_page(GpuPipelineEntry &e, PdfPageSink &sink,
       store_geometric_page(sink, page_idx, std::move(layout),
                            img.cols, img.rows, want_reading_order,
                            std::move(encoded));
+      maybe_render_page_markdown(sink, page_idx, img);
       if (sink.on_page_ready) sink.emit_page_ready(page_idx);
     } else {
       // OCR page: de-rotate upright FIRST (autorotate=1) so det/rec, the boxes,
@@ -491,6 +526,7 @@ inline void ocr_single_page(GpuPipelineEntry &e, PdfPageSink &sink,
                             : OcrPipelineResult{});
       store_ocr_page(sink, page_idx, std::move(out), img.cols, img.rows,
                      std::move(encoded), orient);
+      maybe_render_page_markdown(sink, page_idx, img);
       if (sink.on_page_ready) sink.emit_page_ready(page_idx);
     }
   } catch (const std::exception &ex) {
@@ -712,6 +748,7 @@ inline int run_streamed_render_cpu(
   sink->want_text = opts.want_text;
   sink->on_page_ready = opts.on_page_ready;
   sink->on_page_failed = opts.on_page_failed;
+  sink->render_page_markdown = opts.render_page_markdown;
 
   pdf::PdfMode mode = opts.mode;
   open_pdf_for_text_layer(pdf_data, pdf_len, mode, sink->pdf_doc,

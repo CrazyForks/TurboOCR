@@ -19,6 +19,7 @@
 
 #include "turbo_ocr/common/serialization.h"
 #include "turbo_ocr/decode/image_config.h"
+#include "turbo_ocr/output/markdown_export.h"
 #include "turbo_ocr/pdf/page_image_encoder.h"
 #include "turbo_ocr/pdf/pdf_text_layer.h"
 #include "turbo_ocr/pipeline/pdf_job.h"
@@ -365,6 +366,73 @@ bool emit_job_error(const PdfJobResult &job, server::DrogonCallback &cb) {
   return false;
 }
 
+// /ocr/pdf?markdown=1 response. Default: one text/markdown document, pages
+// prefixed with `<!-- page N -->` (invisible when rendered, splittable by
+// chunkers). ?as_pages=1: JSON array of per-page markdown for programmatic
+// consumers. The markdown body intentionally drops failed/garbage regions, so
+// per-stage degradation is surfaced in the X-OCR-Degraded header (with page
+// numbers) and per-page flags in the as_pages shape — never silently.
+[[nodiscard]] drogon::HttpResponsePtr
+emit_pdf_markdown_response(std::vector<PdfPageResult> &pages, bool as_pages) {
+  std::string dt, dtab, df;
+  for (size_t i = 0; i < pages.size(); ++i) {
+    auto mark = [&](std::string &s) {
+      if (!s.empty()) s += ",";
+      s += std::to_string(i + 1);
+    };
+    if (pages[i].text_degraded) mark(dt);
+    if (pages[i].table_degraded) mark(dtab);
+    if (pages[i].formula_degraded) mark(df);
+  }
+  std::string degraded;
+  auto add = [&](const char *stage, const std::string &plist) {
+    if (plist.empty()) return;
+    if (!degraded.empty()) degraded += "; ";
+    degraded += stage;
+    degraded += "(p";
+    degraded += plist;
+    degraded += ")";
+  };
+  add("text", dt);
+  add("table", dtab);
+  add("formula", df);
+
+  drogon::HttpResponsePtr resp;
+  if (as_pages) {
+    std::string body = "{\"pages\":[";
+    for (size_t i = 0; i < pages.size(); ++i) {
+      if (i) body += ",";
+      body += "{\"page_index\":" + std::to_string(i) + ",\"markdown\":\"";
+      turbo_ocr::detail::append_escaped_string(body, pages[i].markdown);
+      body += "\"";
+      if (pages[i].text_degraded) body += ",\"text_degraded\":true";
+      if (pages[i].table_degraded) body += ",\"table_degraded\":true";
+      if (pages[i].formula_degraded) body += ",\"formula_degraded\":true";
+      body += "}";
+    }
+    body += "]}";
+    resp = server::json_response(std::move(body));
+  } else {
+    size_t total = 0;
+    for (const auto &pg : pages) total += pg.markdown.size() + 24;
+    std::string body;
+    body.reserve(total);
+    for (size_t i = 0; i < pages.size(); ++i) {
+      body += "<!-- page ";
+      body += std::to_string(i + 1);
+      body += " -->\n\n";
+      body += pages[i].markdown;
+      if (i + 1 < pages.size()) body += "\n\n";
+    }
+    resp = drogon::HttpResponse::newHttpResponse();
+    resp->setStatusCode(drogon::k200OK);
+    resp->setBody(std::move(body));
+    resp->setContentTypeString("text/markdown; charset=utf-8");
+  }
+  if (!degraded.empty()) resp->addHeader("X-OCR-Degraded", degraded);
+  return resp;
+}
+
 } // namespace
 
 #ifndef USE_CPU_ONLY
@@ -407,6 +475,50 @@ void register_pdf_route(server::WorkPool &pool,
                                        r.error_code.c_str(), r.error));
       return;
     }
+
+    // ?markdown=1: run the /ocr/markdown pipeline per page and return the
+    // assembled Markdown document instead of the JSON envelope.
+    bool want_markdown = false;
+    bool md_as_pages = false;
+    if (auto err = server::parse_bool_query(req, "markdown", &want_markdown);
+        !err.empty()) {
+      callback(server::error_response(drogon::k400BadRequest,
+                                       "INVALID_PARAMETER", err));
+      return;
+    }
+    if (auto err = server::parse_bool_query(req, "as_pages", &md_as_pages);
+        !err.empty()) {
+      callback(server::error_response(drogon::k400BadRequest,
+                                       "INVALID_PARAMETER", err));
+      return;
+    }
+    if (md_as_pages && !want_markdown) {
+      callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+          "as_pages=1 requires markdown=1"));
+      return;
+    }
+    if (want_markdown) {
+      if (!layout_available) {
+        callback(server::error_response(drogon::k400BadRequest, "LAYOUT_DISABLED",
+            "markdown=1 requires the layout model (do not start with "
+            "DISABLE_LAYOUT=1)"));
+        return;
+      }
+      if (!opts.want_text) {
+        callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+            "text=0 cannot be combined with markdown=1 (markdown needs the text)"));
+        return;
+      }
+      opts.want_layout = true;
+      opts.want_reading_order = true;
+      // Faithful-export defaults (mirror /ocr/markdown): stages the server
+      // actually loaded run unless the query explicitly disabled them, so a
+      // text-only server produces honest text markdown rather than silently
+      // dropping table/formula sections.
+      if (req->getParameter("tables").empty()) opts.want_tables = table_avail;
+      if (req->getParameter("formulas").empty()) opts.want_formulas = formula_avail;
+    }
+
     const bool layout_enabled = opts.want_layout;
     const bool want_reading_order = opts.want_reading_order;
     const bool want_blocks = opts.want_blocks;
@@ -416,7 +528,7 @@ void register_pdf_route(server::WorkPool &pool,
 
     if (reject_unknown_query_params(
             req, {"layout", "reading_order", "as_blocks", "tables", "formulas", "text",
-                  "dpi", "mode",
+                  "dpi", "mode", "markdown", "as_pages",
                   "images", "format", "lossless", "png_compression", "quality",
                   "max_side", "autorotate"}, callback))
       return;
@@ -449,6 +561,12 @@ void register_pdf_route(server::WorkPool &pool,
         !err.empty()) {
       callback(server::error_response(drogon::k400BadRequest,
                                        "INVALID_PARAMETER", err));
+      return;
+    }
+    if (want_markdown && image_mode != PdfImageMode::None) {
+      callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+          "images= page-image export is not available with markdown=1 "
+          "(figure crops are already embedded in the markdown)"));
       return;
     }
 
@@ -484,7 +602,7 @@ void register_pdf_route(server::WorkPool &pool,
     server::submit_work(pool, std::move(callback),
         [pdf_buf, &dispatcher, &pdf_renderer, // req dropped: unused, kept the full request (raw body) resident alongside pdf_buf
          layout_enabled, want_reading_order, want_blocks, want_tables, want_formulas,
-         want_text,
+         want_text, want_markdown, md_as_pages,
          dpi, req_mode, image_mode,
          encode_opts, max_pdf_pages, autorotate](server::DrogonCallback &cb) {
      // Wrap the whole body: post-render work (emit_pdf_response's multi-GB
@@ -514,9 +632,37 @@ void register_pdf_route(server::WorkPool &pool,
       // applies to single-image submits).
       job_opts.request_timeout_ms = dispatcher.request_timeout_ms();
 
+      if (want_markdown) {
+        // Same export as /ocr/markdown, applied per page while the page bitmap
+        // is alive on the dispatcher worker (figure crops become data URIs).
+        job_opts.render_page_markdown =
+            [](PdfPageResult &pg, const cv::Mat &img) -> std::string {
+          turbo_ocr::assign_layout_ids(pg.results, pg.layout);
+          pipeline::OcrPipelineResult res;
+          res.results = std::move(pg.results);
+          res.layout = std::move(pg.layout);
+          res.reading_order = std::move(pg.reading_order);
+          res.tables = std::move(pg.tables);
+          res.formulas = std::move(pg.formulas);
+          std::string md = output::render_markdown_with_assets(
+              res, img, /*base_dir=*/".", /*embed_images=*/true);
+          pg.results = std::move(res.results);
+          pg.layout = std::move(res.layout);
+          pg.reading_order = std::move(res.reading_order);
+          pg.tables = std::move(res.tables);
+          pg.formulas = std::move(res.formulas);
+          return md;
+        };
+      }
+
       auto job = pipeline::run_pdf_job(dispatcher, pdf_renderer, pdf_data,
                                        pdf_len_local, job_opts);
       if (emit_job_error(job, cb)) return;
+
+      if (want_markdown) {
+        cb(emit_pdf_markdown_response(job.pages, md_as_pages));
+        return;
+      }
 
       cb(server::json_response(emit_pdf_response(job.pages, dpi, want_blocks,
                                                   image_mode, encode_opts,

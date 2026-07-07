@@ -321,8 +321,15 @@ curl -X POST 'http://localhost:8000/ocr/pdf?markdown=1' \
   "markdown":"…"}, …]}` — for chunked/RAG consumers; per-page
   `text_degraded` / `table_degraded` / `formula_degraded` flags appear when set.
 - Implies `layout=1&reading_order=1` (requires the layout model —
-  `400 LAYOUT_DISABLED` otherwise). Tables and formulas are included whenever
-  their backends are loaded; pass `tables=0` / `formulas=0` to opt out.
+  `400 LAYOUT_DISABLED` otherwise). In the default `ocr` mode, tables and
+  formulas are recognized whenever their backends are loaded (→ HTML / LaTeX);
+  pass `tables=0` / `formulas=0` to opt out.
+- **Mode choice matters for markdown.** `mode=ocr` (default) renders and
+  recognizes every page → structured HTML tables and LaTeX formulas, best
+  markdown quality. `mode=geometric` reads the born-digital text layer directly
+  → fastest, exact prose, but table/formula regions come out as plain text
+  (no recognizer runs on the text-layer path), so use it for prose-heavy PDFs
+  and the default `ocr` mode for papers with tables/equations.
 - Figure/chart crops are embedded as base64 `data:` URIs with their OCR'd text
   as alt text; tables come back as HTML, formulas as `$…$` / `$$…$$` LaTeX.
 - `dpi`, `mode` and `autorotate` work as usual. `text=0` and `images=` are

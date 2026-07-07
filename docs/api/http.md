@@ -324,12 +324,12 @@ curl -X POST 'http://localhost:8000/ocr/pdf?markdown=1' \
   `400 LAYOUT_DISABLED` otherwise). In the default `ocr` mode, tables and
   formulas are recognized whenever their backends are loaded (→ HTML / LaTeX);
   pass `tables=0` / `formulas=0` to opt out.
-- **Mode choice matters for markdown.** `mode=ocr` (default) renders and
-  recognizes every page → structured HTML tables and LaTeX formulas, best
-  markdown quality. `mode=geometric` reads the born-digital text layer directly
-  → fastest, exact prose, but table/formula regions come out as plain text
-  (no recognizer runs on the text-layer path), so use it for prose-heavy PDFs
-  and the default `ocr` mode for papers with tables/equations.
+- **Mode choice.** `mode=ocr` (default) renders and OCRs every page — best for
+  scanned PDFs. `mode=geometric` reads a born-digital PDF's embedded text layer
+  directly for the prose (exact text, faster, no OCR errors) while **still**
+  recognizing tables → HTML and formulas → LaTeX on the rendered image — so a
+  born-digital paper exports exact text *and* structured math/tables. `auto`
+  picks per page: text layer when trustworthy, OCR otherwise.
 - Figure/chart crops are embedded as base64 `data:` URIs with their OCR'd text
   as alt text; tables come back as HTML, formulas as `$…$` / `$$…$$` LaTeX.
 - `dpi`, `mode` and `autorotate` work as usual. `text=0` and `images=` are

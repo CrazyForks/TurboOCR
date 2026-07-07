@@ -514,21 +514,11 @@ void register_pdf_route(server::WorkPool &pool,
       // Faithful-export defaults (mirror /ocr/markdown): stages the server
       // actually loaded run unless the query explicitly disabled them, so a
       // text-only server produces honest text markdown rather than silently
-      // dropping table/formula sections. EXCEPT in geometric mode: enabling
-      // table/formula recognition there forces the page onto the render+OCR
-      // path (structure runs on the rendered image, not the text layer), which
-      // would replace the exact born-digital text with OCR output — defeating
-      // the whole point of geometric. Honor the layer: a geometric user who
-      // wants structured tables/formulas must pass them explicitly (and accept
-      // OCR) or use mode=ocr.
-      auto md_mode = req->getParameter("mode");
-      const bool geometric_md =
-          md_mode == "geometric" ||
-          (md_mode.empty() && default_pdf_mode == pdf::PdfMode::Geometric);
-      if (!geometric_md) {
-        if (req->getParameter("tables").empty()) opts.want_tables = table_avail;
-        if (req->getParameter("formulas").empty()) opts.want_formulas = formula_avail;
-      }
+      // dropping table/formula sections. Safe in every mode — geometric pages
+      // recognize tables/formulas on the rendered image while KEEPING the exact
+      // text layer (run_layout_and_structure), so structure no longer forces OCR.
+      if (req->getParameter("tables").empty()) opts.want_tables = table_avail;
+      if (req->getParameter("formulas").empty()) opts.want_formulas = formula_avail;
     }
 
     const bool layout_enabled = opts.want_layout;
@@ -1106,17 +1096,12 @@ void register_pdf_route(server::WorkPool &pool,
       }
       opts.want_layout = true;
       opts.want_reading_order = true;
-      // Geometric mode keeps the exact text layer; auto-enabling structure there
-      // would force OCR and replace it (see GPU route). Elsewhere, mirror
-      // /ocr/markdown: recognize whatever backends loaded unless disabled.
-      auto md_mode = req->getParameter("mode");
-      const bool geometric_md =
-          md_mode == "geometric" ||
-          (md_mode.empty() && default_pdf_mode == pdf::PdfMode::Geometric);
-      if (!geometric_md) {
-        if (req->getParameter("tables").empty()) opts.want_tables = table_avail;
-        if (req->getParameter("formulas").empty()) opts.want_formulas = formula_avail;
-      }
+      // Mirror /ocr/markdown: recognize whatever backends loaded unless the
+      // query disabled them. Safe in geometric mode too — the geometric render
+      // path keeps the exact text layer and only takes layout/tables/formulas
+      // from the structure pass, so this never replaces born-digital text.
+      if (req->getParameter("tables").empty()) opts.want_tables = table_avail;
+      if (req->getParameter("formulas").empty()) opts.want_formulas = formula_avail;
     }
 
     const bool want_layout = opts.want_layout;

@@ -470,6 +470,50 @@ OcrPipelineResult OcrPipeline::run_layout_only(const cv::Mat &img,
   return out;
 }
 
+OcrPipelineResult OcrPipeline::run_layout_and_structure(
+    const cv::Mat &img, cudaStream_t stream,
+    std::vector<OCRResultItem> text_results, bool want_tables,
+    bool want_formulas, const routing::RequestRouting &routing) {
+  UseGuard _ug{in_use_, "run_layout_and_structure"};
+  OcrPipelineResult out;
+  out.results = std::move(text_results);
+  // No layout model -> nothing to route on; return the text unchanged. The
+  // router also no-ops without table/formula backends (dispatch_router_ bails).
+  if (!use_layout_ || !layout_) return out;
+
+  PipelineTimer timer;
+  timer.init(stream);
+  timer.reset();
+
+  auto gpu_img = upload_image(img, stream, timer);
+
+  // Record on `stream` so both layout_stream_ and the router's table/formula
+  // streams (which wait on det_only_event_) see the upload complete before
+  // reading gpu_img — mirrors run_layout_only / run_with_layout.
+  CUDA_CHECK(cudaEventRecord(det_only_event_, stream));
+  CUDA_CHECK(cudaStreamWaitEvent(layout_stream_, det_only_event_, 0));
+
+  timer.gpu_start("layout_only");
+  if (layout_->enqueue(gpu_img, img.rows, img.cols, layout_stream_))
+    out.layout = layout_->collect();
+  timer.gpu_stop();
+
+  // The router classifies regions and fills table cells using the text boxes as
+  // the "detections" — here the text-layer boxes. Same call the OCR path makes.
+  std::vector<Box> boxes;
+  boxes.reserve(out.results.size());
+  for (const auto &r : out.results) boxes.push_back(r.box);
+
+  dispatch_router_(out, gpu_img, boxes, timer, routing, /*defer_external=*/false,
+                   want_tables, want_formulas);
+
+  // Event bookkeeping parity: we never touched rec_stream_, so record an
+  // already-complete rec_event_ for the next run()'s wait.
+  CUDA_CHECK(cudaEventRecord(rec_event_, rec_stream_));
+  timer.print_total();
+  return out;
+}
+
 std::vector<OCRResultItem> OcrPipeline::run(GpuImage gpu_img,
                                             cudaStream_t stream) {
   return run_with_layout(gpu_img, stream).results;

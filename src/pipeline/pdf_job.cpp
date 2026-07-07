@@ -360,6 +360,59 @@ inline void maybe_render_page_markdown(PdfPageSink &sink, int page_idx,
 }
 
 #ifndef USE_CPU_ONLY
+// Geometric page WITH structure requested: keep the exact PDF text layer but
+// recognize tables (→ HTML) and formulas (→ LaTeX) on the rendered image. The
+// slot already holds the pt-space text-layer results (prepopulate_pages); we
+// rescale them to this render's pixel space, run layout + the CUA router over
+// them (no det/rec), and write layout/tables/formulas back alongside the layer
+// text. This is what makes born-digital STEM PDFs export exact prose AND
+// structured math/tables.
+inline void store_geometric_structure_page(PdfPageSink &sink, int page_idx,
+                                           GpuPipelineEntry &e,
+                                           const cv::Mat &img,
+                                           bool want_reading_order,
+                                           std::vector<uint8_t> encoded_image) {
+  std::vector<OCRResultItem> px_text;
+  {
+    std::lock_guard<std::mutex> lk(sink.results_mutex);
+    px_text = sink.page_results[static_cast<size_t>(page_idx)].results;
+  }
+  const float pt_to_px = static_cast<float>(sink.dpi) / 72.0f;
+  for (auto &item : px_text)
+    for (int k = 0; k < 4; ++k) {
+      item.box[k][0] =
+          static_cast<int>(std::round(item.box[k][0] * pt_to_px));
+      item.box[k][1] =
+          static_cast<int>(std::round(item.box[k][1] * pt_to_px));
+    }
+
+  auto out = e.pipeline->run_layout_and_structure(
+      img, e.stream, std::move(px_text), sink.want_tables, sink.want_formulas);
+  for (auto &it : out.results) it.source = "pdf";
+  if (want_reading_order && !out.layout.empty()) {
+    turbo_ocr::assign_layout_ids(out.results, out.layout);
+    out.reading_order = turbo_ocr::layout::assign_reading_order_for_results(
+        out.results, out.layout);
+  }
+
+  std::lock_guard<std::mutex> lk(sink.results_mutex);
+  auto &slot = sink.page_results[static_cast<size_t>(page_idx)];
+  slot.results = std::move(out.results);
+  slot.layout = std::move(out.layout);
+  slot.reading_order = std::move(out.reading_order);
+  slot.tables = std::move(out.tables);
+  slot.formulas = std::move(out.formulas);
+  slot.formula_degraded = out.formula_degraded;
+  slot.formula_warning = std::move(out.formula_warning);
+  slot.table_degraded = out.table_degraded;
+  slot.table_warning = std::move(out.table_warning);
+  slot.width = img.cols;
+  slot.height = img.rows;
+  slot.effective_dpi = sink.dpi;
+  slot.encoded_image = std::move(encoded_image);
+  // resolved_mode stays Geometric (set by prepopulate_pages).
+}
+
 // Single-page GPU task: decode the PPM and run layout-only (Geometric) or the
 // full pipeline (everything else). Runs on a dispatcher worker.
 inline void ocr_single_page(GpuPipelineEntry &e, PdfPageSink &sink,
@@ -375,25 +428,26 @@ inline void ocr_single_page(GpuPipelineEntry &e, PdfPageSink &sink,
   }
 
   try {
-    // Geometric (born-digital/text-layer) pages normally take the layout-only
-    // fast path. But table/formula recognition runs on the rendered image via
-    // the router, which the layout-only path doesn't invoke — so when the client
-    // opted into structure, fall through to the full OCR+structure branch
-    // (parity with the CPU/InferFunc PDF path); otherwise structure would be
-    // silently dropped on born-digital pages.
+    // Geometric (born-digital/text-layer) pages keep their exact PDF text.
+    // Structure (tables/formulas) is recognized on the rendered image via the
+    // router WITHOUT det/rec (run_layout_and_structure), so the layer text is
+    // preserved AND tables/formulas are structured — no OCR fallback needed.
     const bool structure_requested = sink.want_tables || sink.want_formulas;
-    if (page_mode_of(sink, page_idx) == pdf::PdfMode::Geometric &&
-        !structure_requested) {
+    if (page_mode_of(sink, page_idx) == pdf::PdfMode::Geometric) {
       // Geometric pages are born-digital/upright with pt-space text boxes;
-      // autorotate does not apply (rotating would desync the boxes). Encode +
-      // run layout-only when requested.
+      // autorotate does not apply (rotating would desync the boxes).
       auto encoded = maybe_encode_page(sink, img);
-      auto layout = layout_enabled
-          ? e.pipeline->run_layout_only(img, e.stream).layout
-          : std::vector<layout::LayoutBox>{};
-      store_geometric_page(sink, page_idx, std::move(layout),
-                           img.cols, img.rows, want_reading_order,
-                           std::move(encoded));
+      if (structure_requested && layout_enabled) {
+        store_geometric_structure_page(sink, page_idx, e, img,
+                                       want_reading_order, std::move(encoded));
+      } else {
+        auto layout = layout_enabled
+            ? e.pipeline->run_layout_only(img, e.stream).layout
+            : std::vector<layout::LayoutBox>{};
+        store_geometric_page(sink, page_idx, std::move(layout),
+                             img.cols, img.rows, want_reading_order,
+                             std::move(encoded));
+      }
       maybe_render_page_markdown(sink, page_idx, img);
       if (sink.on_page_ready) sink.emit_page_ready(page_idx);
     } else {

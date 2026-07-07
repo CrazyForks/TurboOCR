@@ -304,11 +304,11 @@ embedded text is trustworthy.
     `MAX_PDF_PAGES` defaults to `2000`. Exceeding returns
     `400 PDF_TOO_LARGE` with the limit echoed back in the message.
 
-### PDF → Markdown (`?markdown=1`, GPU build)
+### PDF → Markdown (`?markdown=1`)
 
 One call converts the whole PDF to the same faithful Markdown as
 `POST /ocr/markdown`, using the parallel page pipeline — no client-side
-page splitting:
+page splitting. Available on both the GPU and CPU builds:
 
 ```bash
 curl -X POST 'http://localhost:8000/ocr/pdf?markdown=1' \

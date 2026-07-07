@@ -1070,6 +1070,55 @@ void register_pdf_route(server::WorkPool &pool,
                                        r.error_code.c_str(), r.error));
       return;
     }
+
+    // ?markdown=1 / ?as_pages=1 — parity with the GPU route (see there for the
+    // full rationale). CPU build has the same CUDA-free render_markdown.
+    bool want_markdown = false;
+    bool md_as_pages = false;
+    if (auto err = server::parse_bool_query(req, "markdown", &want_markdown);
+        !err.empty()) {
+      callback(server::error_response(drogon::k400BadRequest,
+                                       "INVALID_PARAMETER", err));
+      return;
+    }
+    if (auto err = server::parse_bool_query(req, "as_pages", &md_as_pages);
+        !err.empty()) {
+      callback(server::error_response(drogon::k400BadRequest,
+                                       "INVALID_PARAMETER", err));
+      return;
+    }
+    if (md_as_pages && !want_markdown) {
+      callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+          "as_pages=1 requires markdown=1"));
+      return;
+    }
+    if (want_markdown) {
+      if (!layout_available) {
+        callback(server::error_response(drogon::k400BadRequest, "LAYOUT_DISABLED",
+            "markdown=1 requires the layout model (do not start with "
+            "DISABLE_LAYOUT=1)"));
+        return;
+      }
+      if (!opts.want_text) {
+        callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+            "text=0 cannot be combined with markdown=1 (markdown needs the text)"));
+        return;
+      }
+      opts.want_layout = true;
+      opts.want_reading_order = true;
+      // Geometric mode keeps the exact text layer; auto-enabling structure there
+      // would force OCR and replace it (see GPU route). Elsewhere, mirror
+      // /ocr/markdown: recognize whatever backends loaded unless disabled.
+      auto md_mode = req->getParameter("mode");
+      const bool geometric_md =
+          md_mode == "geometric" ||
+          (md_mode.empty() && default_pdf_mode == pdf::PdfMode::Geometric);
+      if (!geometric_md) {
+        if (req->getParameter("tables").empty()) opts.want_tables = table_avail;
+        if (req->getParameter("formulas").empty()) opts.want_formulas = formula_avail;
+      }
+    }
+
     const bool want_layout = opts.want_layout;
     const bool want_reading_order = opts.want_reading_order;
     const bool want_blocks = opts.want_blocks;
@@ -1078,7 +1127,7 @@ void register_pdf_route(server::WorkPool &pool,
 
     if (reject_unknown_query_params(
             req, {"layout", "reading_order", "as_blocks", "tables", "formulas", "text",
-                  "dpi", "mode",
+                  "dpi", "mode", "markdown", "as_pages",
                   "images", "format", "lossless", "png_compression", "quality",
                   "max_side", "autorotate"}, callback))
       return;
@@ -1111,6 +1160,12 @@ void register_pdf_route(server::WorkPool &pool,
                                        "INVALID_PARAMETER", err));
       return;
     }
+    if (want_markdown && image_mode != PdfImageMode::None) {
+      callback(server::error_response(drogon::k400BadRequest, "INVALID_PARAMETER",
+          "images= page-image export is not available with markdown=1 "
+          "(figure crops are already embedded in the markdown)"));
+      return;
+    }
 
     bool autorotate = false;
     if (auto err = server::parse_bool_query(req, "autorotate", &autorotate);
@@ -1131,6 +1186,7 @@ void register_pdf_route(server::WorkPool &pool,
     server::submit_work(pool, std::move(callback),
         [pdf_buf, &infer, &pdf_renderer, want_layout,
          want_reading_order, want_blocks, want_tables, want_formulas, dpi,
+         want_markdown, md_as_pages,
          req_mode, image_mode, encode_opts, max_pdf_pages,
          autorotate, orient_fn](server::DrogonCallback &cb) {
      // See GPU route: wrap the body so a post-render bad_alloc returns 500
@@ -1164,9 +1220,35 @@ void register_pdf_route(server::WorkPool &pool,
       job_opts.image_mode = image_mode;
       job_opts.encode_opts = encode_opts;
 
+      if (want_markdown) {
+        job_opts.render_page_markdown =
+            [](PdfPageResult &pg, const cv::Mat &img) -> std::string {
+          turbo_ocr::assign_layout_ids(pg.results, pg.layout);
+          pipeline::OcrPipelineResult res;
+          res.results = std::move(pg.results);
+          res.layout = std::move(pg.layout);
+          res.reading_order = std::move(pg.reading_order);
+          res.tables = std::move(pg.tables);
+          res.formulas = std::move(pg.formulas);
+          std::string md = output::render_markdown_with_assets(
+              res, img, /*base_dir=*/".", /*embed_images=*/true);
+          pg.results = std::move(res.results);
+          pg.layout = std::move(res.layout);
+          pg.reading_order = std::move(res.reading_order);
+          pg.tables = std::move(res.tables);
+          pg.formulas = std::move(res.formulas);
+          return md;
+        };
+      }
+
       auto job = pipeline::run_pdf_job(infer, pdf_renderer, pdf_data,
                                        pdf_len_local, job_opts, orient_fn);
       if (emit_job_error(job, cb)) return;
+
+      if (want_markdown) {
+        cb(emit_pdf_markdown_response(job.pages, md_as_pages));
+        return;
+      }
 
       cb(server::json_response(emit_pdf_response(job.pages, dpi, want_blocks,
                                                   image_mode, encode_opts,

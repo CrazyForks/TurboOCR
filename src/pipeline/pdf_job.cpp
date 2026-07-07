@@ -504,7 +504,9 @@ inline int run_streamed_render_cpu(
     int &page_failures, PdfImageMode image_mode,
     const pdf::EncodeOptions &encode_opts,
     bool autorotate, const server::OrientFunc &orient_fn,
-    bool want_tables = false, bool want_formulas = false) {
+    bool want_tables, bool want_formulas,
+    const std::function<std::string(PdfPageResult &, const cv::Mat &)>
+        &render_page_markdown) {
   auto stream_handle = pdf_renderer.render_streamed(pdf_data, pdf_len, dpi,
       [&](int page_idx, const std::string &ppm_path) noexcept {
        try {
@@ -592,6 +594,13 @@ inline int run_streamed_render_cpu(
           pg.height = img.rows;
           pg.effective_dpi = dpi;
           for (auto &item : pg.results) item.source = "ocr";
+        }
+        // Per-page Markdown while the page bitmap is still alive (parity with
+        // the GPU maybe_render_page_markdown call).
+        if (render_page_markdown &&
+            page_idx < static_cast<int>(page_results.size())) {
+          auto &pg_md = page_results[static_cast<size_t>(page_idx)];
+          pg_md.markdown = render_page_markdown(pg_md, img);
         }
        } catch (const std::exception &e) {
         ++page_failures;
@@ -804,7 +813,8 @@ inline int run_streamed_render_cpu(
           infer, pdf_renderer, pdf_data, pdf_len, opts.dpi, opts.want_layout,
           opts.want_reading_order, mode, page_results, need_render,
           decode_failures, page_failures, opts.image_mode, opts.encode_opts,
-          opts.autorotate, orient_fn, opts.want_tables, opts.want_formulas);
+          opts.autorotate, orient_fn, opts.want_tables, opts.want_formulas,
+          opts.render_page_markdown);
       if (static_cast<int>(page_results.size()) < num_pages)
         page_results.resize(num_pages);
     }

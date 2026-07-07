@@ -331,40 +331,37 @@ PdfPageText PdfDocument::extract_page(int page_index) const {
     }
   }
 
-  // Use FPDFText_CountRects / GetRect for line-level grouping. PDFium
-  // merges characters on the same baseline and font into one rect, so
-  // we get reading-order word/line grouping for free — no heuristics.
-  const int n_rects = FPDFText_CountRects(ph->textpage, 0, -1);
-  if (n_rects <= 0) return out;
-  out.lines.reserve(static_cast<size_t>(n_rects));
+  // Line grouping: walk chars and split on PDFium's OWN layout line breaks
+  // (the generated \r\n in the char stream). NOT FPDFText_CountRects/GetRect:
+  // those rects are per same-font/style RUN, so a mid-line font-size change
+  // (small-caps headings: "M"+"AMBA") fragments one visual line into several
+  // out-of-order boxes. PDFium's char-flow segmentation handles those
+  // correctly; the per-char box union gives the true line bbox.
+  const int n_units = FPDFText_CountChars(ph->textpage);
+  std::vector<unsigned short> line_units;
+  line_units.reserve(128);
+  double lleft = 0, ltop = 0, lright = 0, lbottom = 0;
+  bool have_box = false;
 
-  std::vector<unsigned short> buf;
-  buf.reserve(256);
-
-  for (int i = 0; i < n_rects; ++i) {
-    double left = 0, top = 0, right = 0, bottom = 0;
-    if (!FPDFText_GetRect(ph->textpage, i, &left, &top, &right, &bottom))
-      continue;
-    // GetBoundedText expects PDFium native pre-rotation bottom-left-origin
-    // coordinates (top > bottom). GetRect returns those same coordinates.
-    int need = FPDFText_GetBoundedText(ph->textpage, left, top, right, bottom,
-                                       nullptr, 0);
-    if (need <= 0) continue;
-    buf.assign(static_cast<size_t>(need) + 1, 0);
-    int got = FPDFText_GetBoundedText(ph->textpage, left, top, right, bottom,
-                                      buf.data(),
-                                      static_cast<int>(buf.size()));
-    if (got <= 0) continue;
-    std::string utf8 = utf16le_to_utf8(buf.data(), got);
-    // Trim trailing whitespace/newlines for stable equality in tests
+  auto flush_line = [&]() {
+    if (line_units.empty() || !have_box) {
+      line_units.clear();
+      have_box = false;
+      return;
+    }
+    std::string utf8 =
+        utf16le_to_utf8(line_units.data(), static_cast<int>(line_units.size()));
     while (!utf8.empty() &&
            (utf8.back() == '\n' || utf8.back() == '\r' ||
             utf8.back() == ' '  || utf8.back() == '\t'))
       utf8.pop_back();
-    if (utf8.empty()) continue;
+    line_units.clear();
+    have_box = false;
+    if (utf8.empty()) return;
 
     PdfTextLine line;
     line.text = std::move(utf8);
+    const double left = lleft, top = ltop, right = lright, bottom = lbottom;
     // Common path: no rotation, no cropbox offset. Single subtract + flip,
     // no 4-corner transform. This is the shape of ~99% of real PDFs.
     if (ph->rotation_deg == 0 && ph->origin_x_pt == 0.0f &&
@@ -397,7 +394,32 @@ PdfPageText PdfDocument::extract_page(int page_index) const {
       line.y1_pt = vy1;
     }
     out.lines.push_back(std::move(line));
+  };
+
+  for (int idx = 0; idx < n_units; ++idx) {
+    const unsigned int u = FPDFText_GetUnicode(ph->textpage, idx);
+    if (u == '\r' || u == '\n') {
+      flush_line();
+      continue;
+    }
+    line_units.push_back(static_cast<unsigned short>(u));
+    double cl = 0, cr = 0, cb = 0, ct = 0;
+    // Generated chars (inserted spaces) return degenerate boxes — keep their
+    // text, skip them in the bbox union.
+    if (FPDFText_GetCharBox(ph->textpage, idx, &cl, &cr, &cb, &ct) &&
+        cr > cl && ct > cb) {
+      if (!have_box) {
+        lleft = cl; lright = cr; lbottom = cb; ltop = ct;
+        have_box = true;
+      } else {
+        lleft = std::min(lleft, cl);
+        lright = std::max(lright, cr);
+        lbottom = std::min(lbottom, cb);
+        ltop = std::max(ltop, ct);
+      }
+    }
   }
+  flush_line();
 
   return out;
 }

@@ -429,30 +429,18 @@ inline void ocr_single_page(GpuPipelineEntry &e, PdfPageSink &sink,
   }
 
   try {
-    // Geometric (born-digital/text-layer) pages keep their exact PDF text.
-    // Structure (tables/formulas) is recognized on the rendered image via the
-    // router WITHOUT det/rec (run_layout_and_structure), so the layer text is
-    // preserved AND tables/formulas are structured — no OCR fallback needed.
+    // Geometric mode NEVER runs prose OCR: the page text comes from the PDF's
+    // embedded text layer. An image-only page has no layer, so its prose comes
+    // back empty — by design. mode=auto is the mode that OCRs such pages;
+    // mode=ocr always OCRs. Tables/formulas are still recognized on the rendered
+    // image when requested (they are vision-recognized for born-digital pages
+    // too — there is no "table text layer"), keeping the exact prose layer.
     const bool structure_requested = sink.want_tables || sink.want_formulas;
-    const bool geometric =
-        page_mode_of(sink, page_idx) == pdf::PdfMode::Geometric;
-    // A page is only Geometric-with-text when its layer was trusted; a scanned
-    // page under mode=geometric is marked Geometric but has EMPTY results
-    // (fill_from_text_layer_pt was skipped). Such a page must OCR to recover its
-    // prose when structure is requested — feeding its empty results into
-    // store_geometric_structure_page would silently drop the whole page body.
-    bool has_trusted_layer = false;
-    if (geometric) {
-      std::lock_guard<std::mutex> lk(sink.results_mutex);
-      has_trusted_layer =
-          sink.page_results[static_cast<size_t>(page_idx)].text_layer_quality ==
-          "trusted";
-    }
-    if (geometric && (has_trusted_layer || !structure_requested)) {
+    if (page_mode_of(sink, page_idx) == pdf::PdfMode::Geometric) {
       // Geometric pages are born-digital/upright with pt-space text boxes;
       // autorotate does not apply (rotating would desync the boxes).
       auto encoded = maybe_encode_page(sink, img);
-      if (structure_requested && layout_enabled && has_trusted_layer) {
+      if (structure_requested && layout_enabled) {
         store_geometric_structure_page(sink, page_idx, e, img,
                                        want_reading_order, std::move(encoded));
       } else {
@@ -616,42 +604,31 @@ inline int run_streamed_render_cpu(
           pg.encoded_image = pdf::encode_page_image(img, encode_opts);
 
         if (pg.resolved_mode == pdf::PdfMode::Geometric) {
-          const bool has_trusted_layer = (pg.text_layer_quality == "trusted");
-          // NOTE (CPU vs GPU): the CPU InferFunc (run_with_layout) always runs
-          // det/rec — there is no structure-without-det/rec entry point like the
-          // GPU's run_layout_and_structure. So on a born-digital page here we
-          // still pay full-page OCR and then discard inf.results (keeping the
-          // exact layer text), and table cells are filled from that OCR rather
-          // than the layer text. Correct, but less efficient and slightly less
-          // exact-in-cells than the GPU path. Acceptable for the CPU build;
-          // fixing needs a want_text=false structure mode on the CPU pipeline.
+          // Geometric NEVER OCRs prose: pg.results is the PDF text layer (empty
+          // for an image-only page — mode=auto/ocr are the modes that OCR). We
+          // still run layout + table/formula structure on the rendered image
+          // when requested. NOTE (CPU vs GPU): the CPU InferFunc always runs
+          // det/rec, so we call it for the structure and DISCARD its OCR text
+          // (inf.results) to honor the no-OCR contract — the GPU path skips
+          // det/rec entirely via run_layout_and_structure. Less efficient here,
+          // but same output; fixing needs a want_text=false CPU structure mode.
           if (want_layout) {
             auto inf = infer(img, inf_opts);
             pg.layout = std::move(inf.layout);
-            // table/formula structure + degradation also apply to geometric pages (the router
-            // runs on the rendered image); text_degraded does NOT (text is the PDF layer).
+            // Structure + its degradation apply to geometric pages (the router
+            // runs on the rendered image); the OCR'd inf.results is discarded.
             pg.tables = std::move(inf.tables);
             pg.formulas = std::move(inf.formulas);
             pg.formula_degraded = inf.formula_degraded;
             pg.formula_warning = std::move(inf.formula_warning);
             pg.table_degraded = inf.table_degraded;
             pg.table_warning = std::move(inf.table_warning);
-            if (!has_trusted_layer) {
-              // Scanned page under mode=geometric: no text layer — recover its
-              // prose from the OCR pass (already pixel-space) instead of
-              // writing back the empty layer results (silent text loss).
-              pg.results = std::move(inf.results);
-              pg.text_degraded = inf.text_degraded;
-              pg.text_warning = std::move(inf.text_warning);
-              for (auto &item : pg.results) item.source = "ocr";
-            }
           }
           pg.width = img.cols;
           pg.height = img.rows;
           pg.effective_dpi = dpi;
-          // Only the PDF text layer is pt-space; the OCR fallback above is
-          // already in pixel space.
-          if (has_trusted_layer) rescale_boxes_pt_to_px(pg.results, dpi);
+          // pg.results is the pt-space text layer (empty for image pages).
+          rescale_boxes_pt_to_px(pg.results, dpi);
           if (want_reading_order && !pg.layout.empty()) {
             turbo_ocr::assign_layout_ids(pg.results, pg.layout);
             pg.reading_order =

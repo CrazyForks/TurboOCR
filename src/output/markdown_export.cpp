@@ -717,46 +717,64 @@ std::string render_markdown(const pipeline::OcrPipelineResult &res,
 
     // Structure-first dispatch (these own their payload, not gathered text).
     if (label == "table") {
-      const auto it = table_by_li.find(li);
-      if (it == table_by_li.end()) continue;
-      std::string html = strip_table_wrapper(it->second->html);
-      if (!html.empty()) parts.push_back(std::move(html));
+      // Recognized HTML when the table backend ran; otherwise (backend off, e.g.
+      // geometric PDF mode) fall back to the region's raw text so the table's
+      // content is not silently dropped — it just lacks grid structure.
+      if (auto it = table_by_li.find(li); it != table_by_li.end()) {
+        std::string html = strip_table_wrapper(it->second->html);
+        if (!html.empty()) { parts.push_back(std::move(html)); continue; }
+      }
+      std::string txt = gather(li);
+      if (!txt.empty()) parts.push_back(std::move(txt));
       continue;
     }
     if (cls == kClassDisplayFormula) {
-      std::string latex;
-      if (auto f = formula_by_li.find(li); f != formula_by_li.end())
-        latex = trim(f->second->latex);
-      if (latex.empty()) latex = gather(li);
-      if (latex.empty()) continue;
-      if (opts.drop_collapsed_formulas && latex_is_mode_collapsed(latex)) {
-        if (!opts.collapsed_formula_note.empty())
-          parts.push_back(opts.collapsed_formula_note);
-        continue;
+      // Only content from the formula recognizer is LaTeX. When no recognized
+      // result exists (formula backend off, e.g. geometric PDF mode, or the
+      // region failed to recognize), gather(li) returns the region's raw
+      // OCR / PDF-text-layer characters — NOT LaTeX. Wrapping those in $$ makes
+      // KaTeX/MathJax render broken math, so emit them as a plain paragraph.
+      if (auto f = formula_by_li.find(li); f != formula_by_li.end()) {
+        std::string latex = trim(f->second->latex);
+        if (latex.empty()) latex = gather(li);  // recognizer ran but empty: keep old fallback
+        if (latex.empty()) continue;
+        if (opts.drop_collapsed_formulas && latex_is_mode_collapsed(latex)) {
+          if (!opts.collapsed_formula_note.empty())
+            parts.push_back(opts.collapsed_formula_note);
+          continue;
+        }
+        if (auto t = tag_of.find(li); t != tag_of.end())
+          latex += " \\tag{" + t->second + "}";
+        if (!opts.safe_formula_fallback || latex_is_render_safe(latex))
+          parts.push_back("$$\n" + latex + "\n$$");
+        else
+          parts.push_back("```latex\n" + latex + "\n```");
+      } else {
+        std::string txt = gather(li);
+        if (!txt.empty()) parts.push_back(std::move(txt));
       }
-      if (auto t = tag_of.find(li); t != tag_of.end())
-        latex += " \\tag{" + t->second + "}";
-      if (!opts.safe_formula_fallback || latex_is_render_safe(latex))
-        parts.push_back("$$\n" + latex + "\n$$");
-      else
-        parts.push_back("```latex\n" + latex + "\n```");
       continue;
     }
     if (cls == kClassInlineFormula) {
-      std::string latex;
-      if (auto f = formula_by_li.find(li); f != formula_by_li.end())
-        latex = trim(f->second->latex);
-      if (latex.empty()) latex = gather(li);
-      if (latex.empty()) continue;
-      if (opts.drop_collapsed_formulas && latex_is_mode_collapsed(latex)) {
-        if (!opts.collapsed_formula_note.empty())
-          parts.push_back(opts.collapsed_formula_note);
-        continue;
+      if (auto f = formula_by_li.find(li); f != formula_by_li.end()) {
+        std::string latex = trim(f->second->latex);
+        if (latex.empty()) latex = gather(li);
+        if (latex.empty()) continue;
+        if (opts.drop_collapsed_formulas && latex_is_mode_collapsed(latex)) {
+          if (!opts.collapsed_formula_note.empty())
+            parts.push_back(opts.collapsed_formula_note);
+          continue;
+        }
+        if (!opts.safe_formula_fallback || latex_is_render_safe(latex))
+          parts.push_back("$" + latex + "$");
+        else
+          parts.push_back(inline_code(latex));
+      } else {
+        // Unrecognized inline formula: emit its text inline as plain prose
+        // rather than as broken $…$ math.
+        std::string txt = gather(li);
+        if (!txt.empty()) parts.push_back(std::move(txt));
       }
-      if (!opts.safe_formula_fallback || latex_is_render_safe(latex))
-        parts.push_back("$" + latex + "$");
-      else
-        parts.push_back(inline_code(latex));
       continue;
     }
     if (cls == kClassFormulaNumber) {

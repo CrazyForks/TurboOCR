@@ -60,3 +60,5 @@ site/
 
 # TRT/model scratch cache
 model.cache
+# Local scratch outputs (demo/markdown test results) — never tracked
+/tmp/

@@ -109,7 +109,7 @@ Then opt in per request (combine freely; `tables`/`formulas` auto-enable layout)
 ```bash
 curl -X POST "http://localhost:8000/ocr/raw?layout=1&tables=1&formulas=1" \
   --data-binary @paper.png -H "Content-Type: image/png"
-# PDF:  POST /ocr/pdf   ·   Markdown export: POST /ocr/markdown   ·   gRPC: port 50051
+# PDF:  POST /ocr/pdf   ·   PDF → Markdown: POST /ocr/pdf?markdown=1   ·   page → Markdown: POST /ocr/markdown   ·   gRPC: port 50051
 ```
 
 `GET /capabilities` reports which stages a running server has loaded.
@@ -268,7 +268,7 @@ One binary serves HTTP and gRPC from a shared GPU pipeline pool.
 | `POST /ocr` | OCR base64 image in JSON |
 | `POST /ocr/pixels` | Zero-decode raw pixel buffer |
 | `POST /ocr/batch` | Batch of images |
-| `POST /ocr/pdf` | PDF → text (optional page images & auto-rotate) |
+| `POST /ocr/pdf` | PDF → text (optional page images & auto-rotate); `?markdown=1` → whole PDF as Markdown |
 | `POST /ocr/markdown` | Page → faithful Markdown (GPU build; requires layout) |
 | `POST /infer` | OCR + layout / reading-order / blocks in one structured response |
 | `GET /capabilities` | Runtime feature & route discovery |

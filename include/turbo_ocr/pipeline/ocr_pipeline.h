@@ -209,6 +209,20 @@ public:
   [[nodiscard]] OcrPipelineResult run_layout_only(const cv::Mat &img,
                                                    cudaStream_t stream);
 
+  // Layout + table/formula recognition WITHOUT detection/recognition. Used by
+  // /ocr/pdf mode=geometric/auto when the client asked for structure: the page
+  // text comes from the PDFium text layer (passed in as `text_results`, already
+  // in this image's pixel space), so det/rec is skipped, but tables (→ HTML) and
+  // formulas (→ LaTeX) still need the rendered image and the layout regions.
+  // Uploads the image once, runs layout, then the CUA router over the supplied
+  // text boxes — the same dispatch_router_ the OCR path uses. Returns the text
+  // results verbatim plus populated `.layout` / `.tables` / `.formulas`. A no-op
+  // (returns just the text) when layout isn't loaded.
+  [[nodiscard]] OcrPipelineResult run_layout_and_structure(
+      const cv::Mat &img, cudaStream_t stream,
+      std::vector<OCRResultItem> text_results, bool want_tables,
+      bool want_formulas, const routing::RequestRouting &routing = {});
+
   // Ensure the GPU upload buffer can hold an image of the given size.
   // Returns {d_img_buf_, d_img_pitch_} after grow-only reallocation.
   // Useful for callers that want to decode directly into the pipeline's GPU buffer.

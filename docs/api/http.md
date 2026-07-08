@@ -291,10 +291,14 @@ embedded text is trustworthy.
     - multipart with field name `file` or `pdf`.
 - **`mode` query** (default `ocr`):
     - `ocr` — always render + OCR every page.
-    - `geometric` — use the PDF text layer for content; render only when
-      `layout=1` or as a safety net.
+    - `geometric` — prose comes **only** from the PDF text layer; the page is
+      **never OCR'd**. A page with no usable text layer (image-only / scanned)
+      returns empty prose — use `auto` or `ocr` for those. The page is still
+      rendered for layout and table/formula recognition when requested (those
+      are vision-recognized for born-digital pages too), so `?tables=1`/
+      `?formulas=1` work in geometric mode and keep the exact text-layer prose.
     - `auto` — text layer when trusted (`text_layer_quality == "trusted"`),
-      OCR otherwise.
+      OCR otherwise. This is the mode that recovers prose on image-only pages.
     - `auto_verified` — GPU only. Runs OCR, then cross-checks every
       detection against the PDF text layer; replaces matches with the
       native string (`source: "pdf"`). On CPU this aliases to `auto`.

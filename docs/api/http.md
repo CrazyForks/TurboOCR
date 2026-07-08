@@ -291,10 +291,14 @@ embedded text is trustworthy.
     - multipart with field name `file` or `pdf`.
 - **`mode` query** (default `ocr`):
     - `ocr` — always render + OCR every page.
-    - `geometric` — use the PDF text layer for content; render only when
-      `layout=1` or as a safety net.
+    - `geometric` — prose comes **only** from the PDF text layer; the page is
+      **never OCR'd**. A page with no usable text layer (image-only / scanned)
+      returns empty prose — use `auto` or `ocr` for those. The page is still
+      rendered for layout and table/formula recognition when requested (those
+      are vision-recognized for born-digital pages too), so `?tables=1`/
+      `?formulas=1` work in geometric mode and keep the exact text-layer prose.
     - `auto` — text layer when trusted (`text_layer_quality == "trusted"`),
-      OCR otherwise.
+      OCR otherwise. This is the mode that recovers prose on image-only pages.
     - `auto_verified` — GPU only. Runs OCR, then cross-checks every
       detection against the PDF text layer; replaces matches with the
       native string (`source: "pdf"`). On CPU this aliases to `auto`.
@@ -303,6 +307,40 @@ embedded text is trustworthy.
 !!! warning "Page cap"
     `MAX_PDF_PAGES` defaults to `2000`. Exceeding returns
     `400 PDF_TOO_LARGE` with the limit echoed back in the message.
+
+### PDF → Markdown (`?markdown=1`)
+
+One call converts the whole PDF to the same faithful Markdown as
+`POST /ocr/markdown`, using the parallel page pipeline — no client-side
+page splitting. Available on both the GPU and CPU builds:
+
+```bash
+curl -X POST 'http://localhost:8000/ocr/pdf?markdown=1' \
+  --data-binary @paper.pdf -H 'Content-Type: application/pdf'
+```
+
+- Returns `text/markdown`: pages concatenated in order, each prefixed with an
+  invisible `<!-- page N -->` marker (safe to render, easy to split on).
+- `&as_pages=1` returns JSON instead — `{"pages":[{"page_index":0,
+  "markdown":"…"}, …]}` — for chunked/RAG consumers; per-page
+  `text_degraded` / `table_degraded` / `formula_degraded` flags appear when set.
+- Implies `layout=1&reading_order=1` (requires the layout model —
+  `400 LAYOUT_DISABLED` otherwise). In the default `ocr` mode, tables and
+  formulas are recognized whenever their backends are loaded (→ HTML / LaTeX);
+  pass `tables=0` / `formulas=0` to opt out.
+- **Mode choice.** `mode=ocr` (default) renders and OCRs every page — best for
+  scanned PDFs. `mode=geometric` reads a born-digital PDF's embedded text layer
+  directly for the prose (exact text, faster, no OCR errors) while **still**
+  recognizing tables → HTML and formulas → LaTeX on the rendered image — so a
+  born-digital paper exports exact text *and* structured math/tables. `auto`
+  picks per page: text layer when trustworthy, OCR otherwise.
+- Figure/chart crops are embedded as base64 `data:` URIs with their OCR'd text
+  as alt text; tables come back as HTML, formulas as `$…$` / `$$…$$` LaTeX.
+- `dpi`, `mode` and `autorotate` work as usual. `text=0` and `images=` are
+  rejected (`400 INVALID_PARAMETER`) — markdown needs the text, and the figure
+  crops are already embedded.
+- Per-stage degradation is aggregated in the `X-OCR-Degraded` response header
+  with page numbers (e.g. `table(p3,p7)`), same contract as `/ocr/markdown`.
 
 ### Inline page-image export
 

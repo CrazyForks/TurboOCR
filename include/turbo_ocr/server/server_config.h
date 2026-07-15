@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "turbo_ocr/classification/cls_options.h"
 #include "turbo_ocr/common/logger.h"
 #include "turbo_ocr/pdf/pdf_extraction_mode.h"
 #include "turbo_ocr/server/env_utils.h"
@@ -128,6 +129,11 @@ struct ServerConfig {
 
   // ---- Feature toggles ----
   bool        disable_angle_cls = false;
+  // CLS_ALL_BOXES=1: classify orientation on every crop, not just vertical
+  // ones. cls_explicit: CLS_ONNX/CLS_MODEL was set by the user (missing file
+  // is then fatal instead of a silent disable).
+  bool        cls_all_boxes     = false;
+  bool        cls_explicit      = false;
   bool        layout_disabled   = false;
   pdf::PdfMode default_pdf_mode = pdf::PdfMode::Ocr;
   bool        default_pdf_mode_was_set = false;
@@ -258,6 +264,7 @@ inline std::string ServerConfig::to_json() const {
   j += ",\"ocr_model\":" + esc(selected_model_name);
   j += ",\"ocr_lang\":"          + esc(ocr_lang_value);
   j += ",\"disable_angle_cls\":" + std::string(disable_angle_cls ? "true" : "false");
+  j += ",\"cls_all_boxes\":"     + std::string(cls_all_boxes ? "true" : "false");
   j += ",\"layout_disabled\":"   + std::string(layout_disabled ? "true" : "false");
   j += ",\"default_pdf_mode\":"  + esc(pdf::mode_name(default_pdf_mode));
   // Report the EFFECTIVE det config (per-model base + DET_* env overrides) so
@@ -341,7 +348,13 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
         ? GrpcResponseMode::structured : GrpcResponseMode::json_bytes;
   }
 
-  c.cls_onnx    = env_or(cls_env, "models/cls.onnx");
+  // CLS_ONNX/CLS_MODEL takes a path or a shorthand variant name ("x0_25",
+  // "x1_0"). cls_explicit records that the user set it, so a missing file can
+  // refuse to boot instead of silently disabling orientation handling.
+  c.cls_explicit = env_present(cls_env);
+  c.cls_onnx    = classification::resolve_cls_shorthand(
+      env_or(cls_env, "models/cls.onnx"));
+  c.cls_all_boxes = env_bool_strict("CLS_ALL_BOXES", false, c.errors);
   c.layout_onnx = env_or("LAYOUT_ONNX", "models/layout/layout.onnx");
   c.doc_ori_onnx = env_or("DOC_ORI_ONNX", "models/doc_ori.onnx");
   if (env_present("LAYOUT_TRT"))
@@ -400,6 +413,10 @@ inline ServerConfig ServerConfig::from_env_and_cli(int argc, char **argv,
       {"all", "outer", "inner", "union", "large", "small"}, c.errors);
 
   c.disable_angle_cls = env_bool_strict("DISABLE_ANGLE_CLS", false, c.errors);
+  if (c.cls_all_boxes && c.disable_angle_cls)
+    c.warnings.push_back(
+        "CLS_ALL_BOXES=1 has no effect with DISABLE_ANGLE_CLS=1 — the angle "
+        "classifier is disabled entirely");
   c.layout_disabled   = env_bool_strict("DISABLE_LAYOUT",    false, c.errors);
 
   // ENABLE_LAYOUT removed — operators must migrate.

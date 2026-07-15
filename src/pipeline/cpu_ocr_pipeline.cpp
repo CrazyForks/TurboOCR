@@ -7,6 +7,7 @@
 
 #include <opencv2/imgproc.hpp>
 
+#include "turbo_ocr/classification/cls_options.h"
 #include "turbo_ocr/common/box.h"
 #include "turbo_ocr/common/serialization.h"
 #include "turbo_ocr/common/stage_profiler.h"
@@ -58,7 +59,10 @@ bool CpuOcrPipeline::init(const std::string &det_model,
       return false;
     }
     use_cls_ = true;
-    std::cout << "[Pipeline] Angle classifier enabled (CPU)" << '\n';
+    std::cout << "[Pipeline] Angle classifier enabled (CPU, "
+              << (classification::cls_all_boxes_enabled() ? "all boxes"
+                                                          : "vertical-only gate")
+              << ")" << '\n';
   }
 
   return true;
@@ -95,8 +99,12 @@ std::vector<OCRResultItem> CpuOcrPipeline::run_core_(const cv::Mat &img,
     sorted_boxes(boxes);
   }
 
-  // Optional angle classification -- only classify if any box looks vertical
-  if (use_cls_ && cls_ && std::ranges::any_of(boxes, is_vertical_box)) {
+  // Optional angle classification -- default: only when a vertical-looking
+  // box is present; CLS_ALL_BOXES=1 checks every crop (mixed-orientation scans
+  // have upside-down horizontal lines geometry alone cannot detect).
+  if (use_cls_ && cls_ &&
+      (classification::cls_all_boxes_enabled() ||
+       std::ranges::any_of(boxes, is_vertical_box))) {
     prof::Scope _s(prof::CLS);
     cls_->run(img, boxes);
   }

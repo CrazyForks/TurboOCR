@@ -136,6 +136,15 @@ int main(int argc, char **argv) try {
   auto det_model = turbo_ocr::engine::ensure_trt_engine(cfg.det_onnx, "det");
   auto rec_model = turbo_ocr::engine::ensure_trt_engine(rec_paths.rec, "rec");
   std::string cls_model = turbo_ocr::engine::ensure_trt_engine(cfg.cls_onnx, "cls");
+  // An explicitly configured CLS_ONNX that fails to resolve must not silently
+  // disable orientation handling (only the unset default may soft-disable).
+  if (cls_model.empty() && cfg.cls_explicit && !cfg.disable_angle_cls) {
+    std::cerr << "[config error] CLS_ONNX=\"" << cfg.cls_onnx
+              << "\" could not be loaded (file missing or engine build failed). "
+                 "Refusing to start with a silently disabled angle classifier; "
+                 "unset CLS_ONNX or set DISABLE_ANGLE_CLS=1 to run without it.\n";
+    return 2;
+  }
   if (cfg.disable_angle_cls) {
     cls_model.clear();
     TOCR_LOG_INFO("Angle classification disabled via DISABLE_ANGLE_CLS=1");

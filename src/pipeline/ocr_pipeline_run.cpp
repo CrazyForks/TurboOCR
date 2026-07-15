@@ -3,6 +3,7 @@
 #include "infer_one.h"
 #include "ocr_pipeline_detail.h"
 #include "recognizer_registry.h"
+#include "turbo_ocr/classification/cls_options.h"
 #include "turbo_ocr/common/backend_error.h"
 #include "turbo_ocr/common/cuda_check.h"
 #include "turbo_ocr/common/errors.h"
@@ -340,9 +341,18 @@ OcrPipelineResult OcrPipeline::run_with_layout(const cv::Mat &img,
     timer.gpu_stop();
   }
 
-  // Optional angle classification — only classify boxes that look vertical.
-  // Saves time by not classifying horizontal text (majority of boxes).
-  if (use_cls_) {
+  // Optional angle classification. Default gate: only classify boxes that
+  // look vertical (h >= w*1.5) — horizontal text (the majority) skips the
+  // classifier. CLS_ALL_BOXES=1 classifies every crop instead: geometry gives
+  // the axis but cannot detect an upside-down horizontal line, so scans with
+  // mixed per-line orientations need the flip check on all boxes.
+  if (use_cls_ && classification::cls_all_boxes_enabled()) {
+    if (!boxes.empty()) {
+      timer.gpu_start("angle_classification");
+      cls_->run(gpu_img, boxes, stream); // flips 180° boxes in place
+      timer.gpu_stop();
+    }
+  } else if (use_cls_) {
     // Collect indices of vertical-looking boxes (h >= w*1.5)
     vertical_box_indices_.clear();
     for (int i = 0; i < static_cast<int>(boxes.size()); ++i) {

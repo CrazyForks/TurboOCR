@@ -126,6 +126,8 @@ nav:
       - Docker: build/docker.md
       - Configuration: build/config.md
       - Models: build/models.md
+      - Upgrading to v3: build/upgrading-v3.md
+      - Legacy PP-OCRv5: build/legacy-ppocrv5.md
   - Dev:
       - Testing: dev/testing.md
       - Plan history: dev/plan-history.md

@@ -60,6 +60,7 @@ const char* const kAllEnvVars[] = {
     "MAX_BATCH_IMAGES",
     "MAX_PDF_PAGE_PIXELS_MP",
     "DOC_ORI_ONNX",
+    "CLS_ALL_BOXES",
 };
 
 void reset_env() {
@@ -95,6 +96,70 @@ TEST_CASE("from_env defaults are sane (GPU)", "[server_config]") {
   CHECK_FALSE(c.layout_disabled);
   CHECK_FALSE(c.default_pdf_mode_was_set);
   CHECK(c.profile == Profile::Gpu);
+}
+
+TEST_CASE("cls shorthand names resolve to bundled paths", "[server_config]") {
+  reset_env();
+  ::setenv("CLS_ONNX", "x1_0", 1);
+  auto c = ServerConfig::from_env(Profile::Gpu);
+  CHECK(c.errors.empty());
+  CHECK(c.cls_onnx == "models/cls_x1_0.onnx");
+  CHECK(c.cls_explicit);
+
+  ::setenv("CLS_ONNX", "x0_25", 1);
+  auto c2 = ServerConfig::from_env(Profile::Gpu);
+  CHECK(c2.cls_onnx == "models/cls.onnx");
+
+  // CPU profile uses CLS_MODEL for the same shorthand.
+  reset_env();
+  ::setenv("CLS_MODEL", "x1_0", 1);
+  auto c3 = ServerConfig::from_env(Profile::Cpu);
+  CHECK(c3.cls_onnx == "models/cls_x1_0.onnx");
+  CHECK(c3.cls_explicit);
+
+  // A plain path passes through untouched, and an unset env is not explicit.
+  reset_env();
+  ::setenv("CLS_ONNX", "/opt/models/custom_cls.onnx", 1);
+  auto c4 = ServerConfig::from_env(Profile::Gpu);
+  CHECK(c4.cls_onnx == "/opt/models/custom_cls.onnx");
+  reset_env();
+  auto c5 = ServerConfig::from_env(Profile::Gpu);
+  CHECK_FALSE(c5.cls_explicit);
+}
+
+TEST_CASE("CLS_ALL_BOXES parses strictly", "[server_config]") {
+  reset_env();
+  auto c = ServerConfig::from_env(Profile::Gpu);
+  CHECK_FALSE(c.cls_all_boxes);
+
+  ::setenv("CLS_ALL_BOXES", "1", 1);
+  auto c1 = ServerConfig::from_env(Profile::Gpu);
+  CHECK(c1.errors.empty());
+  CHECK(c1.cls_all_boxes);
+
+  ::setenv("CLS_ALL_BOXES", "banana", 1);
+  auto c2 = ServerConfig::from_env(Profile::Gpu);
+  CHECK_FALSE(c2.errors.empty());  // garbage must fail loud, not default
+
+  // Contradictory combo warns (classifier disabled entirely).
+  ::setenv("CLS_ALL_BOXES", "1", 1);
+  ::setenv("DISABLE_ANGLE_CLS", "1", 1);
+  auto c3 = ServerConfig::from_env(Profile::Gpu);
+  CHECK(c3.errors.empty());
+  CHECK_FALSE(c3.warnings.empty());
+}
+
+TEST_CASE("runtime truthy reader matches env_bool_strict's accepted set",
+          "[server_config]") {
+  // The boot validator (env_bool_strict) and the pipelines' runtime reader
+  // (truthy_env_value) must agree, or CLS_ALL_BOXES=true would validate at
+  // boot yet silently run with the feature off.
+  using turbo_ocr::classification::truthy_env_value;
+  for (const char *v : {"1", "true", "TRUE", "yes", "on", "On"})
+    CHECK(truthy_env_value(v));
+  for (const char *v : {"0", "false", "no", "off", "", "banana"})
+    CHECK_FALSE(truthy_env_value(v));
+  CHECK_FALSE(truthy_env_value(nullptr));
 }
 
 TEST_CASE("from_env defaults differ on CPU profile", "[server_config]") {

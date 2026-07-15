@@ -4,6 +4,7 @@
 #include "infer_one.h"
 #include "ocr_pipeline_detail.h"
 #include "recognizer_registry.h"
+#include "turbo_ocr/classification/cls_options.h"
 #include "turbo_ocr/common/backend_error.h"
 #include "turbo_ocr/common/cuda_check.h"
 #include "turbo_ocr/common/errors.h"
@@ -97,7 +98,10 @@ bool OcrPipeline::init(const std::string &det_model,
       return false;
     }
     use_cls_ = true;
-    std::cout << "[Pipeline] Angle classifier enabled" << '\n';
+    std::cout << "[Pipeline] Angle classifier enabled ("
+              << (classification::cls_all_boxes_enabled() ? "all boxes"
+                                                          : "vertical-only gate")
+              << ")" << '\n';
   }
 
   // Pre-allocate double-buffered GPU upload buffers for a typical image

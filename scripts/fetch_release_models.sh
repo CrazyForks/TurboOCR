@@ -89,6 +89,26 @@ fetch_verified "keys_tiny.txt"   "$OUT/keys_tiny.txt"
 # Angle classifier (script-agnostic, serves all paths; PP-OCRv6 ships none).
 fetch_verified "cls.onnx"        "$OUT/cls.onnx"
 
+# PP-LCNet_x1_0 textline-orientation variant (~6.8 MB) — OPTIONAL, selected via
+# CLS_ONNX=x1_0 / CLS_MODEL=x1_0. Lives on its own release (the base v3.0.0
+# models release is immutable), sha pinned here like doc_ori below (recipe:
+# scripts/export_textline_ori_x1_0.py). Opt-in only: a failed fetch must not
+# abort the build — the server refuses to boot loudly if a user selects x1_0
+# without the file, so skipping stays visible, not silent.
+CLS_X1_0_RELEASE_URL="${CLS_X1_0_RELEASE_URL:-https://github.com/aiptimizer/TurboOCR/releases/download/models-v3.4.0-textline-ori-x1-0}"
+CLS_X1_0_RELEASE_URL_FALLBACK="${CLS_X1_0_RELEASE_URL_FALLBACK:-}"
+CLS_X1_0_SHA256="e1e089ca7669e0ae28842a3b018152b6c320121fcd30e54664b4b5abbacda5a5"
+echo "  cls_x1_0.onnx -> $OUT/cls_x1_0.onnx (optional)"
+if fetch_asset "cls_x1_0.onnx" "$OUT/cls_x1_0.onnx.part" \
+       "$CLS_X1_0_RELEASE_URL" "$CLS_X1_0_RELEASE_URL_FALLBACK" \
+   && [[ "$(sha256sum "$OUT/cls_x1_0.onnx.part" | awk '{print $1}')" == "$CLS_X1_0_SHA256" ]]; then
+  mv "$OUT/cls_x1_0.onnx.part" "$OUT/cls_x1_0.onnx"
+else
+  echo "    WARN: cls_x1_0.onnx unavailable or checksum mismatch — skipping." >&2
+  echo "          CLS_ONNX=x1_0 will refuse to start; the default x0_25 classifier is unaffected." >&2
+  rm -f "$OUT/cls_x1_0.onnx.part"
+fi
+
 # PP-DocLayoutV3 (~124 MB) — required for ?layout=1 endpoints.
 mkdir -p "$OUT/layout"
 fetch_verified "layout.onnx" "$OUT/layout/layout.onnx"

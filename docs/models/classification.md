@@ -1,10 +1,24 @@
 # Classification — `PaddleCls`
 
-Per-line angle classifier. Runs **only** on detection boxes that look vertical
+Per-line angle classifier. By default it runs **only** on detection boxes that
+look vertical
 (`h >= 1.5 * w`, see [`is_vertical_box`](https://github.com/aiptimizer/TurboOCR/blob/main/include/turbo_ocr/common/types.h))
 and decides whether each crop should be flipped 180° before recognition. Most
 horizontal text never touches this stage, which is why the latency cost is
 typically <0.5 ms on a page with ~100 lines.
+
+Two opt-ins change this (see [Configuration](../build/config.md)):
+
+- **`CLS_ALL_BOXES=1`** classifies **every** crop instead of only vertical-looking
+  ones. Detection geometry gives each line's axis but cannot spot an upside-down
+  *horizontal* line, so scans with mixed per-line orientations need this. Cost on
+  OmniDocBench text-only throughput: ~−1% (`tiny`) to ~−0% (`medium`).
+- **`CLS_ONNX=x1_0`** (CPU: `CLS_MODEL=x1_0`) swaps in the full-width
+  **PP-LCNet_x1_0** textline-orientation variant (`models/cls_x1_0.onnx`, ~6.8 MB,
+  identical I/O contract). Slightly better flip decisions on hard crops at ~−10%
+  text-only throughput when combined with `CLS_ALL_BOXES=1`; the default `x0_25`
+  remains the recommended tradeoff. Export recipe:
+  [`scripts/export_textline_ori_x1_0.py`](https://github.com/aiptimizer/TurboOCR/blob/main/scripts/export_textline_ori_x1_0.py).
 
 ## Why this design
 

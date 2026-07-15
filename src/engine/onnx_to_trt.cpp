@@ -255,7 +255,20 @@ static bool build_engine(const std::string &onnx_path,
     double scale = (static_cast<double>(det_max) / 960.0) *
                    (static_cast<double>(det_max) / 960.0);
     size_t scaled = static_cast<size_t>((1ULL << 30) * scale);
-    workspace_bytes = std::min(scaled, size_t(4ULL << 30));
+    // TRT_DET_WORKSPACE_GB raises the 4 GiB ceiling on cards with headroom:
+    // the medium det at DET_MAX_SIDE_LIMIT=2560 has tactics needing ~4.06 GiB,
+    // so the default cap fails its build by ~60 MB even on a 32 GB card.
+    size_t cap = 4ULL << 30;
+    if (const char *env = std::getenv("TRT_DET_WORKSPACE_GB"); env && *env) {
+      int gb = std::atoi(env);
+      if (gb >= 1 && gb <= 24) {
+        cap = static_cast<size_t>(gb) << 30;
+      } else {
+        std::cerr << "[TRT] TRT_DET_WORKSPACE_GB=\"" << env
+                  << "\" out of range [1,24] — keeping the 4 GiB default\n";
+      }
+    }
+    workspace_bytes = std::min(scaled, cap);
     if (workspace_bytes < (1ULL << 30)) workspace_bytes = 1ULL << 30;
   } else if (type == "slanext_wired" || type == "slanext_wireless" ||
              type == "formula") {

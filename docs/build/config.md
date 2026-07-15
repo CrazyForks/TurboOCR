@@ -70,7 +70,8 @@ build the variables are `*_ONNX`; on the CPU build they are `*_MODEL`.
 |---|---|---|
 | `DET_ONNX` / `DET_MODEL` | per-model | Detection model path. CLI: `--det-onnx`. |
 | `REC_ONNX` / `REC_MODEL` | per-model | Recognition model path. |
-| `CLS_ONNX` / `CLS_MODEL` | `models/cls.onnx` | Angle-classifier model path. CLI: `--cls-onnx`. |
+| `CLS_ONNX` / `CLS_MODEL` | `models/cls.onnx` | Angle-classifier model: a path, or a shorthand variant name — `x0_25` (default tiny) / `x1_0` (full-width PP-LCNet, better on rotated lines; expects `models/cls_x1_0.onnx`). When set explicitly, a missing/unloadable file refuses to start instead of silently disabling the classifier. CLI: `--cls-onnx`. |
+| `CLS_ALL_BOXES` | `0` | `1` runs the 0°/180° orientation classifier on **every** text crop instead of only vertical-looking ones (h ≥ 1.5·w). Detection geometry gives each line's axis but cannot spot an upside-down horizontal line — enable for scans with mixed per-line orientations (0/90/180/270 on one page). Upright documents gain nothing; leave off for speed. |
 | `REC_DICT` | per-model | Recognition character dictionary. |
 | `DOC_ORI_ONNX` | `models/doc_ori.onnx` | Document-orientation model (PP-LCNet_x1_0_doc_ori) for `/ocr/pdf?autorotate=1`. If the file is absent, autorotate requests return `400 AUTOROTATE_DISABLED`; nothing else is affected. |
 
@@ -125,6 +126,7 @@ the `*_ONNX` overrides below are only needed for a non-default location.
 |---|---|---|
 | `TRT_OPT_LEVEL` | `5` | TensorRT builder optimization level. `0` = fastest build, `5` = fastest runtime (`3` builds ~3–5× faster with <5% runtime regression). Part of the engine cache key. Bounds `[0, 5]`. CLI: `--trt-opt-level`. |
 | `TRT_ENGINE_CACHE` | `~/.cache/turbo-ocr` | Directory for cached TensorRT engines (empty value resolves to the default). Mount it to share engines across restarts. CLI: `--trt-engine-cache`. |
+| `TRT_DET_WORKSPACE_GB` | `4` | Ceiling (GiB, `[1, 24]`) for the detection engine's TensorRT build workspace. The 4 GiB default fits 16 GB cards, but the `medium` detector at `DET_MAX_SIDE_LIMIT=2560` needs ~4.1 GiB — on cards with headroom set `8` or the build fails with "Could not find any implementation". Out-of-range values warn and keep the default. |
 | `TURBO_OCR_CUDA_GRAPHS` | `1` (on) | Bake CUDA graphs for the recognition batch shapes at warmup. **Default changed to ON in v3.1.0**: +10–16% throughput and lower p50 latency (recognition is launch-bound), identical accuracy, at ~0.5 GiB extra VRAM per pipeline. Set `0` to opt out on VRAM-constrained cards (or lower `PIPELINE_POOL_SIZE`). |
 
 ## Performance / threading

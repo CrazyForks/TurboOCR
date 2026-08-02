@@ -1,4 +1,9 @@
 <p align="center">
+  <sub>🧪 Apple Metal and Intel OpenVINO backends are in testing, with AMD ROCm in development. NVIDIA is the only backend shipped today.</sub>
+</p>
+
+
+<p align="center">
   <img src="tests/benchmark/comparison/images/banner.png" alt="TurboOCR — the fastest GPU document parser." width="100%">
 </p>
 
